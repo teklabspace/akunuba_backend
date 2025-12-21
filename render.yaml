@@ -5,7 +5,7 @@ services:
     env: python
     region: oregon  # Options: oregon, frankfurt, singapore, mumbai, tokyo
     plan: starter  # Options: free, starter, standard, pro
-    buildCommand: pip install -r requirements.txt && alembic upgrade head
+    buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
