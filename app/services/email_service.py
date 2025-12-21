@@ -282,4 +282,91 @@ class EmailService:
         except Exception as e:
             logger.error(f"Error sending password reset email: {e}")
             return False
+    
+    @classmethod
+    async def send_otp_email(
+        cls,
+        to_email: str,
+        to_name: str,
+        otp_code: str
+    ) -> bool:
+        """Send OTP verification email"""
+        html_template = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+                .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+                .header { background-color: #4F46E5; color: white; padding: 20px; text-align: center; border-radius: 5px 5px 0 0; }
+                .content { background-color: #f9fafb; padding: 30px; border-radius: 0 0 5px 5px; }
+                .otp-box { background-color: #ffffff; border: 2px solid #4F46E5; border-radius: 8px; padding: 20px; text-align: center; margin: 20px 0; }
+                .otp-code { font-size: 32px; font-weight: bold; color: #4F46E5; letter-spacing: 8px; font-family: 'Courier New', monospace; }
+                .footer { text-align: center; margin-top: 20px; color: #6b7280; font-size: 12px; }
+                .warning { background-color: #fef3c7; border-left: 4px solid #f59e0b; padding: 12px; margin: 20px 0; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>Fullego</h1>
+                </div>
+                <div class="content">
+                    <h2>Your Verification Code</h2>
+                    <p>Hi {{ name }},</p>
+                    <p>Your verification code is:</p>
+                    <div class="otp-box">
+                        <div class="otp-code">{{ otp_code }}</div>
+                    </div>
+                    <p>Enter this code to verify your email address.</p>
+                    <div class="warning">
+                        <p><strong>Security Notice:</strong> This code will expire in 10 minutes. Never share this code with anyone.</p>
+                    </div>
+                    <p>If you didn't request this code, please ignore this email.</p>
+                </div>
+                <div class="footer">
+                    <p>This is an automated email from Fullego. Please do not reply to this email.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        text_template = """
+        Your Verification Code - Fullego
+        
+        Hi {{ name }},
+        
+        Your verification code is: {{ otp_code }}
+        
+        Enter this code to verify your email address.
+        
+        Security Notice: This code will expire in 10 minutes. Never share this code with anyone.
+        
+        If you didn't request this code, please ignore this email.
+        
+        ---
+        This is an automated email from Fullego. Please do not reply to this email.
+        """
+        
+        try:
+            html_content = Template(html_template).render(
+                name=to_name,
+                otp_code=otp_code
+            )
+            
+            text_content = Template(text_template).render(
+                name=to_name,
+                otp_code=otp_code
+            )
+            
+            return await cls.send_email(
+                to_email=to_email,
+                subject="Your Verification Code - Fullego",
+                html_content=html_content,
+                text_content=text_content
+            )
+        except Exception as e:
+            logger.error(f"Error sending OTP email: {e}")
+            return False
 

@@ -1,0 +1,113 @@
+services:
+  # Web Service (FastAPI Backend)
+  - type: web
+    name: fullego-backend
+    env: python
+    region: oregon  # Options: oregon, frankfurt, singapore, mumbai, tokyo
+    plan: starter  # Options: free, starter, standard, pro
+    buildCommand: pip install -r requirements.txt && alembic upgrade head
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      # Application Settings
+      - key: APP_NAME
+        value: Fullego Backend
+      - key: APP_ENV
+        value: production
+      - key: APP_DEBUG
+        value: false
+      - key: APP_VERSION
+        value: 1.0.0
+      - key: API_V1_PREFIX
+        value: /api/v1
+      - key: HOST
+        value: 0.0.0.0
+      
+      # CORS Origins - Update with your frontend URLs
+      - key: CORS_ORIGINS
+        value: https://yourdomain.com,https://www.yourdomain.com
+      
+      # Database - Render will auto-inject DATABASE_URL if using Render PostgreSQL
+      # If using external database, set it manually
+      - key: DATABASE_URL
+        sync: false  # Set this manually in Render dashboard
+      
+      # Supabase Configuration
+      - key: SUPABASE_URL
+        sync: false  # Set this manually in Render dashboard
+      - key: SUPABASE_ANON_KEY
+        sync: false  # Set this manually in Render dashboard
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false  # Set this manually in Render dashboard
+      - key: SUPABASE_JWT_SECRET
+        sync: false  # Set this manually in Render dashboard
+      
+      # Security
+      - key: SECRET_KEY
+        generateValue: true  # Render will generate a secure key
+      - key: ALGORITHM
+        value: HS256
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: 1440
+      
+      # Email Service (SendGrid)
+      - key: SENDGRID_API_KEY
+        sync: false  # Set this manually in Render dashboard
+      - key: EMAIL_FROM_ADDRESS
+        value: noreply@fullego.com
+      - key: EMAIL_FROM_NAME
+        value: Fullego
+      - key: EMAIL_ENABLED
+        value: true
+      
+      # Stripe
+      - key: STRIPE_SECRET_KEY
+        sync: false  # Set this manually in Render dashboard
+      - key: STRIPE_PUBLISHABLE_KEY
+        sync: false  # Set this manually in Render dashboard
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false  # Set this manually in Render dashboard
+      
+      # Plaid
+      - key: PLAID_CLIENT_ID
+        sync: false  # Set this manually in Render dashboard
+      - key: PLAID_SECRET_KEY
+        sync: false  # Set this manually in Render dashboard
+      - key: PLAID_PUBLIC_KEY
+        sync: false  # Set this manually in Render dashboard
+      - key: PLAID_ENV
+        value: sandbox
+      
+      # Persona
+      - key: PERSONA_API_KEY
+        sync: false  # Set this manually in Render dashboard
+      - key: PERSONA_TEMPLATE_ID
+        sync: false  # Set this manually in Render dashboard
+      - key: PERSONA_FILE_ACCESS_TOKEN_EXPIRY
+        value: 21600
+      
+      # Sendbird
+      - key: SENDBIRD_APP_ID
+        sync: false  # Set this manually in Render dashboard
+      - key: SENDBIRD_API_TOKEN
+        sync: false  # Set this manually in Render dashboard
+      
+      # Polygon (Optional)
+      - key: POLYGON_API_KEY
+        sync: false  # Set this manually in Render dashboard
+      
+      # Alpaca (Optional)
+      - key: ALPACA_OAUTH_ENABLED
+        value: false
+      
+      # PostHog (Optional)
+      - key: POSTHOG_HOST
+        value: https://us.i.posthog.com
+
+  # PostgreSQL Database (Optional - if you want to use Render's managed PostgreSQL)
+  - type: pg
+    name: fullego-database
+    plan: starter  # Options: starter, standard, pro
+    databaseName: fullego
+    user: fullego_user
+

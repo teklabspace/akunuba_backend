@@ -32,6 +32,7 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
     
     hashed_password = get_password_hash(user_data.password)
     verification_token = generate_verification_token()
+    otp_code = generate_otp()
     
     user = User(
         email=user_data.email,
@@ -40,6 +41,8 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
         last_name=user_data.last_name,
         phone=user_data.phone,
         email_verification_token=verification_token,
+        otp_code=otp_code,
+        otp_expires_at=datetime.utcnow() + timedelta(minutes=10),
     )
     
     db.add(user)
@@ -68,13 +71,32 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
     user.refresh_token = refresh_token
     await db.commit()
     
-    # Send verification email
+    # Send verification email and OTP email
     user_name = f"{user_data.first_name or ''} {user_data.last_name or ''}".strip() or "User"
-    await EmailService.send_verification_email(
+    
+    # Send verification email
+    verification_email_sent = await EmailService.send_verification_email(
         to_email=user.email,
         to_name=user_name,
         verification_token=verification_token
     )
+    
+    # Send OTP email
+    otp_email_sent = await EmailService.send_otp_email(
+        to_email=user.email,
+        to_name=user_name,
+        otp_code=otp_code
+    )
+    
+    if verification_email_sent:
+        logger.info(f"Verification email sent successfully to {user.email}")
+    else:
+        logger.error(f"Failed to send verification email to {user.email}")
+    
+    if otp_email_sent:
+        logger.info(f"OTP email sent successfully to {user.email}")
+    else:
+        logger.error(f"Failed to send OTP email to {user.email}")
     
     logger.info(f"User registered: {user.email}")
     
@@ -140,10 +162,25 @@ async def request_otp(request: OTPRequest, db: AsyncSession = Depends(get_db)):
     user.otp_expires_at = datetime.utcnow() + timedelta(minutes=10)
     await db.commit()
     
-    # In production, send OTP via email/SMS
-    logger.info(f"OTP generated for {user.email}: {otp_code}")
+    # Send OTP via email
+    user_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "User"
+    email_sent = await EmailService.send_otp_email(
+        to_email=user.email,
+        to_name=user_name,
+        otp_code=otp_code
+    )
     
-    return {"message": "OTP sent to your email/phone", "otp": otp_code}  # Remove otp in production
+    if email_sent:
+        logger.info(f"OTP sent successfully to {user.email}")
+    else:
+        logger.error(f"Failed to send OTP email to {user.email}")
+        # Still return success to avoid revealing email issues, but log the error
+    
+    # In development, you can return the OTP for testing. Remove in production.
+    if settings.APP_ENV == "development":
+        return {"message": "OTP sent to your email", "otp": otp_code}
+    
+    return {"message": "OTP sent to your email"}
 
 
 @router.post("/verify-otp")
