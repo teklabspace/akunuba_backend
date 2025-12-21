@@ -6,6 +6,7 @@ except ImportError:
     create_client = None
     Client = None
 
+from typing import Optional
 from app.config import settings
 from app.utils.logger import logger
 
