@@ -1,5 +1,4 @@
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail, Email, To, Content
+import resend
 from app.config import settings
 from app.utils.logger import logger
 from typing import Optional, Dict, Any
@@ -7,27 +6,29 @@ from jinja2 import Template
 
 
 class EmailService:
-    _client: Optional[SendGridAPIClient] = None
+    _initialized: bool = False
     
     @classmethod
-    def get_client(cls) -> Optional[SendGridAPIClient]:
-        """Get SendGrid client instance"""
+    def _initialize(cls) -> bool:
+        """Initialize Resend client"""
         if not settings.EMAIL_ENABLED:
-            return None
+            return False
         
-        if not settings.SENDGRID_API_KEY:
-            logger.warning("SendGrid API key not configured, email service disabled")
-            return None
+        if not settings.RESEND_API_KEY:
+            logger.warning("Resend API key not configured, email service disabled")
+            return False
         
-        if cls._client is None:
+        if not cls._initialized:
             try:
-                cls._client = SendGridAPIClient(settings.SENDGRID_API_KEY)
-                logger.info("SendGrid client initialized")
+                resend.api_key = settings.RESEND_API_KEY
+                cls._initialized = True
+                logger.info("Resend client initialized")
+                return True
             except Exception as e:
-                logger.error(f"Failed to initialize SendGrid client: {e}")
-                return None
+                logger.error(f"Failed to initialize Resend client: {e}")
+                return False
         
-        return cls._client
+        return True
     
     @classmethod
     async def send_email(
@@ -39,37 +40,51 @@ class EmailService:
         from_email: Optional[str] = None,
         from_name: Optional[str] = None
     ) -> bool:
-        """Send an email via SendGrid"""
+        """Send an email via Resend"""
         if not settings.EMAIL_ENABLED:
             logger.debug("Email service disabled, skipping email send")
             return False
         
-        client = cls.get_client()
-        if not client:
+        if not cls._initialize():
             return False
         
         try:
-            from_addr = Email(from_email or settings.EMAIL_FROM_ADDRESS, from_name or settings.EMAIL_FROM_NAME)
-            to_addr = To(to_email)
+            from_address = from_email or settings.EMAIL_FROM_ADDRESS
+            from_name_str = from_name or settings.EMAIL_FROM_NAME
             
-            # Use HTML content if provided, otherwise use text
-            if html_content:
-                content = Content("text/html", html_content)
-            elif text_content:
-                content = Content("text/plain", text_content)
+            # Format from address with name if provided
+            if from_name_str and from_name_str != "Fullego":
+                from_addr = f"{from_name_str} <{from_address}>"
             else:
-                logger.error("No email content provided")
-                return False
+                from_addr = from_address
             
-            message = Mail(from_addr, to_addr, subject, content)
+            email_params = {
+                "from": from_addr,
+                "to": to_email,
+                "subject": subject,
+                "html": html_content,
+            }
             
-            response = client.send(message)
+            # Add text content if provided
+            if text_content:
+                email_params["text"] = text_content
             
-            if response.status_code in [200, 201, 202]:
-                logger.info(f"Email sent successfully to {to_email}")
+            # Run Resend send in thread to avoid blocking
+            import asyncio
+            response = await asyncio.to_thread(resend.Emails.send, email_params)
+            
+            if response and hasattr(response, 'id'):
+                logger.info(f"Email sent successfully to {to_email} (ID: {response.id})")
                 return True
+            elif response:
+                # Check if response is a dict with error
+                if isinstance(response, dict) and 'error' in response:
+                    logger.error(f"Failed to send email: {response.get('message', 'Unknown error')}")
+                else:
+                    logger.error(f"Failed to send email: Unexpected response format: {response}")
+                return False
             else:
-                logger.error(f"Failed to send email: {response.status_code} - {response.body}")
+                logger.error(f"Failed to send email: No response received")
                 return False
                 
         except Exception as e:
@@ -369,4 +384,3 @@ class EmailService:
         except Exception as e:
             logger.error(f"Error sending OTP email: {e}")
             return False
-

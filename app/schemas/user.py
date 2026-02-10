@@ -19,6 +19,7 @@ class UserCreate(UserBase):
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
+    totp_code: Optional[str] = None  # 2FA code (required if 2FA is enabled)
 
 
 class UserResponse(UserBase):
@@ -33,10 +34,26 @@ class UserResponse(UserBase):
         from_attributes = True
 
 
+class LoginUserResponse(BaseModel):
+    """Simplified user response for login/register/refresh endpoints"""
+    id: UUID
+    role: Role
+    is_verified: bool  # Overall verification status (True if either KYC or email verified)
+    is_kyc_verified: bool  # True if Persona KYC is approved
+    is_email_verified: bool  # True if email is verified via OTP/email link
+
+    class Config:
+        from_attributes = True
+
+
 class TokenResponse(BaseModel):
-    access_token: str
+    access_token: Optional[str] = None  # None if 2FA required
     refresh_token: Optional[str] = None
     token_type: str = "bearer"
+    user: Optional[LoginUserResponse] = None
+    requires_2fa: Optional[bool] = False  # True if 2FA code is required
+    temp_token: Optional[str] = None  # Temporary token for 2FA verification
+    message: Optional[str] = None  # Message for 2FA requirement
 
 
 class OTPRequest(BaseModel):

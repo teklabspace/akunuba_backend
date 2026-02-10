@@ -98,3 +98,31 @@ class EscrowTransaction(Base):
     buyer = relationship("Account", foreign_keys=[buyer_id])
     seller = relationship("Account", foreign_keys=[seller_id])
 
+
+class WatchlistItem(Base):
+    __tablename__ = "watchlist_items"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    account_id = Column(UUID(as_uuid=True), ForeignKey("accounts.id"), nullable=False)
+    listing_id = Column(UUID(as_uuid=True), ForeignKey("marketplace_listings.id"), nullable=False)
+    
+    # Denormalized fields for performance (updated when listing changes)
+    listing_title = Column(String(255), nullable=False)
+    listing_category = Column(String(100))  # Category from asset
+    asking_price = Column(Numeric(20, 2), nullable=False)
+    currency = Column(String(3), default="USD", nullable=False)
+    listing_status = Column(SQLEnum(ListingStatus), nullable=False)
+    asset_type = Column(String(50))  # Asset type from asset
+    thumbnail_url = Column(String(500))  # From asset photos
+    price_at_added = Column(Numeric(20, 2), nullable=False)  # Price when added to watchlist
+    
+    # User-specific fields
+    notes = Column(Text)
+    
+    # Timestamps
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    account = relationship("Account")
+    listing = relationship("MarketplaceListing")
+

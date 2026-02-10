@@ -2,8 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File,
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, func
-from typing import List, Optional
-from datetime import datetime
+from typing import List, Optional, Dict, Any
+from datetime import datetime, timezone
 from app.database import get_db
 from app.api.deps import get_current_user
 from app.models.user import User
@@ -329,4 +329,167 @@ async def get_document_stats(
         "total_size_mb": round(total_size / (1024 * 1024), 2),
         "by_type": by_type
     }
+
+
+@router.post("/{document_id}/share", response_model=Dict[str, Any])
+async def share_document(
+    document_id: UUID,
+    user_ids: Optional[List[UUID]] = Body(None),
+    permissions: str = Body("view"),
+    expiry_date: Optional[str] = Body(None),
+    generate_link: bool = Body(False),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Share a document with other users or generate a shareable link"""
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+    
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+    
+    result = await db.execute(
+        select(Document).where(
+            Document.id == document_id,
+            Document.account_id == account.id
+        )
+    )
+    document = result.scalar_one_or_none()
+    
+    if not document:
+        raise NotFoundException("Document", str(document_id))
+    
+    from app.models.document_share import DocumentShare, SharePermission
+    import secrets
+    
+    shares_created = []
+    
+    # Share with specific users
+    if user_ids:
+        for user_id in user_ids:
+            # Verify user exists
+            user_result = await db.execute(
+                select(User).where(User.id == user_id)
+            )
+            user = user_result.scalar_one_or_none()
+            
+            if not user:
+                continue
+            
+            # Check if share already exists
+            existing_share = await db.execute(
+                select(DocumentShare).where(
+                    DocumentShare.document_id == document_id,
+                    DocumentShare.shared_with_user_id == user_id,
+                    DocumentShare.is_active == True
+                )
+            )
+            if existing_share.scalar_one_or_none():
+                continue
+            
+            # Create share
+            share = DocumentShare(
+                document_id=document_id,
+                shared_with_user_id=user_id,
+                permission=SharePermission(permissions.lower()),
+                expiry_date=datetime.fromisoformat(expiry_date.replace('Z', '+00:00')) if expiry_date else None
+            )
+            db.add(share)
+            shares_created.append({
+                "user_id": str(user_id),
+                "user_name": user.email,
+                "permission": permissions
+            })
+    
+    # Generate shareable link
+    share_link = None
+    share_token = None
+    if generate_link:
+        share_token = secrets.token_urlsafe(32)
+        share_link = f"/api/v1/documents/shared/{share_token}"
+        
+        share = DocumentShare(
+            document_id=document_id,
+            share_link=share_link,
+            share_token=share_token,
+            permission=SharePermission(permissions.lower()),
+            expiry_date=datetime.fromisoformat(expiry_date.replace('Z', '+00:00')) if expiry_date else None
+        )
+        db.add(share)
+    
+    await db.commit()
+    
+    return {
+        "message": "Document shared successfully",
+        "shares": shares_created,
+        "share_link": share_link,
+        "share_token": share_token
+    }
+
+
+@router.get("/{document_id}/preview")
+async def preview_document(
+    document_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get a preview URL or thumbnail for a document"""
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+    
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+    
+    result = await db.execute(
+        select(Document).where(
+            Document.id == document_id,
+            Document.account_id == account.id
+        )
+    )
+    document = result.scalar_one_or_none()
+    
+    # Check if shared with user
+    if not document:
+        from app.models.document_share import DocumentShare
+        share_result = await db.execute(
+            select(DocumentShare).where(
+                DocumentShare.document_id == document_id,
+                DocumentShare.shared_with_user_id == current_user.id,
+                DocumentShare.is_active == True
+            )
+        )
+        share = share_result.scalar_one_or_none()
+        if not share:
+            raise NotFoundException("Document", str(document_id))
+        document_result = await db.execute(
+            select(Document).where(Document.id == document_id)
+        )
+        document = document_result.scalar_one_or_none()
+    
+    if not document:
+        raise NotFoundException("Document", str(document_id))
+    
+    # Generate signed URL for preview (expires in 1 hour)
+    from app.integrations.supabase_client import SupabaseClient
+    try:
+        # For images, return direct URL
+        if document.mime_type and document.mime_type.startswith('image/'):
+            preview_url = SupabaseClient.get_file_url("documents", document.supabase_storage_path)
+        else:
+            # For other files, return download URL (preview not supported)
+            preview_url = SupabaseClient.get_file_url("documents", document.supabase_storage_path)
+        
+        return {
+            "preview_url": preview_url,
+            "file_name": document.file_name,
+            "mime_type": document.mime_type,
+            "file_size": document.file_size
+        }
+    except Exception as e:
+        logger.error(f"Failed to generate preview URL: {e}")
+        raise BadRequestException("Failed to generate preview URL")
 

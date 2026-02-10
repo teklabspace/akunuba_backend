@@ -1,10 +1,10 @@
-from fastapi import APIRouter, Depends, Query
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, Query, Body, HTTPException, status
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, desc
 from typing import Optional, List, Dict, Any
 from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from app.database import get_db
 from app.api.deps import get_current_user
 from app.models.user import User
@@ -13,9 +13,17 @@ from app.models.asset import Asset, AssetValuation, AssetType
 from app.models.portfolio import Portfolio
 from app.models.payment import Payment, PaymentStatus
 from app.models.banking import Transaction as BankingTransaction
-from app.core.exceptions import NotFoundException
+from app.models.report import Report, ReportType, ReportStatus, ReportFormat
+from app.models.support import SupportTicket, TicketStatus
+from app.models.document import Document
+from app.models.asset import AssetAppraisal, AppraisalStatus
+from app.core.exceptions import NotFoundException, BadRequestException
+from app.core.permissions import Permission, has_permission
 from app.utils.logger import logger
 from pydantic import BaseModel
+from uuid import UUID
+import json
+import io
 
 router = APIRouter()
 
@@ -331,5 +339,494 @@ async def generate_transaction_report(
             }
             for tx in banking_transactions[:50]  # Limit to 50 most recent
         ]
+    }
+
+
+class ReportGenerateRequest(BaseModel):
+    report_type: str
+    date_range: Optional[Dict[str, str]] = None
+    filters: Optional[Dict[str, Any]] = None
+    format: str = "pdf"  # pdf, csv, xlsx
+
+
+class ReportResponse(BaseModel):
+    id: UUID
+    report_type: str
+    status: str
+    format: str
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
+    created_at: datetime
+    generated_at: Optional[datetime] = None
+    file_url: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+@router.post("/generate", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
+async def generate_report(
+    report_data: ReportGenerateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Generate a new report"""
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+    
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+    
+    # Parse date range
+    start_date = None
+    end_date = None
+    if report_data.date_range:
+        if "start_date" in report_data.date_range:
+            try:
+                start_date = datetime.fromisoformat(report_data.date_range["start_date"].replace('Z', '+00:00'))
+            except:
+                pass
+        if "end_date" in report_data.date_range:
+            try:
+                end_date = datetime.fromisoformat(report_data.date_range["end_date"].replace('Z', '+00:00'))
+            except:
+                pass
+    
+    # Validate report type
+    try:
+        report_type_enum = ReportType(report_data.report_type.lower())
+    except ValueError:
+        raise BadRequestException(f"Invalid report type: {report_data.report_type}")
+    
+    # Validate format
+    try:
+        format_enum = ReportFormat(report_data.format.lower())
+    except ValueError:
+        raise BadRequestException(f"Invalid format: {report_data.format}")
+    
+    # Create report record
+    report = Report(
+        account_id=account.id,
+        report_type=report_type_enum,
+        status=ReportStatus.PENDING,
+        format=format_enum,
+        start_date=start_date,
+        end_date=end_date,
+        filters=report_data.filters or {},
+        parameters={}
+    )
+    
+    db.add(report)
+    await db.commit()
+    await db.refresh(report)
+    
+    # Generate report asynchronously (for now, we'll mark it as generating)
+    report.status = ReportStatus.GENERATING
+    await db.commit()
+    
+    # Generate report data based on type
+    report_data_dict = {}
+    try:
+        if report_type_enum == ReportType.PORTFOLIO:
+            # Use existing portfolio report logic
+            portfolio_result = await db.execute(
+                select(Portfolio).where(Portfolio.account_id == account.id)
+            )
+            portfolio = portfolio_result.scalar_one_or_none()
+            
+            assets_result = await db.execute(
+                select(Asset).where(Asset.account_id == account.id)
+            )
+            assets = assets_result.scalars().all()
+            
+            total_value = sum([asset.current_value for asset in assets])
+            
+            asset_allocation = {}
+            for asset in assets:
+                asset_type = asset.asset_type.value if asset.asset_type else "other"
+                if asset_type not in asset_allocation:
+                    asset_allocation[asset_type] = {"count": 0, "value": Decimal("0"), "percentage": Decimal("0")}
+                asset_allocation[asset_type]["count"] += 1
+                asset_allocation[asset_type]["value"] += asset.current_value
+            
+            if total_value > 0:
+                for asset_type in asset_allocation:
+                    asset_allocation[asset_type]["percentage"] = (
+                        asset_allocation[asset_type]["value"] / total_value * 100
+                    )
+            
+            report_data_dict = {
+                "total_value": float(total_value),
+                "asset_count": len(assets),
+                "asset_allocation": {k: {**v, "value": float(v["value"]), "percentage": float(v["percentage"])} 
+                                    for k, v in asset_allocation.items()},
+                "performance": {}
+            }
+        
+        elif report_type_enum == ReportType.PERFORMANCE:
+            days = 30
+            if report_data.filters and "days" in report_data.filters:
+                days = int(report_data.filters["days"])
+            
+            period_end = datetime.now(timezone.utc)
+            period_start = period_end - timedelta(days=days)
+            
+            assets_result = await db.execute(
+                select(Asset).where(Asset.account_id == account.id)
+            )
+            assets = assets_result.scalars().all()
+            
+            current_value = sum([asset.current_value for asset in assets])
+            historical_value = current_value * Decimal("0.95")  # Simplified
+            
+            total_return = current_value - historical_value
+            total_return_percentage = (total_return / historical_value * 100) if historical_value > 0 else Decimal("0")
+            
+            report_data_dict = {
+                "period_start": period_start.isoformat(),
+                "period_end": period_end.isoformat(),
+                "total_return": float(total_return),
+                "total_return_percentage": float(total_return_percentage),
+                "asset_breakdown": [
+                    {
+                        "name": asset.name,
+                        "type": asset.asset_type.value if asset.asset_type else "other",
+                        "current_value": float(asset.current_value),
+                        "percentage": float((asset.current_value / current_value * 100) if current_value > 0 else 0)
+                    }
+                    for asset in assets
+                ]
+            }
+        
+        elif report_type_enum == ReportType.TRANSACTION:
+            # Use existing transaction report logic
+            query = select(Payment).where(Payment.account_id == account.id)
+            if start_date:
+                query = query.where(Payment.created_at >= start_date)
+            if end_date:
+                query = query.where(Payment.created_at <= end_date)
+            
+            result = await db.execute(query.order_by(Payment.created_at.desc()))
+            payments = result.scalars().all()
+            
+            total_amount = sum([payment.amount for payment in payments if payment.status == PaymentStatus.COMPLETED])
+            
+            report_data_dict = {
+                "period": {
+                    "start": start_date.isoformat() if start_date else None,
+                    "end": end_date.isoformat() if end_date else None,
+                },
+                "summary": {
+                    "total_transactions": len(payments),
+                    "total_amount": float(total_amount)
+                },
+                "transactions": [
+                    {
+                        "id": str(payment.id),
+                        "amount": float(payment.amount),
+                        "currency": payment.currency,
+                        "status": payment.status.value,
+                        "created_at": payment.created_at.isoformat(),
+                    }
+                    for payment in payments
+                ]
+            }
+        
+        # Store report data as JSON (for now, until we implement file generation)
+        report.parameters = report_data_dict
+        report.status = ReportStatus.COMPLETED
+        report.generated_at = datetime.now(timezone.utc)
+        
+        # For now, we'll store the data. In production, you'd generate PDF/CSV/XLSX files
+        report.file_url = f"/api/v1/reports/{report.id}/download"
+        
+    except Exception as e:
+        logger.error(f"Failed to generate report: {e}")
+        report.status = ReportStatus.FAILED
+        report.error_message = str(e)
+    
+    await db.commit()
+    await db.refresh(report)
+    
+    logger.info(f"Report generated: {report.id}")
+    
+    return {
+        "id": str(report.id),
+        "status": report.status.value,
+        "report_type": report.report_type.value,
+        "format": report.format.value,
+        "created_at": report.created_at.isoformat() if report.created_at else None,
+        "generated_at": report.generated_at.isoformat() if report.generated_at else None
+    }
+
+
+@router.get("", response_model=Dict[str, Any])
+async def list_reports(
+    type: Optional[str] = Query(None),
+    status_filter: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get a list of all reports with optional filtering"""
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+    
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+    
+    query = select(Report).where(Report.account_id == account.id)
+    
+    # Admins can see all reports
+    if has_permission(current_user.role, Permission.MANAGE_SUPPORT):
+        query = select(Report)
+    
+    if type:
+        try:
+            report_type = ReportType(type.lower())
+            query = query.where(Report.report_type == report_type)
+        except ValueError:
+            pass
+    
+    if status_filter:
+        try:
+            status_enum = ReportStatus(status_filter.lower())
+            query = query.where(Report.status == status_enum)
+        except ValueError:
+            pass
+    
+    # Get total count
+    count_query = select(func.count(Report.id))
+    if not has_permission(current_user.role, Permission.MANAGE_SUPPORT):
+        count_query = count_query.where(Report.account_id == account.id)
+    if type:
+        try:
+            report_type = ReportType(type.lower())
+            count_query = count_query.where(Report.report_type == report_type)
+        except ValueError:
+            pass
+    if status_filter:
+        try:
+            status_enum = ReportStatus(status_filter.lower())
+            count_query = count_query.where(Report.status == status_enum)
+        except ValueError:
+            pass
+    
+    total_result = await db.execute(count_query)
+    total = total_result.scalar() or 0
+    
+    # Apply pagination
+    offset = (page - 1) * limit
+    query = query.order_by(desc(Report.created_at)).offset(offset).limit(limit)
+    
+    result = await db.execute(query)
+    reports = result.scalars().all()
+    
+    return {
+        "data": [
+            {
+                "id": str(report.id),
+                "report_type": report.report_type.value if report.report_type else None,
+                "status": report.status.value if report.status else None,
+                "format": report.format.value if report.format else None,
+                "start_date": report.start_date.isoformat() if report.start_date else None,
+                "end_date": report.end_date.isoformat() if report.end_date else None,
+                "created_at": report.created_at.isoformat() if report.created_at else None,
+                "generated_at": report.generated_at.isoformat() if report.generated_at else None,
+                "file_url": report.file_url
+            }
+            for report in reports
+        ],
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "pages": (total + limit - 1) // limit if total > 0 else 0
+        }
+    }
+
+
+@router.get("/{report_id}", response_model=Dict[str, Any])
+async def get_report_details(
+    report_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get detailed information about a specific report"""
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+    
+    result = await db.execute(
+        select(Report).where(Report.id == report_id)
+    )
+    report = result.scalar_one_or_none()
+    
+    if not report:
+        raise NotFoundException("Report", str(report_id))
+    
+    # Check access
+    if not has_permission(current_user.role, Permission.MANAGE_SUPPORT):
+        if report.account_id != account.id:
+            raise HTTPException(status_code=403, detail="Access denied")
+    
+    return {
+        "id": str(report.id),
+        "report_type": report.report_type.value if report.report_type else None,
+        "status": report.status.value if report.status else None,
+        "format": report.format.value if report.format else None,
+        "start_date": report.start_date.isoformat() if report.start_date else None,
+        "end_date": report.end_date.isoformat() if report.end_date else None,
+        "filters": report.filters or {},
+        "parameters": report.parameters or {},
+        "created_at": report.created_at.isoformat() if report.created_at else None,
+        "generated_at": report.generated_at.isoformat() if report.generated_at else None,
+        "file_url": report.file_url,
+        "file_size": report.file_size,
+        "error_message": report.error_message
+    }
+
+
+@router.get("/{report_id}/download")
+async def download_report(
+    report_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Download a generated report file"""
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+    
+    result = await db.execute(
+        select(Report).where(Report.id == report_id)
+    )
+    report = result.scalar_one_or_none()
+    
+    if not report:
+        raise NotFoundException("Report", str(report_id))
+    
+    # Check access
+    if not has_permission(current_user.role, Permission.MANAGE_SUPPORT):
+        if report.account_id != account.id:
+            raise HTTPException(status_code=403, detail="Access denied")
+    
+    if report.status != ReportStatus.COMPLETED:
+        raise BadRequestException("Report is not ready for download")
+    
+    # For now, return JSON data
+    # In production, you'd generate and return PDF/CSV/XLSX files
+    if report.format == ReportFormat.JSON:
+        return JSONResponse(
+            content=report.parameters or {},
+            headers={"Content-Disposition": f'attachment; filename="report_{report_id}.json"'}
+        )
+    else:
+        # For PDF/CSV/XLSX, you'd need to implement file generation
+        # For now, return JSON with a message
+        return JSONResponse(
+            content={
+                "message": f"File generation for {report.format.value} format not yet implemented",
+                "data": report.parameters or {}
+            },
+            headers={"Content-Disposition": f'attachment; filename="report_{report_id}.json"'}
+        )
+
+
+@router.get("/statistics", response_model=Dict[str, Any])
+async def get_report_statistics(
+    date_range_start: Optional[str] = Query(None),
+    date_range_end: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get statistics for the CRM dashboard overview"""
+    # Check permissions - only admins/advisors can see CRM statistics
+    if not has_permission(current_user.role, Permission.MANAGE_SUPPORT):
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    # Parse date range
+    start_date = None
+    end_date = None
+    if date_range_start:
+        try:
+            start_date = datetime.fromisoformat(date_range_start.replace('Z', '+00:00'))
+        except:
+            pass
+    if date_range_end:
+        try:
+            end_date = datetime.fromisoformat(date_range_end.replace('Z', '+00:00'))
+        except:
+            pass
+    
+    # Aggregate statistics from support tickets, documents, and appraisals
+    # Total tasks received (support tickets + appraisals)
+    tickets_query = select(func.count(SupportTicket.id))
+    appraisals_query = select(func.count(AssetAppraisal.id))
+    
+    if start_date:
+        tickets_query = tickets_query.where(SupportTicket.created_at >= start_date)
+        appraisals_query = appraisals_query.where(AssetAppraisal.requested_at >= start_date)
+    if end_date:
+        tickets_query = tickets_query.where(SupportTicket.created_at <= end_date)
+        appraisals_query = appraisals_query.where(AssetAppraisal.requested_at <= end_date)
+    
+    tickets_result = await db.execute(tickets_query)
+    total_tickets = tickets_result.scalar() or 0
+    
+    appraisals_result = await db.execute(appraisals_query)
+    total_appraisals = appraisals_result.scalar() or 0
+    
+    total_tasks = total_tickets + total_appraisals
+    
+    # Tasks solved (resolved tickets + completed appraisals)
+    solved_tickets_query = select(func.count(SupportTicket.id)).where(
+        SupportTicket.status.in_([TicketStatus.RESOLVED, TicketStatus.CLOSED])
+    )
+    solved_appraisals_query = select(func.count(AssetAppraisal.id)).where(
+        AssetAppraisal.status == AppraisalStatus.COMPLETED
+    )
+    
+    if start_date:
+        solved_tickets_query = solved_tickets_query.where(SupportTicket.created_at >= start_date)
+        solved_appraisals_query = solved_appraisals_query.where(AssetAppraisal.requested_at >= start_date)
+    if end_date:
+        solved_tickets_query = solved_tickets_query.where(SupportTicket.created_at <= end_date)
+        solved_appraisals_query = solved_appraisals_query.where(AssetAppraisal.requested_at <= end_date)
+    
+    solved_tickets_result = await db.execute(solved_tickets_query)
+    solved_tickets = solved_tickets_result.scalar() or 0
+    
+    solved_appraisals_result = await db.execute(solved_appraisals_query)
+    solved_appraisals = solved_appraisals_result.scalar() or 0
+    
+    tasks_solved = solved_tickets + solved_appraisals
+    
+    # Tasks unresolved
+    tasks_unresolved = total_tasks - tasks_solved
+    
+    return {
+        "total_tasks_received": total_tasks,
+        "tasks_solved": tasks_solved,
+        "tasks_unresolved": tasks_unresolved,
+        "performance_trends": {
+            "tickets": {
+                "total": total_tickets,
+                "solved": solved_tickets,
+                "unresolved": total_tickets - solved_tickets
+            },
+            "appraisals": {
+                "total": total_appraisals,
+                "solved": solved_appraisals,
+                "unresolved": total_appraisals - solved_appraisals
+            }
+        }
     }
 

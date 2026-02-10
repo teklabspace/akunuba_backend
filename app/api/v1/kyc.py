@@ -6,7 +6,7 @@ import httpx
 from app.database import get_db
 from app.api.deps import get_current_user
 from app.models.user import User
-from app.models.account import Account
+from app.models.account import Account, AccountType
 from app.models.kyc import KYCVerification, KYCStatus
 from app.integrations.persona_client import PersonaClient
 from app.core.exceptions import NotFoundException, BadRequestException, UnauthorizedException
@@ -24,6 +24,7 @@ class KYCResponse(BaseModel):
     id: UUID
     status: str
     persona_inquiry_id: Optional[str] = None
+    verification_url: Optional[str] = None  # Persona hosted verification page URL
     verification_level: Optional[str] = None
     verified_at: Optional[datetime] = None
 
@@ -36,14 +37,36 @@ async def start_kyc(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Start KYC verification process"""
+    """Start KYC verification process
+    
+    Requires email verification first before KYC can be started.
+    """
+    # Check if email is verified (required before KYC)
+    if not current_user.email_verified_at and not current_user.is_verified:
+        raise BadRequestException("Email verification required before starting KYC. Please verify your email first.")
+    
     account_result = await db.execute(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
     
+    # Auto-create account if it doesn't exist (for individual accounts)
     if not account:
-        raise NotFoundException("Account", str(current_user.id))
+        # Generate account name from user's name
+        account_name = f"{current_user.first_name or ''} {current_user.last_name or ''}".strip()
+        if not account_name:
+            account_name = current_user.email.split("@")[0]  # Use email prefix as fallback
+        
+        account = Account(
+            user_id=current_user.id,
+            account_type=AccountType.INDIVIDUAL,
+            account_name=account_name,
+            is_joint=False
+        )
+        db.add(account)
+        await db.commit()
+        await db.refresh(account)
+        logger.info(f"Auto-created individual account for user {current_user.id}")
     
     # Check if KYC already exists
     kyc_result = await db.execute(
@@ -54,8 +77,12 @@ async def start_kyc(
     if kyc and kyc.status == KYCStatus.APPROVED:
         raise BadRequestException("KYC already approved")
     
-    # Create Persona inquiry
+    # Create Persona inquiry (optional in development)
+    from app.config import settings
     reference_id = generate_reference_id(f"KYC-{account.id}")
+    inquiry_id = None
+    persona_response = None
+    
     try:
         persona_response = PersonaClient.create_inquiry(
             account_id=str(account.id),
@@ -64,11 +91,17 @@ async def start_kyc(
         inquiry_id = persona_response.get("data", {}).get("id")
         if not inquiry_id:
             logger.error(f"Persona inquiry created but no inquiry ID returned: {persona_response}")
-            raise BadRequestException("Failed to start KYC verification: No inquiry ID returned")
+            if settings.APP_ENV != "development":
+                raise BadRequestException("Failed to start KYC verification: No inquiry ID returned")
+            else:
+                logger.warning("Persona inquiry ID missing, continuing without Persona in development mode")
     except ValueError as e:
         # Template ID validation error
-        logger.error(f"Persona configuration error: {e}")
-        raise BadRequestException(str(e))
+        logger.warning(f"Persona configuration error: {e}")
+        if settings.APP_ENV != "development":
+            raise BadRequestException(str(e))
+        else:
+            logger.warning("Persona template not configured, continuing without Persona in development mode")
     except httpx.HTTPStatusError as e:
         # Persona API error - extract the actual error message
         error_msg = str(e)
@@ -90,18 +123,30 @@ async def start_kyc(
                         error_msg = f"Persona API error: {error_body[:500]}"  # Limit length
         except:
             pass
-        logger.error(f"Failed to create Persona inquiry: {error_msg}", exc_info=True)
-        raise BadRequestException(f"Failed to start KYC verification: {error_msg}")
+        if settings.APP_ENV != "development":
+            logger.error(f"Failed to create Persona inquiry: {error_msg}", exc_info=True)
+            raise BadRequestException(f"Failed to start KYC verification: {error_msg}")
+        else:
+            logger.warning(f"Failed to create Persona inquiry, continuing without Persona in development mode: {error_msg}")
     except BadRequestException:
-        raise
+        if settings.APP_ENV != "development":
+            raise
+        else:
+            logger.warning("Persona BadRequestException, continuing without Persona in development mode")
     except Exception as e:
-        logger.error(f"Failed to create Persona inquiry: {e}", exc_info=True)
-        raise BadRequestException(f"Failed to start KYC verification: {str(e)}")
+        if settings.APP_ENV != "development":
+            logger.error(f"Failed to create Persona inquiry: {e}", exc_info=True)
+            raise BadRequestException(f"Failed to start KYC verification: {str(e)}")
+        else:
+            logger.warning(f"Failed to create Persona inquiry, continuing without Persona in development mode: {e}")
     
+    # Create or update KYC verification
     if kyc:
-        kyc.persona_inquiry_id = inquiry_id
+        if inquiry_id:
+            kyc.persona_inquiry_id = inquiry_id
         kyc.status = KYCStatus.IN_PROGRESS
-        kyc.persona_response = persona_response
+        if persona_response:
+            kyc.persona_response = persona_response
     else:
         kyc = KYCVerification(
             account_id=account.id,
@@ -111,14 +156,48 @@ async def start_kyc(
         )
         db.add(kyc)
     
+    # Ensure user is NOT verified when KYC is in progress
+    account.user.is_verified = False
+    
     await db.commit()
     await db.refresh(kyc)
     
-    logger.info(f"KYC started for account {account.id}")
-    return kyc
+    # Get verification URL for Persona hosted flow
+    verification_url = None
+    if inquiry_id:
+        # Get redirect URI from settings or construct from CORS origins
+        from app.config import settings
+        if settings.PERSONA_REDIRECT_URI:
+            redirect_uri = settings.PERSONA_REDIRECT_URI
+        else:
+            # Fallback to first CORS origin + default path
+            base_url = settings.CORS_ORIGINS[0] if isinstance(settings.CORS_ORIGINS, list) and settings.CORS_ORIGINS else 'http://localhost:3000'
+            redirect_uri = f"{base_url}/kyc/verification-complete"
+        
+        # Try to extract from response, otherwise construct it
+        if persona_response:
+            verification_url = PersonaClient.extract_verification_url_from_response(
+                persona_response,
+                redirect_uri=redirect_uri
+            )
+        else:
+            # Construct verification URL directly if we have inquiry_id
+            verification_url = PersonaClient.get_verification_url(inquiry_id, redirect_uri)
+    
+    logger.info(f"KYC started for account {account.id}, verification URL: {verification_url}")
+    
+    # Return response with verification URL
+    return {
+        "id": kyc.id,
+        "status": kyc.status.value if hasattr(kyc.status, 'value') else str(kyc.status),
+        "persona_inquiry_id": kyc.persona_inquiry_id,
+        "verification_url": verification_url,
+        "verification_level": kyc.verification_level,
+        "verified_at": kyc.verified_at
+    }
 
 
-@router.get("/status", response_model=KYCResponse)
+@router.get("/status")
 async def get_kyc_status(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
@@ -129,38 +208,162 @@ async def get_kyc_status(
     )
     account = account_result.scalar_one_or_none()
     
+    # If no account exists, return not_started status
     if not account:
-        raise NotFoundException("Account", str(current_user.id))
+        return {
+            "id": None,
+            "status": "not_started",
+            "persona_inquiry_id": None,
+            "verification_url": None,
+            "verification_level": None,
+            "verified_at": None
+        }
     
     kyc_result = await db.execute(
         select(KYCVerification).where(KYCVerification.account_id == account.id)
     )
     kyc = kyc_result.scalar_one_or_none()
     
+    # If KYC hasn't been started, return not_started status
     if not kyc:
-        raise NotFoundException("KYC Verification", str(account.id))
+        return {
+            "id": None,
+            "status": "not_started",
+            "persona_inquiry_id": None,
+            "verification_url": None,
+            "verification_level": None,
+            "verified_at": None
+        }
     
     # Sync with Persona
+    verification_url = None
     if kyc.persona_inquiry_id:
         try:
+            logger.info(f"[KYC STATUS SYNC] Fetching Persona inquiry: {kyc.persona_inquiry_id}")
             persona_data = PersonaClient.get_inquiry(kyc.persona_inquiry_id)
             if persona_data:
-                attributes = persona_data.get("data", {}).get("attributes", {})
-                status_str = attributes.get("status")
+                # Log full Persona response for debugging
+                import json
+                logger.info(f"[KYC STATUS SYNC] Full Persona API response: {json.dumps(persona_data, indent=2, default=str)}")
                 
-                if status_str == "completed":
+                attributes = persona_data.get("data", {}).get("attributes", {})
+                logger.info(f"[KYC STATUS SYNC] Attributes keys: {list(attributes.keys()) if attributes else 'None'}")
+                
+                status_str = attributes.get("status")
+                logger.info(f"[KYC STATUS SYNC] Persona status field value: '{status_str}'")
+                
+                # Check all possible status-related fields
+                verification_status = attributes.get("verification-status")
+                verification_state = attributes.get("verification_state")
+                state = attributes.get("state")
+                logger.info(f"[KYC STATUS SYNC] verification-status: '{verification_status}', verification_state: '{verification_state}', state: '{state}'")
+                
+                # Get account and user for is_verified updates
+                account_result = await db.execute(
+                    select(Account).where(Account.id == kyc.account_id)
+                )
+                account = account_result.scalar_one_or_none()
+                
+                # Properly map Persona statuses to KYC statuses
+                if status_str == "approved":
+                    # Persona returns "approved" directly when verification is complete and approved
+                    logger.info(f"[KYC STATUS SYNC] Status is 'approved'. Setting to APPROVED")
                     kyc.status = KYCStatus.APPROVED
                     kyc.verified_at = datetime.utcnow()
+                    # Update verification level if available
+                    if attributes.get("verification-level"):
+                        kyc.verification_level = attributes.get("verification-level")
+                    # Set user as verified
+                    if account:
+                        account.user.is_verified = True
+                elif status_str == "completed":
+                    # Check verification status to determine if approved or pending review
+                    verification_status = attributes.get("verification-status")
+                    if verification_status == "approved":
+                        kyc.status = KYCStatus.APPROVED
+                        kyc.verified_at = datetime.utcnow()
+                        # Update verification level if available
+                        if attributes.get("verification-level"):
+                            kyc.verification_level = attributes.get("verification-level")
+                        # Set user as verified
+                        if account:
+                            account.user.is_verified = True
+                    elif verification_status == "pending":
+                        kyc.status = KYCStatus.PENDING_REVIEW
+                        # Set user as NOT verified
+                        if account:
+                            account.user.is_verified = False
+                    elif verification_status == "failed":
+                        kyc.status = KYCStatus.REJECTED
+                        kyc.rejection_reason = attributes.get("failure-reason", "Verification failed")
+                        # Set user as NOT verified
+                        if account:
+                            account.user.is_verified = False
+                    else:
+                        # Default to approved if completed but no verification-status
+                        logger.info(f"[KYC STATUS SYNC] Status is 'completed' but no verification-status found. Defaulting to APPROVED")
+                        kyc.status = KYCStatus.APPROVED
+                        kyc.verified_at = datetime.utcnow()
+                        # Set user as verified
+                        if account:
+                            account.user.is_verified = True
                 elif status_str == "failed":
+                    logger.info(f"[KYC STATUS SYNC] Status is 'failed'. Setting to REJECTED")
                     kyc.status = KYCStatus.REJECTED
                     kyc.rejection_reason = attributes.get("failure-reason", "Verification failed")
+                    # Set user as NOT verified
+                    if account:
+                        account.user.is_verified = False
+                elif status_str == "pending":
+                    logger.info(f"[KYC STATUS SYNC] Status is 'pending'. Setting to PENDING_REVIEW")
+                    kyc.status = KYCStatus.PENDING_REVIEW
+                    # Set user as NOT verified
+                    if account:
+                        account.user.is_verified = False
+                elif status_str in ["processing", "waiting"]:
+                    logger.info(f"[KYC STATUS SYNC] Status is '{status_str}'. Keeping as IN_PROGRESS")
+                    kyc.status = KYCStatus.IN_PROGRESS
+                    # Set user as NOT verified (KYC is still in progress)
+                    if account:
+                        account.user.is_verified = False
+                else:
+                    logger.warning(f"[KYC STATUS SYNC] Unknown status value: '{status_str}'. Keeping current status: {kyc.status}")
+                    # For unknown statuses, set user as NOT verified to be safe
+                    if account and kyc.status != KYCStatus.APPROVED:
+                        account.user.is_verified = False
                 
+                # Update verification level if available
+                verification_level = attributes.get("verification-level") or attributes.get("verification_level")
+                if verification_level and not kyc.verification_level:
+                    logger.info(f"[KYC STATUS SYNC] Updating verification_level to: {verification_level}")
+                    kyc.verification_level = verification_level
+                
+                logger.info(f"[KYC STATUS SYNC] Final KYC status after sync: {kyc.status.value if hasattr(kyc.status, 'value') else kyc.status}")
                 kyc.persona_response = persona_data
                 await db.commit()
+                logger.info(f"[KYC STATUS SYNC] Database updated successfully")
+                
+                # Get verification URL if inquiry is still in progress
+                if kyc.status == KYCStatus.IN_PROGRESS:
+                    from app.config import settings
+                    if settings.PERSONA_REDIRECT_URI:
+                        redirect_uri = settings.PERSONA_REDIRECT_URI
+                    else:
+                        base_url = settings.CORS_ORIGINS[0] if isinstance(settings.CORS_ORIGINS, list) and settings.CORS_ORIGINS else 'http://localhost:3000'
+                        redirect_uri = f"{base_url}/kyc/verification-complete"
+                    
+                    verification_url = PersonaClient.get_verification_url(kyc.persona_inquiry_id, redirect_uri)
         except Exception as e:
-            logger.error(f"Failed to sync Persona status: {e}")
+            logger.error(f"[KYC STATUS SYNC] Failed to sync Persona status: {e}", exc_info=True)
     
-    return kyc
+    return {
+        "id": kyc.id,
+        "status": kyc.status.value if hasattr(kyc.status, 'value') else str(kyc.status),
+        "persona_inquiry_id": kyc.persona_inquiry_id,
+        "verification_url": verification_url,
+        "verification_level": kyc.verification_level,
+        "verified_at": kyc.verified_at
+    }
 
 
 @router.post("/submit")
@@ -381,14 +584,33 @@ async def persona_webhook(
     request: Request,
     db: AsyncSession = Depends(get_db)
 ):
-    """Handle Persona webhook events"""
+    """Handle Persona webhook events
+    
+    CRITICAL: Preserves verification_level and verification_type when updating status.
+    """
+    logger.info("=== PERSONA WEBHOOK RECEIVED ===")
+    
     try:
-        payload = await request.json()
+        # Get raw body for potential signature verification (read before JSON parsing)
+        body = await request.body()
+        
+        # Parse webhook payload
+        import json
+        payload = json.loads(body.decode('utf-8'))
+        
+        logger.info(f"Webhook payload: {json.dumps(payload, indent=2)}")
+        
+        # Extract webhook data - CRITICAL FIX: inquiry_id is in data.id, not relationships
         event_type = payload.get("data", {}).get("attributes", {}).get("name")
-        inquiry_id = payload.get("data", {}).get("relationships", {}).get("inquiry", {}).get("data", {}).get("id")
+        inquiry_id = payload.get("data", {}).get("id")  # FIXED: Was using relationships.inquiry.data.id
+        
+        logger.info(f"Webhook event: {event_type}, inquiry_id: {inquiry_id}")
         
         if not inquiry_id:
-            return {"status": "ignored"}
+            logger.warning("Missing inquiry_id in webhook payload")
+            # Log payload structure for debugging
+            logger.warning(f"Payload structure: {list(payload.get('data', {}).keys())}")
+            return {"status": "ignored", "message": "Missing inquiry_id"}
         
         # Find KYC by inquiry ID
         kyc_result = await db.execute(
@@ -398,35 +620,108 @@ async def persona_webhook(
         
         if not kyc:
             logger.warning(f"KYC not found for inquiry {inquiry_id}")
-            return {"status": "ignored"}
+            # Log all existing inquiry IDs for debugging
+            all_kyc_result = await db.execute(
+                select(KYCVerification.persona_inquiry_id).where(
+                    KYCVerification.persona_inquiry_id.isnot(None)
+                )
+            )
+            existing_ids = [row[0] for row in all_kyc_result.fetchall()]
+            logger.info(f"Existing persona_inquiry_ids in database: {existing_ids}")
+            return {"status": "ignored", "message": "KYC not found"}
+        
+        logger.info(f"Found KYC record: id={kyc.id}, current_status={kyc.status.value if hasattr(kyc.status, 'value') else kyc.status}")
+        
+        # Get account and user for is_verified updates
+        account_result = await db.execute(
+            select(Account).where(Account.id == kyc.account_id)
+        )
+        account = account_result.scalar_one_or_none()
+        
+        # CRITICAL: Preserve verification_level and verification_type (if exists)
+        old_verification_level = kyc.verification_level
+        old_verification_type = getattr(kyc, 'verification_type', None)  # May not exist on KYC model
+        
+        logger.info(f"Preserving values: level={old_verification_level}, type={old_verification_type}")
         
         # Handle different event types
         if event_type == "inquiry.completed":
-            kyc.status = KYCStatus.APPROVED
-            kyc.verified_at = datetime.utcnow()
-            # Update user verification status
-            account_result = await db.execute(
-                select(Account).where(Account.id == kyc.account_id)
-            )
-            account = account_result.scalar_one_or_none()
-            if account:
-                account.user.is_verified = True
+            # Check verification status to determine if approved or pending review
+            attributes = payload.get("data", {}).get("attributes", {})
+            verification_status = attributes.get("verification-status")
+            
+            if verification_status == "approved":
+                logger.info("Updating status to approved")
+                kyc.status = KYCStatus.APPROVED
+                kyc.verified_at = datetime.utcnow()
+                
+                # Update verification level if available
+                if attributes.get("verification-level"):
+                    kyc.verification_level = attributes.get("verification-level")
+                
+                # Update user verification status - ONLY set to True when APPROVED
+                if account:
+                    account.user.is_verified = True
+            elif verification_status == "pending":
+                logger.info("Updating status to pending_review")
+                kyc.status = KYCStatus.PENDING_REVIEW
+                # Set user as NOT verified
+                if account:
+                    account.user.is_verified = False
+            elif verification_status == "failed":
+                logger.info("Updating status to rejected")
+                kyc.status = KYCStatus.REJECTED
+                kyc.rejection_reason = attributes.get("failure-reason", "Verification failed")
+                # Set user as NOT verified
+                if account:
+                    account.user.is_verified = False
+            else:
+                # Default to approved if completed but no verification-status
+                logger.info("Updating status to approved (default for completed)")
+                kyc.status = KYCStatus.APPROVED
+                kyc.verified_at = datetime.utcnow()
+                
+                # Update verification level if available
+                if attributes.get("verification-level"):
+                    kyc.verification_level = attributes.get("verification-level")
+                # Set user as verified
+                if account:
+                    account.user.is_verified = True
         
         elif event_type == "inquiry.failed":
+            logger.info("Updating status to rejected")
             kyc.status = KYCStatus.REJECTED
             attributes = payload.get("data", {}).get("attributes", {})
             kyc.rejection_reason = attributes.get("failure-reason", "Verification failed")
+            # Set user as NOT verified
+            if account:
+                account.user.is_verified = False
         
         elif event_type == "inquiry.requires-attention":
+            logger.info("Updating status to pending_review")
             kyc.status = KYCStatus.PENDING_REVIEW
+            # Set user as NOT verified
+            if account:
+                account.user.is_verified = False
+        
+        # CRITICAL: Restore preserved values
+        kyc.verification_level = old_verification_level
+        if hasattr(kyc, 'verification_type'):
+            kyc.verification_type = old_verification_type
         
         kyc.persona_response = payload
         await db.commit()
+        await db.refresh(kyc)
         
-        logger.info(f"KYC webhook processed: {event_type} for inquiry {inquiry_id}")
-        return {"status": "success"}
+        logger.info(f"KYC webhook processed successfully: event={event_type}, inquiry_id={inquiry_id}, new_status={kyc.status.value if hasattr(kyc.status, 'value') else kyc.status}")
+        logger.info(f"Preserved values after update: level={kyc.verification_level}, type={getattr(kyc, 'verification_type', 'N/A')}")
+        
+        return {"status": "success", "message": "KYC status updated"}
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse webhook JSON: {e}")
+        return {"status": "error", "message": "Invalid JSON payload"}
     except Exception as e:
-        logger.error(f"Failed to process Persona webhook: {e}")
+        logger.error(f"Failed to process Persona webhook: {e}", exc_info=True)
         return {"status": "error", "message": str(e)}
 
 
@@ -469,6 +764,9 @@ async def resubmit_kyc(
         kyc.rejection_reason = None
         kyc.persona_response = persona_response
         
+        # Set user as NOT verified when resubmitting (KYC is in progress again)
+        account.user.is_verified = False
+        
         await db.commit()
         await db.refresh(kyc)
         
@@ -477,6 +775,151 @@ async def resubmit_kyc(
     except Exception as e:
         logger.error(f"Failed to resubmit KYC: {e}")
         raise BadRequestException("Failed to resubmit KYC verification")
+
+
+@router.post("/sync-status")
+async def sync_kyc_status(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Manually sync KYC status with Persona API"""
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+    
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+    
+    kyc_result = await db.execute(
+        select(KYCVerification).where(KYCVerification.account_id == account.id)
+    )
+    kyc = kyc_result.scalar_one_or_none()
+    
+    if not kyc or not kyc.persona_inquiry_id:
+        raise NotFoundException("KYC Verification", str(account.id))
+    
+    # Query Persona API for latest status
+    try:
+        logger.info(f"[KYC SYNC-STATUS] Starting sync for inquiry: {kyc.persona_inquiry_id}")
+        logger.info(f"[KYC SYNC-STATUS] Current database status: {kyc.status.value if hasattr(kyc.status, 'value') else kyc.status}")
+        
+        persona_data = PersonaClient.get_inquiry(kyc.persona_inquiry_id)
+        if not persona_data:
+            logger.error(f"[KYC SYNC-STATUS] Persona API returned None for inquiry: {kyc.persona_inquiry_id}")
+            raise BadRequestException("Failed to fetch status from Persona")
+        
+        # Log full Persona response for debugging
+        import json
+        logger.info(f"[KYC SYNC-STATUS] Full Persona API response: {json.dumps(persona_data, indent=2, default=str)}")
+        
+        attributes = persona_data.get("data", {}).get("attributes", {})
+        logger.info(f"[KYC SYNC-STATUS] Attributes keys: {list(attributes.keys()) if attributes else 'None'}")
+        
+        status_str = attributes.get("status")
+        logger.info(f"[KYC SYNC-STATUS] Persona status field value: '{status_str}'")
+        
+        # Check all possible status-related fields
+        verification_status = attributes.get("verification-status")
+        verification_state = attributes.get("verification_state")
+        state = attributes.get("state")
+        logger.info(f"[KYC SYNC-STATUS] verification-status: '{verification_status}', verification_state: '{verification_state}', state: '{state}'")
+        
+        old_status = kyc.status
+        
+        # Properly map Persona statuses to KYC statuses
+        # NOTE: Persona can return "approved" directly OR "completed" with verification-status
+        if status_str == "approved":
+            # Persona returns "approved" directly when verification is complete and approved
+            logger.info(f"[KYC SYNC-STATUS] Status is 'approved'. Setting to APPROVED")
+            kyc.status = KYCStatus.APPROVED
+            kyc.verified_at = datetime.utcnow()
+            # Update verification level if available
+            verification_level = attributes.get("verification-level") or attributes.get("verification_level")
+            if verification_level:
+                logger.info(f"[KYC SYNC-STATUS] Updating verification_level to: {verification_level}")
+                kyc.verification_level = verification_level
+            
+            # Update user verification status - ONLY set to True when APPROVED
+            account.user.is_verified = True
+        elif status_str == "completed":
+            if verification_status == "approved":
+                logger.info(f"[KYC SYNC-STATUS] verification-status is 'approved'. Setting to APPROVED")
+                kyc.status = KYCStatus.APPROVED
+                kyc.verified_at = datetime.utcnow()
+                # Update verification level if available
+                verification_level = attributes.get("verification-level") or attributes.get("verification_level")
+                if verification_level:
+                    logger.info(f"[KYC SYNC-STATUS] Updating verification_level to: {verification_level}")
+                    kyc.verification_level = verification_level
+                
+                # Update user verification status - ONLY set to True when APPROVED
+                account.user.is_verified = True
+            elif verification_status == "pending":
+                logger.info(f"[KYC SYNC-STATUS] verification-status is 'pending'. Setting to PENDING_REVIEW")
+                kyc.status = KYCStatus.PENDING_REVIEW
+                # Set user as NOT verified
+                account.user.is_verified = False
+            elif verification_status == "failed":
+                logger.info(f"[KYC SYNC-STATUS] verification-status is 'failed'. Setting to REJECTED")
+                kyc.status = KYCStatus.REJECTED
+                kyc.rejection_reason = attributes.get("failure-reason", "Verification failed")
+                # Set user as NOT verified
+                account.user.is_verified = False
+            else:
+                # Default to approved if completed but no verification-status
+                logger.info(f"[KYC SYNC-STATUS] Status is 'completed' but verification-status is '{verification_status}' (not found/unknown). Defaulting to APPROVED")
+                kyc.status = KYCStatus.APPROVED
+                kyc.verified_at = datetime.utcnow()
+                verification_level = attributes.get("verification-level") or attributes.get("verification_level")
+                if verification_level:
+                    logger.info(f"[KYC SYNC-STATUS] Updating verification_level to: {verification_level}")
+                    kyc.verification_level = verification_level
+                # Set user as verified (defaulting to approved)
+                account.user.is_verified = True
+        elif status_str == "failed":
+            logger.info(f"[KYC SYNC-STATUS] Status is 'failed'. Setting to REJECTED")
+            kyc.status = KYCStatus.REJECTED
+            kyc.rejection_reason = attributes.get("failure-reason", "Verification failed")
+            # Set user as NOT verified
+            account.user.is_verified = False
+        elif status_str == "pending":
+            logger.info(f"[KYC SYNC-STATUS] Status is 'pending'. Setting to PENDING_REVIEW")
+            kyc.status = KYCStatus.PENDING_REVIEW
+            # Set user as NOT verified
+            account.user.is_verified = False
+        elif status_str in ["processing", "waiting"]:
+            logger.info(f"[KYC SYNC-STATUS] Status is '{status_str}'. Keeping as IN_PROGRESS")
+            kyc.status = KYCStatus.IN_PROGRESS
+            # Set user as NOT verified (KYC is still in progress)
+            account.user.is_verified = False
+        else:
+            logger.warning(f"[KYC SYNC-STATUS] Unknown status value: '{status_str}'. Keeping current status: {kyc.status}")
+            # For unknown statuses, set user as NOT verified to be safe (unless already approved)
+            if kyc.status != KYCStatus.APPROVED:
+                account.user.is_verified = False
+        
+        # Update verification level if available
+        verification_level = attributes.get("verification-level") or attributes.get("verification_level")
+        if verification_level and not kyc.verification_level:
+            logger.info(f"[KYC SYNC-STATUS] Updating verification_level to: {verification_level}")
+            kyc.verification_level = verification_level
+        
+        kyc.persona_response = persona_data
+        await db.commit()
+        await db.refresh(kyc)
+        
+        logger.info(f"[KYC SYNC-STATUS] Status synced successfully: {old_status.value if hasattr(old_status, 'value') else old_status} -> {kyc.status.value if hasattr(kyc.status, 'value') else kyc.status}")
+        
+        return {
+            "status": kyc.status.value if hasattr(kyc.status, 'value') else str(kyc.status),
+            "message": "Status synced successfully",
+            "verification_level": kyc.verification_level,
+            "verified_at": kyc.verified_at.isoformat() if kyc.verified_at else None
+        }
+    except Exception as e:
+        logger.error(f"[KYC SYNC-STATUS] Failed to sync KYC status: {e}", exc_info=True)
+        raise BadRequestException(f"Failed to sync status: {str(e)}")
 
 
 @router.get("/rejection-reason")

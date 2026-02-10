@@ -9,7 +9,11 @@ from app.config import settings
 # Import all models to ensure they're registered with Base.metadata
 from app.models.user import User
 from app.models.account import Account
-from app.models.asset import Asset, AssetValuation, AssetOwnership
+from app.models.asset import (
+    Asset, AssetValuation, AssetOwnership, AssetCategory, AssetPhoto,
+    AssetDocument, AssetAppraisal, AssetSaleRequest, AssetTransfer,
+    AssetShare, AssetReport
+)
 from app.models.portfolio import Portfolio
 from app.models.order import Order, OrderHistory
 from app.models.marketplace import MarketplaceListing, Offer, EscrowTransaction
@@ -18,10 +22,19 @@ from app.models.banking import LinkedAccount, Transaction
 from app.models.kyc import KYCVerification
 from app.models.kyb import KYBVerification
 from app.models.document import Document
+from app.models.document_share import DocumentShare
+from app.models.report import Report
+from app.models.entity import Entity, EntityCompliance, EntityPerson, EntityDocument, EntityAuditTrail
 from app.models.support import SupportTicket
 from app.models.ticket_reply import TicketReply
 from app.models.notification import Notification
 from app.models.joint_invitation import JointAccountInvitation
+from app.models.compliance import (
+    ComplianceTask, ComplianceTaskDocument, ComplianceTaskComment, ComplianceTaskHistory,
+    ComplianceAudit, ComplianceAlert, ComplianceScore, ComplianceMetrics,
+    ComplianceReport, CompliancePolicy
+)
+from app.models.user_preferences import UserPreferences
 
 config = context.config
 

@@ -612,7 +612,7 @@ async def pay_invoice(
     return payment
 
 
-@router.get("/payments/stats")
+@router.get("/stats")
 async def get_payment_stats(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)

@@ -30,5 +30,14 @@ class User(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     last_login = Column(DateTime(timezone=True))
     
+    # Two-Factor Authentication
+    two_factor_auth_enabled = Column(Boolean, default=False, nullable=False)
+    two_factor_auth_verified = Column(Boolean, default=False, nullable=False)
+    two_factor_auth_secret = Column(String(255), nullable=True)  # TOTP secret
+    two_factor_auth_method = Column(String(20), nullable=True)  # 'totp', 'sms', 'email'
+    two_factor_backup_codes = Column(String(1000), nullable=True)  # JSON array of backup codes
+    deactivated_at = Column(DateTime(timezone=True), nullable=True)  # Soft delete timestamp
+    
     account = relationship("Account", back_populates="user", uselist=False)
+    preferences = relationship("UserPreferences", back_populates="user", uselist=False, cascade="all, delete-orphan")
 

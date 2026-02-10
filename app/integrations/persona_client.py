@@ -74,16 +74,23 @@ class PersonaClient:
     @staticmethod
     def get_inquiry(inquiry_id: str) -> Optional[Dict[str, Any]]:
         try:
+            logger.info(f"[PERSONA CLIENT] Fetching inquiry: {inquiry_id}")
             with httpx.Client() as client:
                 response = client.get(
                     f"{PersonaClient.BASE_URL}/inquiries/{inquiry_id}",
                     headers=PersonaClient._get_headers(),
                     timeout=30.0
                 )
+                logger.info(f"[PERSONA CLIENT] Response status code: {response.status_code}")
                 response.raise_for_status()
-                return response.json()
+                response_data = response.json()
+                logger.info(f"[PERSONA CLIENT] Successfully fetched inquiry. Response structure: data={bool(response_data.get('data'))}, attributes={bool(response_data.get('data', {}).get('attributes'))}")
+                return response_data
+        except httpx.HTTPStatusError as e:
+            logger.error(f"[PERSONA CLIENT] HTTP error fetching inquiry {inquiry_id}: {e.response.status_code} - {e.response.text}")
+            return None
         except Exception as e:
-            logger.error(f"Failed to get Persona inquiry: {e}")
+            logger.error(f"[PERSONA CLIENT] Failed to get Persona inquiry {inquiry_id}: {e}", exc_info=True)
             return None
 
     @staticmethod
@@ -177,4 +184,53 @@ class PersonaClient:
         except Exception as e:
             logger.error(f"Failed to redact Persona inquiry: {e}")
             return None
+
+    @staticmethod
+    def get_verification_url(inquiry_id: str, redirect_uri: Optional[str] = None) -> str:
+        """
+        Get the Persona hosted verification URL for an inquiry.
+        
+        Args:
+            inquiry_id: The Persona inquiry ID
+            redirect_uri: Optional redirect URI after verification completes
+            
+        Returns:
+            The verification URL to redirect users to
+        """
+        base_url = f"https://inquiry.withpersona.com/verify?inquiry-id={inquiry_id}"
+        
+        if redirect_uri:
+            base_url += f"&redirect-uri={redirect_uri}"
+        
+        return base_url
+
+    @staticmethod
+    def extract_verification_url_from_response(inquiry_response: Dict[str, Any], redirect_uri: Optional[str] = None) -> Optional[str]:
+        """
+        Extract verification URL from Persona inquiry response.
+        
+        Persona may return the verification URL in the response, or we construct it.
+        
+        Args:
+            inquiry_response: The response from create_inquiry
+            redirect_uri: Optional redirect URI after verification completes
+            
+        Returns:
+            The verification URL or None if inquiry_id is missing
+        """
+        inquiry_id = inquiry_response.get("data", {}).get("id")
+        if not inquiry_id:
+            return None
+        
+        # Check if Persona provided a verification URL in the response
+        verification_url = inquiry_response.get("data", {}).get("attributes", {}).get("verification-url")
+        if verification_url:
+            if redirect_uri:
+                # Append redirect URI if provided
+                separator = "&" if "?" in verification_url else "?"
+                return f"{verification_url}{separator}redirect-uri={redirect_uri}"
+            return verification_url
+        
+        # Construct the verification URL if not provided
+        return PersonaClient.get_verification_url(inquiry_id, redirect_uri)
 

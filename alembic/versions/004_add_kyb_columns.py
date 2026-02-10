@@ -1,7 +1,7 @@
 """Add missing columns to kyb_verifications table
 
 Revision ID: 004_add_kyb_columns
-Revises: 003_enable_rls_alembic_version
+Revises: 003_enable_rls_alembic
 Create Date: 2024-12-19 12:00:00.000000
 
 """
@@ -11,7 +11,7 @@ from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision = '004_add_kyb_columns'
-down_revision = '003_enable_rls_alembic_version'
+down_revision = '003_enable_rls_alembic'
 branch_labels = None
 depends_on = None
 

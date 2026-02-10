@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, status, HTTPException, Query, Body
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from typing import List, Optional, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from app.database import get_db
 from app.api.deps import get_current_user
@@ -12,6 +12,8 @@ from app.models.kyc import KYCVerification, KYCStatus
 from app.models.joint_invitation import JointAccountInvitation, InvitationStatus
 from app.models.payment import Payment, PaymentStatus
 from app.models.asset import Asset
+from app.models.banking import LinkedAccount, AccountType as BankingAccountType
+from app.integrations.alpaca_client import AlpacaClient
 from app.schemas.account import AccountCreate, AccountResponse
 from app.core.exceptions import ConflictException, NotFoundException, BadRequestException, UnauthorizedException
 from app.core.permissions import Role, Permission, has_permission
@@ -69,6 +71,108 @@ async def create_account(
     
     logger.info(f"Account created for user {current_user.id}")
     return account
+
+
+@router.get("", response_model=Dict[str, List[Dict[str, Any]]])
+async def get_user_accounts(
+    type: Optional[str] = Query("all", description="Filter by type: checking, savings, investment, brokerage, all"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get all user accounts for transfers and trading (linked accounts, brokerage, investment)"""
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+    
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+    
+    accounts_list = []
+    
+    # Get linked accounts (banking accounts from Plaid)
+    if type in ["all", "checking", "savings"]:
+        linked_accounts_result = await db.execute(
+            select(LinkedAccount).where(
+                and_(
+                    LinkedAccount.account_id == account.id,
+                    LinkedAccount.is_active == True
+                )
+            )
+        )
+        linked_accounts = linked_accounts_result.scalars().all()
+        
+        for linked_account in linked_accounts:
+            account_type_map = {
+                BankingAccountType.BANKING: "checking",
+                BankingAccountType.BROKERAGE: "brokerage",
+                BankingAccountType.CRYPTO: "investment"
+            }
+            
+            account_type = account_type_map.get(linked_account.account_type, "checking")
+            
+            # Filter by type if specified
+            if type != "all" and account_type != type:
+                continue
+            
+            accounts_list.append({
+                "id": str(linked_account.id),
+                "name": linked_account.account_name,
+                "type": account_type,
+                "masked_number": f"****{linked_account.account_number[-4:]}" if linked_account.account_number and len(linked_account.account_number) >= 4 else "****",
+                "balance": float(linked_account.balance) if linked_account.balance else 0.0,
+                "currency": linked_account.currency,
+                "available_balance": float(linked_account.balance) if linked_account.balance else 0.0
+            })
+    
+    # Get brokerage accounts (from Alpaca)
+    if type in ["all", "brokerage", "investment"]:
+        try:
+            alpaca_account = AlpacaClient.get_account()
+            if alpaca_account:
+                if isinstance(alpaca_account, dict):
+                    account_data = alpaca_account
+                else:
+                    account_data = {
+                        "account_number": getattr(alpaca_account, "account_number", ""),
+                        "cash": float(getattr(alpaca_account, "cash", 0)),
+                        "portfolio_value": float(getattr(alpaca_account, "portfolio_value", 0)),
+                        "buying_power": float(getattr(alpaca_account, "buying_power", 0))
+                    }
+                
+                accounts_list.append({
+                    "id": f"broker_{account_data.get('account_number', 'default')}",
+                    "name": "Primary Trading Account",
+                    "type": "brokerage",
+                    "masked_number": f"****{str(account_data.get('account_number', ''))[-4:]}" if account_data.get('account_number') else "****",
+                    "balance": account_data.get("portfolio_value", 0),
+                    "currency": "USD",
+                    "available_balance": account_data.get("buying_power", 0)
+                })
+        except Exception as e:
+            logger.error(f"Failed to get Alpaca account: {e}")
+    
+    # Get investment accounts (from portfolio/assets)
+    if type in ["all", "investment"]:
+        # Add main investment account based on portfolio
+        from app.models.portfolio import Portfolio
+        portfolio_result = await db.execute(
+            select(Portfolio).where(Portfolio.account_id == account.id)
+        )
+        portfolio = portfolio_result.scalar_one_or_none()
+        
+        if portfolio and portfolio.total_value > 0:
+            accounts_list.append({
+                "id": f"investment_{account.id}",
+                "name": "Investment Portfolio",
+                "type": "investment",
+                "masked_number": "****",
+                "balance": float(portfolio.total_value),
+                "currency": portfolio.currency,
+                "available_balance": float(portfolio.total_value)
+            })
+    
+    return {"data": accounts_list}
 
 
 @router.get("/me", response_model=AccountResponse)
@@ -443,8 +547,16 @@ async def get_account_stats(
     if not account:
         raise NotFoundException("Account", str(current_user.id))
     
-    # Account age
-    account_age_days = (datetime.utcnow() - account.created_at).days
+    # Account age (handle timezone-aware vs naive datetimes safely)
+    now = datetime.now(timezone.utc)
+    created_at = account.created_at
+    if created_at is None:
+        account_age_days = 0
+    else:
+        # Ensure created_at is timezone-aware in UTC for safe subtraction
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        account_age_days = (now - created_at).days
     
     # Total transactions
     transactions_result = await db.execute(
