@@ -4,10 +4,24 @@ from sqlalchemy import select, and_, or_, func, case
 from typing import List, Optional
 from decimal import Decimal
 from datetime import datetime, timedelta
+from uuid import UUID
 from app.database import get_db
 from app.api.deps import get_current_user
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from app.core.security import decode_access_token
+from app.models.user import User
+from app.models.account import Account, AccountType
+from app.models.asset import Asset
+from app.models.marketplace import (
+    MarketplaceListing, Offer, EscrowTransaction, WatchlistItem,
+    ListingStatus, OfferStatus, EscrowStatus
+)
+from app.core.exceptions import NotFoundException, BadRequestException, UnauthorizedException, ForbiddenException
+from app.core.permissions import Role, Permission, has_permission
+from app.utils.logger import logger
+from app.utils.helpers import calculate_listing_fee, calculate_commission, generate_reference_id
+from app.integrations.stripe_client import StripeClient
+from pydantic import BaseModel
 
 security = HTTPBearer(auto_error=False)
 
@@ -39,20 +53,6 @@ async def get_optional_user(
         pass
     
     return None
-from app.models.user import User
-from app.models.account import Account, AccountType
-from app.models.asset import Asset
-from app.models.marketplace import (
-    MarketplaceListing, Offer, EscrowTransaction, WatchlistItem,
-    ListingStatus, OfferStatus, EscrowStatus
-)
-from app.core.exceptions import NotFoundException, BadRequestException, UnauthorizedException, ForbiddenException
-from app.core.permissions import Role, Permission, has_permission
-from app.utils.logger import logger
-from app.utils.helpers import calculate_listing_fee, calculate_commission, generate_reference_id
-from app.integrations.stripe_client import StripeClient
-from uuid import UUID
-from pydantic import BaseModel
 
 router = APIRouter()
 
