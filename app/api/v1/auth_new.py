@@ -301,11 +301,16 @@ async def verify_otp(request: OTPVerify, db: AsyncSession = Depends(get_db)):
         if user.otp_expires_at and user.otp_expires_at < now:
             raise BadRequestException("OTP code has expired")
         
-        user.otp_code = None
-        user.otp_expires_at = None
-        user.is_verified = True
+        # If purpose is "password_reset", don't clear the OTP - it will be used again in reset-password
+        # For email verification or other purposes, clear the OTP after verification
+        if request.purpose != "password_reset":
+            user.otp_code = None
+            user.otp_expires_at = None
+            user.is_verified = True
+        # For password reset, keep the OTP so it can be used in reset-password endpoint
+        
         await db.commit()
-        logger.info(f"OTP verified successfully for user: {user.email}")
+        logger.info(f"OTP verified successfully for user: {user.email}, purpose: {request.purpose or 'email_verification'}")
         return {"message": "OTP verified successfully"}
     except (NotFoundException, BadRequestException) as e:
         # Re-raise known exceptions
@@ -327,26 +332,65 @@ async def request_password_reset(request: PasswordResetRequest, db: AsyncSession
     user = result.scalar_one_or_none()
     if not user:
         return {"message": "If the email exists, a password reset link has been sent"}
+    
+    # Generate both reset token and OTP for flexibility
     reset_token = generate_reset_token()
+    otp_code = generate_otp()
+    
     user.password_reset_token = reset_token
-    user.password_reset_expires_at = datetime.utcnow() + timedelta(hours=1)
+    user.password_reset_expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    user.otp_code = otp_code
+    user.otp_expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+    
     await db.commit()
     user_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "User"
+    
+    # Send both token-based reset email and OTP email
     await EmailService.send_password_reset_email(to_email=user.email, to_name=user_name, reset_token=reset_token)
+    await EmailService.send_otp_email(to_email=user.email, to_name=user_name, otp_code=otp_code)
+    
     return {"message": "If the email exists, a password reset link has been sent"}
 
 @router.post("/reset-password")
 async def reset_password(request: PasswordReset, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).where(User.password_reset_token == request.token))
-    user = result.scalar_one_or_none()
-    if not user:
-        raise BadRequestException("Invalid reset token")
-    if user.password_reset_expires_at and user.password_reset_expires_at < datetime.utcnow():
-        raise BadRequestException("Reset token has expired")
+    # Support both token-based and OTP-based password reset
+    if request.token:
+        # Token-based reset (original method)
+        result = await db.execute(select(User).where(User.password_reset_token == request.token))
+        user = result.scalar_one_or_none()
+        if not user:
+            raise BadRequestException("Invalid reset token")
+        if user.password_reset_expires_at and user.password_reset_expires_at < datetime.now(timezone.utc):
+            raise BadRequestException("Reset token has expired")
+    elif request.email and request.otp_code:
+        # OTP-based reset
+        result = await db.execute(select(User).where(User.email == request.email))
+        user = result.scalar_one_or_none()
+        if not user:
+            raise NotFoundException("User", request.email)
+        
+        # Verify OTP
+        user_otp = str(user.otp_code) if user.otp_code else None
+        request_otp = str(request.otp_code).strip()
+        
+        if not user_otp or user_otp != request_otp:
+            raise BadRequestException("Invalid OTP code")
+        
+        # Check OTP expiration
+        now = datetime.now(timezone.utc)
+        if user.otp_expires_at and user.otp_expires_at < now:
+            raise BadRequestException("OTP code has expired")
+    else:
+        raise BadRequestException("No reset token found. Please use the link from your email or request a new password reset.")
+    
+    # Reset password
     user.hashed_password = get_password_hash(request.new_password)
     user.password_reset_token = None
     user.password_reset_expires_at = None
+    user.otp_code = None
+    user.otp_expires_at = None
     await db.commit()
+    logger.info(f"Password reset successfully for user: {user.email}")
     return {"message": "Password reset successfully"}
 
 @router.post("/verify-email")

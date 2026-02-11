@@ -63,6 +63,7 @@ class OTPRequest(BaseModel):
 class OTPVerify(BaseModel):
     email: EmailStr
     otp_code: str
+    purpose: Optional[str] = None  # "email_verification" or "password_reset"
 
 
 class PasswordResetRequest(BaseModel):
@@ -70,7 +71,9 @@ class PasswordResetRequest(BaseModel):
 
 
 class PasswordReset(BaseModel):
-    token: str
+    token: Optional[str] = None
+    email: Optional[EmailStr] = None
+    otp_code: Optional[str] = None
     new_password: str
 
 
