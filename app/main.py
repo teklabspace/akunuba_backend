@@ -68,6 +68,17 @@ else:
     for localhost_origin in localhost_origins:
         if localhost_origin not in origins:
             origins.append(localhost_origin)
+    
+    # Add production frontend origins
+    production_origins = [
+        "https://akunuba.vercel.app",
+        "https://akunuba.io",
+        "https://www.akunuba.io"
+    ]
+    # Add production origins if not already present
+    for prod_origin in production_origins:
+        if prod_origin not in origins:
+            origins.append(prod_origin)
 
 app.add_middleware(
     CORSMiddleware,
@@ -209,8 +220,8 @@ async def general_exception_handler(request: Request, exc: Exception):
             response.headers["Access-Control-Allow-Origin"] = origins[0] if origins else "*"
     
     # Always add these headers
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Accept, X-Requested-With, *"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Accept, X-Requested-With, *"
     response.headers["Access-Control-Expose-Headers"] = "*"
     return response
 
