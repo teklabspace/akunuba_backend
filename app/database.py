@@ -3,6 +3,21 @@ from sqlalchemy.orm import declarative_base
 from sqlalchemy.pool import NullPool
 from app.config import settings
 import ssl
+from urllib.parse import urlparse, urlunparse, parse_qs
+
+# Clean DATABASE_URL - remove query parameters that asyncpg doesn't understand
+# asyncpg doesn't support sslmode in the URL, we handle SSL via connect_args
+database_url = settings.DATABASE_URL
+parsed = urlparse(database_url)
+# Remove query parameters (like ?sslmode=require)
+clean_url = urlunparse((
+    parsed.scheme,
+    parsed.netloc,
+    parsed.path,
+    parsed.params,
+    '',  # Remove query string
+    parsed.fragment
+))
 
 # Configure SSL for Supabase connections
 # For asyncpg, SSL should be True or an SSLContext
@@ -22,11 +37,11 @@ connect_args = {
 # Add SSL for Supabase (required for cloud databases)
 # asyncpg accepts ssl as True, False, or an SSLContext
 # For Supabase, we need SSL enabled
-if "supabase" in settings.DATABASE_URL.lower() or "pooler" in settings.DATABASE_URL.lower():
+if "supabase" in clean_url.lower() or "pooler" in clean_url.lower():
     connect_args["ssl"] = True  # Enable SSL for Supabase
 
 engine = create_async_engine(
-    settings.DATABASE_URL,
+    clean_url,  # Use cleaned URL without query parameters
     echo=settings.APP_DEBUG,
     pool_pre_ping=True,  # Verify connections before using them
     pool_recycle=3600,   # Recycle connections after 1 hour
