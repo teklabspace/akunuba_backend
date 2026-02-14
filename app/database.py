@@ -4,18 +4,28 @@ from sqlalchemy.pool import NullPool
 from app.config import settings
 import ssl
 from urllib.parse import urlparse, urlunparse, parse_qs
+from app.utils.logger import logger
 
 # Clean DATABASE_URL - remove query parameters that asyncpg doesn't understand
 # asyncpg doesn't support sslmode in the URL, we handle SSL via connect_args
 database_url = settings.DATABASE_URL
-parsed = urlparse(database_url)
-# Remove query parameters (like ?sslmode=require)
+
+# Remove query parameters manually (more robust)
+if '?' in database_url:
+    original_url = database_url
+    clean_url = database_url.split('?')[0]
+    logger.warning(f"Removed query parameters from DATABASE_URL: {original_url} -> {clean_url}")
+else:
+    clean_url = database_url
+
+# Also parse and reconstruct to be safe
+parsed = urlparse(clean_url)
 clean_url = urlunparse((
     parsed.scheme,
     parsed.netloc,
     parsed.path,
     parsed.params,
-    '',  # Remove query string
+    '',  # Ensure no query string
     parsed.fragment
 ))
 
