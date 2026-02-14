@@ -304,17 +304,24 @@ async def startup_event():
             import asyncio
             from app.database import engine
             from sqlalchemy import text
+            logger.info("Testing database connection...")
             async with engine.connect() as conn:
-                # Add timeout to prevent hanging
+                # Add timeout to prevent hanging - increased for cloud connections
                 await asyncio.wait_for(
                     conn.execute(text("SELECT 1")),
-                    timeout=5.0  # 5 second timeout
+                    timeout=15.0  # Increased to 15 seconds for cloud connections
                 )
-            logger.info("Database connection verified")
+            logger.info("✅ Database connection verified successfully")
         except asyncio.TimeoutError:
-            logger.warning("Database connection test timed out - server will continue but database may not be accessible")
+            logger.error("❌ Database connection test timed out after 15 seconds")
+            logger.error("   This usually means:")
+            logger.error("   1. Network connectivity issue from Render to Supabase")
+            logger.error("   2. Wrong DATABASE_URL (check host, port, credentials)")
+            logger.error("   3. Supabase firewall blocking Render IPs")
+            logger.error("   Server will continue but database operations will fail")
         except Exception as e:
-            logger.error(f"Database connection failed: {e}")
+            logger.error(f"❌ Database connection failed: {type(e).__name__}: {e}")
+            logger.error(f"   Full error: {str(e)}")
             # Don't fail startup, but log the error
             # The app can still start, but database operations will fail
         
