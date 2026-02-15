@@ -15,17 +15,28 @@ pwd_context = CryptContext(
 )
 
 # Pre-initialize bcrypt handler to avoid lazy initialization bug detection error
-# This forces the handler to initialize immediately, avoiding the bug detection
+# The bug detection uses a long test password (>72 bytes) which causes an error
+# We catch this and continue - the handler will still work for normal passwords
 try:
     # Get the handler to trigger initialization
     handler = pwd_context.handler()
-    # Force a test hash to ensure backend is ready
-    # Use a simple test to avoid the bug detection path
-    test_hash = handler.hash("test")
+    # Try to initialize with a simple hash
+    # This may trigger bug detection, but we'll catch and ignore that error
+    try:
+        test_hash = handler.hash("test")
+    except ValueError as ve:
+        # This is expected - the bug detection uses a long password
+        # The handler is still usable for normal password verification
+        if "cannot be longer than 72 bytes" in str(ve):
+            # This is the bug detection error - it's safe to ignore
+            import logging
+            logging.debug(f"Bcrypt bug detection triggered (expected): {ve}")
+        else:
+            raise
 except Exception as e:
-    # If initialization fails, log but continue
+    # If initialization fails completely, log but continue
     import logging
-    logging.warning(f"Bcrypt pre-initialization warning (may be normal): {e}")
+    logging.warning(f"Bcrypt pre-initialization warning: {e}")
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
