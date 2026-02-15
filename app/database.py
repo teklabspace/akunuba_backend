@@ -51,15 +51,16 @@ connect_args = {
         "application_name": "fullego_backend"
     },
     "command_timeout": 60,  # Increased timeout for cloud connections
-    "timeout": 60,           # Increased connection timeout
+    "timeout": 90,           # Increased connection timeout to 90 seconds
 }
 
 # Add SSL for Supabase (required for cloud databases)
 # asyncpg accepts ssl as True, False, or an SSLContext
 # For Supabase, we need SSL enabled
 if "supabase" in clean_url.lower() or "pooler" in clean_url.lower():
-    # Use SSL context for better compatibility
-    connect_args["ssl"] = ssl_context  # Use SSL context instead of True
+    # Try using True first (simpler SSL), fallback to context if needed
+    # Some Supabase poolers work better with ssl=True
+    connect_args["ssl"] = True  # Use simple SSL=True first
     logger.info(f"SSL enabled for database connection to: {parsed.netloc}")
 
 engine = create_async_engine(
