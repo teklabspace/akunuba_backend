@@ -299,32 +299,35 @@ async def startup_event():
             logger.warning("   Install with: pip install pyotp qrcode[pil]")
             logger.warning("   Or: python -m pip install pyotp qrcode[pil]")
         
-        # Test database connection with timeout
-        try:
-            import asyncio
-            from app.database import engine
-            from sqlalchemy import text
-            logger.info("Testing database connection...")
-            async with engine.connect() as conn:
-                # Add timeout to prevent hanging - increased for cloud connections
-                # Match the connection timeout (60s) but cap at 30s for startup test
-                await asyncio.wait_for(
-                    conn.execute(text("SELECT 1")),
-                    timeout=30.0  # Increased to 30 seconds to match connection timeout
-                )
-            logger.info("✅ Database connection verified successfully")
-        except asyncio.TimeoutError:
-            logger.error("❌ Database connection test timed out after 15 seconds")
-            logger.error("   This usually means:")
-            logger.error("   1. Network connectivity issue from Render to Supabase")
-            logger.error("   2. Wrong DATABASE_URL (check host, port, credentials)")
-            logger.error("   3. Supabase firewall blocking Render IPs")
-            logger.error("   Server will continue but database operations will fail")
-        except Exception as e:
-            logger.error(f"❌ Database connection failed: {type(e).__name__}: {e}")
-            logger.error(f"   Full error: {str(e)}")
-            # Don't fail startup, but log the error
-            # The app can still start, but database operations will fail
+        # Test database connection with timeout (non-blocking)
+        # Run in background so it doesn't block startup
+        async def test_db_connection():
+            try:
+                import asyncio
+                from app.database import engine
+                from sqlalchemy import text
+                logger.info("Testing database connection...")
+                async with engine.connect() as conn:
+                    # Add timeout to prevent hanging - increased for cloud connections
+                    await asyncio.wait_for(
+                        conn.execute(text("SELECT 1")),
+                        timeout=30.0  # 30 seconds timeout
+                    )
+                logger.info("✅ Database connection verified successfully")
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ Database connection test timed out after 30 seconds")
+                logger.warning("   The connection might work for actual requests.")
+                logger.warning("   If login fails, check:")
+                logger.warning("   1. DATABASE_URL is correct (host, port, credentials)")
+                logger.warning("   2. Supabase network restrictions allow all IPs")
+                logger.warning("   3. Try Transaction Pooler (port 6543) instead of Session (5432)")
+            except Exception as e:
+                logger.warning(f"⚠️ Database connection test failed: {type(e).__name__}: {e}")
+                logger.warning("   The connection might still work for actual requests.")
+        
+        # Run test in background (don't await - non-blocking)
+        import asyncio
+        asyncio.create_task(test_db_connection())
         
         # Start background job scheduler
         from app.core.scheduler import scheduler, setup_scheduled_tasks
