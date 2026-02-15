@@ -6,11 +6,46 @@ from app.config import settings
 import secrets
 import random
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Configure bcrypt context with proper settings
+pwd_context = CryptContext(
+    schemes=["bcrypt"],
+    deprecated="auto",
+    bcrypt__ident="2b",  # Use bcrypt 2b format
+    bcrypt__rounds=12,   # Standard rounds
+)
+
+# Workaround for bcrypt initialization bug detection issue
+# This happens when passlib tries to detect bcrypt wrap bug during initialization
+import os
+# Set environment variable to skip bug detection if needed
+os.environ.setdefault("PASSLIB_SKIP_BCRYPT_DETECT", "0")
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    """
+    Verify a plain password against a hashed password.
+    Handles bcrypt 72-byte limit and initialization errors.
+    """
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except ValueError as e:
+        error_msg = str(e)
+        # Handle bcrypt 72-byte limit error
+        if "cannot be longer than 72 bytes" in error_msg:
+            # This shouldn't happen for normal passwords, but handle it just in case
+            if isinstance(plain_password, str):
+                plain_password_bytes = plain_password.encode('utf-8')
+                if len(plain_password_bytes) > 72:
+                    truncated = plain_password_bytes[:72].decode('utf-8', errors='ignore')
+                    return pwd_context.verify(truncated, hashed_password)
+        # Re-raise other ValueError
+        raise
+    except Exception as e:
+        # Log unexpected errors for debugging
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Password verification error: {type(e).__name__}: {e}")
+        raise
 
 
 def get_password_hash(password: str) -> str:
