@@ -74,7 +74,18 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 
 def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
+    """
+    Hash a password using passlib (for hashing, passlib works fine).
+    """
+    try:
+        return pwd_context.hash(password)
+    except Exception as e:
+        # Fallback to bcrypt directly if passlib fails
+        logger.warning(f"Passlib hashing failed, using bcrypt directly: {e}")
+        password_bytes = password.encode('utf-8')
+        salt = bcrypt.gensalt(rounds=12)
+        hashed = bcrypt.hashpw(password_bytes, salt)
+        return hashed.decode('utf-8')
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
