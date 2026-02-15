@@ -14,11 +14,18 @@ pwd_context = CryptContext(
     bcrypt__rounds=12,   # Standard rounds
 )
 
-# Workaround for bcrypt initialization bug detection issue
-# This happens when passlib tries to detect bcrypt wrap bug during initialization
-import os
-# Set environment variable to skip bug detection if needed
-os.environ.setdefault("PASSLIB_SKIP_BCRYPT_DETECT", "0")
+# Pre-initialize bcrypt handler to avoid lazy initialization bug detection error
+# This forces the handler to initialize immediately, avoiding the bug detection
+try:
+    # Get the handler to trigger initialization
+    handler = pwd_context.handler()
+    # Force a test hash to ensure backend is ready
+    # Use a simple test to avoid the bug detection path
+    test_hash = handler.hash("test")
+except Exception as e:
+    # If initialization fails, log but continue
+    import logging
+    logging.warning(f"Bcrypt pre-initialization warning (may be normal): {e}")
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
