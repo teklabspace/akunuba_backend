@@ -141,8 +141,15 @@ async def login(credentials: UserLogin, db: AsyncSession = Depends(get_db)):
     - First call (without totp_code): Returns requires_2fa=true and temp_token
     - Second call (with totp_code): Verifies 2FA and returns access_token
     """
-    result = await db.execute(select(User).where(User.email == credentials.email))
-    user = result.scalar_one_or_none()
+    try:
+        result = await db.execute(select(User).where(User.email == credentials.email))
+        user = result.scalar_one_or_none()
+    except Exception as e:
+        logger.error(f"Database error during login for {credentials.email}: {type(e).__name__}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection failed. Please try again later."
+        )
     if not user or not verify_password(credentials.password, user.hashed_password):
         raise UnauthorizedException("Incorrect email or password")
     if not user.is_active:
