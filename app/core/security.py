@@ -5,25 +5,13 @@ from passlib.context import CryptContext
 from app.config import settings
 import secrets
 import random
+import bcrypt
+import logging
 
-# Monkey patch passlib to skip bcrypt bug detection
-# This prevents the "password cannot be longer than 72 bytes" error during initialization
-try:
-    from passlib.handlers import bcrypt
-    original_detect_wrap_bug = bcrypt.detect_wrap_bug
-    
-    def patched_detect_wrap_bug(ident):
-        # Skip bug detection - always return False (no bug detected)
-        # This prevents the 72-byte password error during initialization
-        return False
-    
-    bcrypt.detect_wrap_bug = patched_detect_wrap_bug
-except Exception as e:
-    # If patching fails, log but continue
-    import logging
-    logging.warning(f"Failed to patch bcrypt bug detection: {e}")
+logger = logging.getLogger(__name__)
 
-# Configure bcrypt context with proper settings
+# Configure bcrypt context with proper settings for hashing
+# We'll use passlib for hashing but bcrypt directly for verification to avoid initialization issues
 pwd_context = CryptContext(
     schemes=["bcrypt"],
     deprecated="auto",
@@ -31,30 +19,56 @@ pwd_context = CryptContext(
     bcrypt__rounds=12,   # Standard rounds
 )
 
+# Pre-initialize passlib handler for hashing only (doesn't trigger bug detection)
+try:
+    # Just get the handler - don't trigger verification which causes bug detection
+    _ = pwd_context.handler()
+except Exception as e:
+    logger.warning(f"Passlib handler initialization warning: {e}")
+
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """
     Verify a plain password against a hashed password.
-    Handles bcrypt 72-byte limit and initialization errors.
+    Uses bcrypt directly to avoid passlib initialization issues.
     """
     try:
-        return pwd_context.verify(plain_password, hashed_password)
+        # Use bcrypt directly for verification to bypass passlib's bug detection
+        # This is more reliable and avoids the initialization errors
+        if not plain_password or not hashed_password:
+            return False
+        
+        # Ensure password is bytes
+        if isinstance(plain_password, str):
+            password_bytes = plain_password.encode('utf-8')
+        else:
+            password_bytes = plain_password
+        
+        # Ensure hash is bytes
+        if isinstance(hashed_password, str):
+            hash_bytes = hashed_password.encode('utf-8')
+        else:
+            hash_bytes = hashed_password
+        
+        # Use bcrypt.checkpw directly - this bypasses passlib entirely
+        return bcrypt.checkpw(password_bytes, hash_bytes)
+        
     except ValueError as e:
         error_msg = str(e)
         # Handle bcrypt 72-byte limit error
         if "cannot be longer than 72 bytes" in error_msg:
-            # This shouldn't happen for normal passwords, but handle it just in case
             if isinstance(plain_password, str):
                 plain_password_bytes = plain_password.encode('utf-8')
                 if len(plain_password_bytes) > 72:
-                    truncated = plain_password_bytes[:72].decode('utf-8', errors='ignore')
-                    return pwd_context.verify(truncated, hashed_password)
+                    truncated = plain_password_bytes[:72]
+                    if isinstance(hashed_password, str):
+                        hash_bytes = hashed_password.encode('utf-8')
+                    else:
+                        hash_bytes = hashed_password
+                    return bcrypt.checkpw(truncated, hash_bytes)
         # Re-raise other ValueError
         raise
     except Exception as e:
-        # Log unexpected errors for debugging
-        import logging
-        logger = logging.getLogger(__name__)
         logger.error(f"Password verification error: {type(e).__name__}: {e}")
         raise
 
