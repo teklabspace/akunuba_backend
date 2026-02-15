@@ -65,12 +65,12 @@ if "supabase" in clean_url.lower() or "pooler" in clean_url.lower():
     logger.info(f"SSL enabled (no cert verification) for database connection to: {parsed.netloc}")
     logger.info(f"Prepared statements disabled for pgbouncer transaction mode")
 
+# Use NullPool for pgbouncer transaction mode to avoid connection pooling issues
+# NullPool creates a new connection for each request, which works better with pgbouncer
 engine = create_async_engine(
     clean_url,  # Use cleaned URL without query parameters
     echo=settings.APP_DEBUG,
-    pool_pre_ping=True,  # Verify connections before using them
-    pool_recycle=3600,   # Recycle connections after 1 hour
-    pool_timeout=30,      # Timeout for getting connection from pool (seconds)
+    poolclass=NullPool,  # Use NullPool for pgbouncer transaction mode
     connect_args=connect_args
 )
 
@@ -86,13 +86,31 @@ Base = declarative_base()
 
 
 async def get_db() -> AsyncSession:
-    async with AsyncSessionLocal() as session:
+    """
+    Get database session with retry logic for connection issues.
+    """
+    max_retries = 3
+    retry_delay = 1  # seconds
+    
+    for attempt in range(max_retries):
         try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
+            async with AsyncSessionLocal() as session:
+                try:
+                    yield session
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
+                    raise
+                finally:
+                    await session.close()
+            break  # Success, exit retry loop
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"Database connection attempt {attempt + 1} failed: {e}. Retrying...")
+                import asyncio
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                logger.error(f"Database connection failed after {max_retries} attempts: {e}")
+                raise
 
