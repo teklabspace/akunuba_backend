@@ -10,6 +10,16 @@ from app.utils.logger import logger
 # asyncpg doesn't support sslmode in the URL, we handle SSL via connect_args
 database_url = settings.DATABASE_URL
 
+# Validate DATABASE_URL is set and not empty
+if not database_url or not database_url.strip():
+    raise ValueError("DATABASE_URL environment variable is not set or is empty. Please set it in Render dashboard.")
+
+# Validate it starts with the correct scheme
+if not database_url.startswith(('postgresql://', 'postgresql+asyncpg://')):
+    raise ValueError(f"Invalid DATABASE_URL format. Must start with 'postgresql://' or 'postgresql+asyncpg://'. Got: {database_url[:50]}...")
+
+logger.info(f"Using DATABASE_URL: {database_url.split('@')[1] if '@' in database_url else '***'}")  # Log host only for security
+
 # Remove query parameters manually (more robust)
 if '?' in database_url:
     original_url = database_url
