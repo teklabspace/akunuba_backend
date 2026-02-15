@@ -307,9 +307,10 @@ async def startup_event():
             logger.info("Testing database connection...")
             async with engine.connect() as conn:
                 # Add timeout to prevent hanging - increased for cloud connections
+                # Match the connection timeout (60s) but cap at 30s for startup test
                 await asyncio.wait_for(
                     conn.execute(text("SELECT 1")),
-                    timeout=15.0  # Increased to 15 seconds for cloud connections
+                    timeout=30.0  # Increased to 30 seconds to match connection timeout
                 )
             logger.info("✅ Database connection verified successfully")
         except asyncio.TimeoutError:
