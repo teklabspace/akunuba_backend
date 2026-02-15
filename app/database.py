@@ -52,6 +52,7 @@ connect_args = {
     },
     "command_timeout": 60,  # Increased timeout for cloud connections
     "timeout": 90,           # Increased connection timeout to 90 seconds
+    "statement_cache_size": 0,  # Disable prepared statements for pgbouncer transaction mode
 }
 
 # Add SSL for Supabase (required for cloud databases)
@@ -62,6 +63,7 @@ if "supabase" in clean_url.lower() or "pooler" in clean_url.lower():
     # Supabase pooler sometimes has certificate chain issues
     connect_args["ssl"] = ssl_context  # Use SSL context with CERT_NONE
     logger.info(f"SSL enabled (no cert verification) for database connection to: {parsed.netloc}")
+    logger.info(f"Prepared statements disabled for pgbouncer transaction mode")
 
 engine = create_async_engine(
     clean_url,  # Use cleaned URL without query parameters
