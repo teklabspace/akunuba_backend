@@ -56,12 +56,12 @@ connect_args = {
 
 # Add SSL for Supabase (required for cloud databases)
 # asyncpg accepts ssl as True, False, or an SSLContext
-# For Supabase, we need SSL enabled
+# For Supabase, we need SSL enabled but certificate verification disabled
 if "supabase" in clean_url.lower() or "pooler" in clean_url.lower():
-    # Try using True first (simpler SSL), fallback to context if needed
-    # Some Supabase poolers work better with ssl=True
-    connect_args["ssl"] = True  # Use simple SSL=True first
-    logger.info(f"SSL enabled for database connection to: {parsed.netloc}")
+    # Use SSL context with certificate verification disabled
+    # Supabase pooler sometimes has certificate chain issues
+    connect_args["ssl"] = ssl_context  # Use SSL context with CERT_NONE
+    logger.info(f"SSL enabled (no cert verification) for database connection to: {parsed.netloc}")
 
 engine = create_async_engine(
     clean_url,  # Use cleaned URL without query parameters
