@@ -6,6 +6,23 @@ from app.config import settings
 import secrets
 import random
 
+# Monkey patch passlib to skip bcrypt bug detection
+# This prevents the "password cannot be longer than 72 bytes" error during initialization
+try:
+    from passlib.handlers import bcrypt
+    original_detect_wrap_bug = bcrypt.detect_wrap_bug
+    
+    def patched_detect_wrap_bug(ident):
+        # Skip bug detection - always return False (no bug detected)
+        # This prevents the 72-byte password error during initialization
+        return False
+    
+    bcrypt.detect_wrap_bug = patched_detect_wrap_bug
+except Exception as e:
+    # If patching fails, log but continue
+    import logging
+    logging.warning(f"Failed to patch bcrypt bug detection: {e}")
+
 # Configure bcrypt context with proper settings
 pwd_context = CryptContext(
     schemes=["bcrypt"],
@@ -13,30 +30,6 @@ pwd_context = CryptContext(
     bcrypt__ident="2b",  # Use bcrypt 2b format
     bcrypt__rounds=12,   # Standard rounds
 )
-
-# Pre-initialize bcrypt handler to avoid lazy initialization bug detection error
-# The bug detection uses a long test password (>72 bytes) which causes an error
-# We catch this and continue - the handler will still work for normal passwords
-try:
-    # Get the handler to trigger initialization
-    handler = pwd_context.handler()
-    # Try to initialize with a simple hash
-    # This may trigger bug detection, but we'll catch and ignore that error
-    try:
-        test_hash = handler.hash("test")
-    except ValueError as ve:
-        # This is expected - the bug detection uses a long password
-        # The handler is still usable for normal password verification
-        if "cannot be longer than 72 bytes" in str(ve):
-            # This is the bug detection error - it's safe to ignore
-            import logging
-            logging.debug(f"Bcrypt bug detection triggered (expected): {ve}")
-        else:
-            raise
-except Exception as e:
-    # If initialization fails completely, log but continue
-    import logging
-    logging.warning(f"Bcrypt pre-initialization warning: {e}")
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
