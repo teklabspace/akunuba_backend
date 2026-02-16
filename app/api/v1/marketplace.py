@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Body
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func, case
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from decimal import Decimal
 from datetime import datetime, timedelta
 from uuid import UUID
@@ -156,26 +156,47 @@ async def create_listing(
     return listing
 
 
-@router.get("/listings", response_model=List[ListingResponse])
+@router.get("/listings", response_model=Dict[str, Any])
 async def list_listings(
     status_filter: Optional[ListingStatus] = Query(None),
-    current_user: Optional[User] = Depends(get_current_user),
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    current_user: Optional[User] = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """List all marketplace listings"""
+    """List marketplace listings with optional auth and pagination."""
+    # Base query: only approved/active listings by default
     query = select(MarketplaceListing)
+    count_query = select(func.count(MarketplaceListing.id))
     
     if status_filter:
         query = query.where(MarketplaceListing.status == status_filter)
+        count_query = count_query.where(MarketplaceListing.status == status_filter)
     else:
-        query = query.where(MarketplaceListing.status.in_([
-            ListingStatus.APPROVED, ListingStatus.ACTIVE
-        ]))
+        visible_statuses = [ListingStatus.APPROVED, ListingStatus.ACTIVE]
+        query = query.where(MarketplaceListing.status.in_(visible_statuses))
+        count_query = count_query.where(MarketplaceListing.status.in_(visible_statuses))
+    
+    # Total count for pagination
+    total_result = await db.execute(count_query)
+    total = total_result.scalar() or 0
+    
+    # Apply pagination (newest first)
+    offset = (page - 1) * limit
+    query = query.order_by(MarketplaceListing.created_at.desc()).offset(offset).limit(limit)
     
     result = await db.execute(query)
     listings = result.scalars().all()
     
-    return listings
+    return {
+        "data": [ListingResponse.model_validate(l) for l in listings],
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "total_pages": (total + limit - 1) // limit if total > 0 else 0,
+        },
+    }
 
 
 @router.post("/listings/{listing_id}/approve", response_model=ListingResponse)
@@ -418,7 +439,7 @@ class EscrowResponse(BaseModel):
 @router.get("/listings/{listing_id}", response_model=ListingResponse)
 async def get_listing(
     listing_id: UUID,
-    current_user: Optional[User] = Depends(get_current_user),
+    current_user: Optional[User] = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db)
 ):
     """Get listing details"""
@@ -994,50 +1015,82 @@ async def refund_escrow(
     return {"message": "Escrow refunded successfully"}
 
 
-@router.get("/search")
+@router.get("/search", response_model=Dict[str, Any])
 async def search_listings(
     q: Optional[str] = Query(None, description="Search query"),
     asset_type: Optional[str] = Query(None),
     min_price: Optional[Decimal] = Query(None),
     max_price: Optional[Decimal] = Query(None),
     sort_by: Optional[str] = Query("created_at", description="Sort by: price, created_at"),
-    current_user: Optional[User] = Depends(get_current_user),
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    current_user: Optional[User] = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Search marketplace listings"""
+    """Search marketplace listings (public, paginated).
+
+    Guests can search/browse; only approved/active listings are returned.
+    """
+    # Base query: only approved/active listings
+    base_status_filter = [ListingStatus.APPROVED, ListingStatus.ACTIVE]
     query = select(MarketplaceListing).where(
-        MarketplaceListing.status.in_([ListingStatus.APPROVED, ListingStatus.ACTIVE])
+        MarketplaceListing.status.in_(base_status_filter)
     )
-    
+    count_query = select(func.count(MarketplaceListing.id)).where(
+        MarketplaceListing.status.in_(base_status_filter)
+    )
+
+    # Free‑text search
     if q:
-        query = query.where(
-            or_(
-                MarketplaceListing.title.ilike(f"%{q}%"),
-                MarketplaceListing.description.ilike(f"%{q}%")
-            )
+        search_expr = f"%{q}%"
+        text_filter = or_(
+            MarketplaceListing.title.ilike(search_expr),
+            MarketplaceListing.description.ilike(search_expr)
         )
-    
+        query = query.where(text_filter)
+        count_query = count_query.where(text_filter)
+
+    # Filter by asset type (join Asset)
     if asset_type:
-        # Join with Asset table
         from app.models.asset import Asset
         query = query.join(Asset).where(Asset.asset_type == asset_type)
-    
-    if min_price:
-        query = query.where(MarketplaceListing.asking_price >= min_price)
-    
-    if max_price:
-        query = query.where(MarketplaceListing.asking_price <= max_price)
-    
+        count_query = count_query.join(Asset).where(Asset.asset_type == asset_type)
+
+    # Price range filters
+    if min_price is not None:
+        price_min_filter = MarketplaceListing.asking_price >= min_price
+        query = query.where(price_min_filter)
+        count_query = count_query.where(price_min_filter)
+
+    if max_price is not None:
+        price_max_filter = MarketplaceListing.asking_price <= max_price
+        query = query.where(price_max_filter)
+        count_query = count_query.where(price_max_filter)
+
     # Sorting
     if sort_by == "price":
         query = query.order_by(MarketplaceListing.asking_price.asc())
     else:
         query = query.order_by(MarketplaceListing.created_at.desc())
-    
+
+    # Pagination
+    total_result = await db.execute(count_query)
+    total = total_result.scalar() or 0
+    offset = (page - 1) * limit
+    query = query.offset(offset).limit(limit)
+
     result = await db.execute(query)
     listings = result.scalars().all()
-    
-    return listings
+
+    return {
+        "data": [ListingResponse.model_validate(l) for l in listings],
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "total_pages": (total + limit - 1) // limit if total > 0 else 0,
+        },
+    }
 
 
 # ==================== Market Highlights APIs ====================

@@ -202,8 +202,14 @@ async def calculate_performance(
     db: AsyncSession, 
     days: int = 30
 ) -> Optional[PerformanceMetrics]:
-    """Calculate portfolio performance over time using historical valuations"""
-    period_start = datetime.utcnow() - timedelta(days=days)
+    """Calculate portfolio performance over time using historical valuations.
+
+    Optimized to avoid per-day, per-asset DB queries by bulk-loading valuations
+    for all assets in the account and computing snapshots in-memory.
+    """
+    # Use a consistent "now" for the whole calculation
+    now = datetime.now(timezone.utc)
+    period_start = now - timedelta(days=days)
     
     # Get all assets for the account
     assets_result = await db.execute(
@@ -218,36 +224,43 @@ async def calculate_performance(
     current_value = sum([asset.current_value for asset in assets])
     currency = assets[0].currency if assets else "USD"
     
-    # Get historical valuations for each asset
-    historical_values = {}
-    for asset in assets:
-        # Get the earliest valuation before or at period start
-        valuation_result = await db.execute(
-            select(AssetValuation)
-            .where(
-                and_(
-                    AssetValuation.asset_id == asset.id,
-                    AssetValuation.valuation_date <= period_start
-                )
+    # Bulk-load all valuations for these assets up to "now"
+    asset_ids = [asset.id for asset in assets]
+    valuations_result = await db.execute(
+        select(AssetValuation)
+        .where(
+            and_(
+                AssetValuation.asset_id.in_(asset_ids),
+                AssetValuation.valuation_date <= now,
             )
-            .order_by(desc(AssetValuation.valuation_date))
-            .limit(1)
         )
-        historical_valuation = valuation_result.scalar_one_or_none()
+        .order_by(AssetValuation.asset_id, AssetValuation.valuation_date)
+    )
+    all_valuations = valuations_result.scalars().all()
+    
+    # Group valuations by asset_id
+    valuations_by_asset: Dict[UUID, List[AssetValuation]] = {}
+    for v in all_valuations:
+        valuations_by_asset.setdefault(v.asset_id, []).append(v)
+    
+    # Compute historical value per asset at period_start
+    historical_values: Dict[UUID, Decimal] = {}
+    for asset in assets:
+        vals = valuations_by_asset.get(asset.id, [])
+        baseline_value: Optional[Decimal] = None
         
-        if historical_valuation:
-            historical_values[asset.id] = historical_valuation.value
+        # Find the latest valuation on or before period_start
+        for v in reversed(vals):
+            if v.valuation_date <= period_start:
+                baseline_value = v.value
+                break
+        
+        if baseline_value is not None:
+            historical_values[asset.id] = baseline_value
         else:
-            # If no historical valuation, use initial value or current value
-            # Try to get the first valuation
-            first_valuation_result = await db.execute(
-                select(AssetValuation)
-                .where(AssetValuation.asset_id == asset.id)
-                .order_by(AssetValuation.valuation_date)
-                .limit(1)
-            )
-            first_valuation = first_valuation_result.scalar_one_or_none()
-            historical_values[asset.id] = first_valuation.value if first_valuation else asset.current_value
+            # If no valuation before period_start, fall back to first valuation or current value
+            first_val = vals[0].value if vals else asset.current_value
+            historical_values[asset.id] = first_val
     
     # Calculate historical total value
     historical_value = sum(historical_values.values())
@@ -258,37 +271,53 @@ async def calculate_performance(
         (total_return / historical_value * 100) if historical_value > 0 else Decimal("0.00")
     )
     
-    # Calculate daily returns (simplified - using daily snapshots for better granularity)
-    daily_returns = []
-    # Use daily snapshots instead of weekly for better data points
+    # Prepare snapshot dates (bounded to ~30 points)
+    # Generate dates from (now - days) to today, ensuring no future dates
+    daily_returns: List[Dict[str, Any]] = []
     step = max(1, days // 30)  # Limit to ~30 data points max
-    for i in range(days, -1, -step):
-        snapshot_date = datetime.utcnow() - timedelta(days=i)
+    today = now.date()
+    
+    # Generate snapshot dates: from (now - days) up to today (inclusive)
+    snapshot_dates = []
+    for i in range(0, days + 1, step):
+        snapshot_datetime = (now - timedelta(days=days - i)).replace(tzinfo=timezone.utc)
+        snapshot_date_only = snapshot_datetime.date()
+        
+        # Safety check: never include future dates
+        if snapshot_date_only <= today:
+            snapshot_dates.append(snapshot_datetime)
+    
+    # Ensure we always include "today" as the last point
+    if snapshot_dates and snapshot_dates[-1].date() < today:
+        snapshot_dates.append(now)
+    
+    snapshot_dates.sort()  # Oldest to newest
+    
+    # For each snapshot date, compute portfolio value using in-memory valuations
+    for snapshot_date in snapshot_dates:
         snapshot_value = Decimal("0.00")
         
         for asset in assets:
-            valuation_result = await db.execute(
-                select(AssetValuation)
-                .where(
-                    and_(
-                        AssetValuation.asset_id == asset.id,
-                        AssetValuation.valuation_date <= snapshot_date
-                    )
-                )
-                .order_by(desc(AssetValuation.valuation_date))
-                .limit(1)
-            )
-            valuation = valuation_result.scalar_one_or_none()
-            if valuation:
-                snapshot_value += valuation.value
+            vals = valuations_by_asset.get(asset.id, [])
+            latest_val: Optional[Decimal] = None
+            
+            # Find latest valuation on or before snapshot_date
+            for v in reversed(vals):
+                if v.valuation_date <= snapshot_date:
+                    latest_val = v.value
+                    break
+            
+            if latest_val is not None:
+                snapshot_value += latest_val
             else:
                 snapshot_value += historical_values.get(asset.id, asset.current_value)
         
-        # Always add the snapshot, even if value is 0
-        daily_returns.append({
-            "date": snapshot_date.date().isoformat(),  # Use date only, not datetime
-            "value": float(snapshot_value)
-        })
+        daily_returns.append(
+            {
+                "date": snapshot_date.date().isoformat(),
+                "value": float(snapshot_value),
+            }
+        )
     
     # Find best and worst performers
     best_performer = None
@@ -466,40 +495,78 @@ async def get_portfolio_history(
         if not assets:
             return []
         
-        history = []
         # Use timezone-aware UTC datetimes to avoid naive/aware comparison issues
         now = datetime.now(timezone.utc)
-        for i in range(days, 0, -1):
-            snapshot_date = now - timedelta(days=i)
-            snapshot_value = Decimal("0.00")
-            
-            for asset in assets:
-                # Get closest valuation to snapshot date
-                valuation_result = await db.execute(
-                    select(AssetValuation)
-                    .where(
-                        and_(
-                            AssetValuation.asset_id == asset.id,
-                            AssetValuation.valuation_date <= snapshot_date
-                        )
-                    )
-                    .order_by(desc(AssetValuation.valuation_date))
-                    .limit(1)
+
+        # Bulk-load all valuations for these assets up to "now"
+        asset_ids = [asset.id for asset in assets]
+        valuations_result = await db.execute(
+            select(AssetValuation)
+            .where(
+                and_(
+                    AssetValuation.asset_id.in_(asset_ids),
+                    AssetValuation.valuation_date <= now,
                 )
-                valuation = valuation_result.scalar_one_or_none()
-                
-                if valuation:
-                    snapshot_value += valuation.value
+            )
+            .order_by(AssetValuation.asset_id, AssetValuation.valuation_date)
+        )
+        all_valuations = valuations_result.scalars().all()
+
+        # Group valuations by asset_id
+        valuations_by_asset: Dict[UUID, List[AssetValuation]] = {}
+        for v in all_valuations:
+            valuations_by_asset.setdefault(v.asset_id, []).append(v)
+
+        # Prepare snapshot dates; to keep performance bounded, limit to ~60 points max
+        # Generate dates from (now - days) to today, ensuring no future dates
+        step = max(1, days // 60)
+        today = now.date()
+        
+        snapshot_dates = []
+        for i in range(0, days + 1, step):
+            snapshot_datetime = (now - timedelta(days=days - i)).replace(tzinfo=timezone.utc)
+            snapshot_date_only = snapshot_datetime.date()
+            
+            # Safety check: never include future dates
+            if snapshot_date_only <= today:
+                snapshot_dates.append(snapshot_datetime)
+        
+        # Ensure we always include "today" as the last point
+        if snapshot_dates and snapshot_dates[-1].date() < today:
+            snapshot_dates.append(now)
+        
+        snapshot_dates.sort()
+
+        history: List[Dict[str, Any]] = []
+        default_currency = assets[0].currency if assets else "USD"
+
+        for snapshot_date in snapshot_dates:
+            snapshot_value = Decimal("0.00")
+
+            for asset in assets:
+                vals = valuations_by_asset.get(asset.id, [])
+                latest_val: Optional[Decimal] = None
+
+                # Find latest valuation on or before snapshot_date
+                for v in reversed(vals):
+                    if v.valuation_date <= snapshot_date:
+                        latest_val = v.value
+                        break
+
+                if latest_val is not None:
+                    snapshot_value += latest_val
                 else:
                     # Use current value if no historical data
                     snapshot_value += asset.current_value
-            
-            history.append({
-                "date": snapshot_date.isoformat(),
-                "value": float(snapshot_value),
-                "currency": assets[0].currency if assets else "USD"
-            })
-        
+
+            history.append(
+                {
+                    "date": snapshot_date.isoformat(),
+                    "value": float(snapshot_value),
+                    "currency": default_currency,
+                }
+            )
+
         return history
     except NotFoundException:
         # Preserve 404 semantics for missing account

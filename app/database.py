@@ -87,30 +87,20 @@ Base = declarative_base()
 
 async def get_db() -> AsyncSession:
     """
-    Get database session with retry logic for connection issues.
-    """
-    max_retries = 3
-    retry_delay = 1  # seconds
+    Standard FastAPI-style async DB dependency.
     
-    for attempt in range(max_retries):
+    Important: This must behave as a single-yield async generator and
+    terminate cleanly after FastAPI injects the session. Having retry
+    loops around `yield` can cause "generator didn't stop after athrow()"
+    runtime errors when request handling fails.
+    """
+    async with AsyncSessionLocal() as session:
         try:
-            async with AsyncSessionLocal() as session:
-                try:
-                    yield session
-                    await session.commit()
-                except Exception:
-                    await session.rollback()
-                    raise
-                finally:
-                    await session.close()
-            break  # Success, exit retry loop
-        except Exception as e:
-            if attempt < max_retries - 1:
-                logger.warning(f"Database connection attempt {attempt + 1} failed: {e}. Retrying...")
-                import asyncio
-                await asyncio.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
-            else:
-                logger.error(f"Database connection failed after {max_retries} attempts: {e}")
-                raise
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
 
