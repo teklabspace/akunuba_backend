@@ -778,6 +778,108 @@ async def list_assets(
         )
 
 
+# ==================== SUMMARY (Must be before /{asset_id} route) ====================
+
+@router.get("/summary", response_model=Dict[str, AssetsSummaryResponse])
+async def get_assets_summary(
+    category_group: Optional[str] = Query(None, description="Filter by category group"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get summary statistics for all assets"""
+    account = await get_account(current_user=current_user, db=db)
+    
+    # Get all assets
+    query = select(Asset).where(Asset.account_id == account.id)
+    if category_group:
+        # Note: This would require category_group field in Asset model
+        pass
+    
+    result = await db.execute(query)
+    assets = result.scalars().all()
+    
+    if not assets:
+        return {
+            "data": AssetsSummaryResponse(
+                total_assets=0,
+                total_value=Decimal("0.00"),
+                total_estimated_value=Decimal("0.00"),
+                currency="USD",
+                by_category=[],
+                by_category_group=[],
+                recently_added=0,
+                pending_appraisals=0,
+                pending_sales=0
+            )
+        }
+    
+    # Calculate summary
+    total_value = sum([asset.current_value for asset in assets])
+    total_estimated_value = total_value  # Assuming same for now
+    
+    # Get pending appraisals
+    appraisals_result = await db.execute(
+        select(func.count(AssetAppraisal.id)).join(Asset).where(
+            and_(
+                Asset.account_id == account.id,
+                AssetAppraisal.status == AppraisalStatus.PENDING
+            )
+        )
+    )
+    pending_appraisals = appraisals_result.scalar() or 0
+    
+    # Get pending sales
+    sales_result = await db.execute(
+        select(func.count(AssetSaleRequest.id)).join(Asset).where(
+            and_(
+                Asset.account_id == account.id,
+                AssetSaleRequest.status == SaleRequestStatus.PENDING
+            )
+        )
+    )
+    pending_sales = sales_result.scalar() or 0
+    
+    # Get recently added (last 30 days)
+    thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
+    recent_result = await db.execute(
+        select(func.count(Asset.id)).where(
+            and_(
+                Asset.account_id == account.id,
+                Asset.created_at >= thirty_days_ago
+            )
+        )
+    )
+    recently_added = recent_result.scalar() or 0
+    
+    # Group by category (using asset_type for now)
+    by_category = {}
+    for asset in assets:
+        category = asset.asset_type.value
+        if category not in by_category:
+            by_category[category] = {"count": 0, "value": Decimal("0.00")}
+        by_category[category]["count"] += 1
+        by_category[category]["value"] += asset.current_value
+    
+    category_list = [
+        {"category": k, "count": v["count"], "total_value": v["value"]}
+        for k, v in by_category.items()
+    ]
+    
+    return {
+        "data": AssetsSummaryResponse(
+            total_assets=len(assets),
+            total_value=total_value,
+            total_estimated_value=total_estimated_value,
+            currency=assets[0].currency if assets else "USD",
+            by_category=category_list,
+            by_category_group=[],  # Would need category_group implementation
+            recently_added=recently_added,
+            pending_appraisals=pending_appraisals,
+            pending_sales=pending_sales
+        )
+    }
+
+
 @router.get("/{asset_id}", response_model=Dict[str, Any])
 async def get_asset(
     asset_id: UUID,
@@ -2492,106 +2594,6 @@ async def get_asset_report_status(
 
 
 # ==================== ANALYTICS ====================
-
-@router.get("/summary", response_model=Dict[str, AssetsSummaryResponse])
-async def get_assets_summary(
-    category_group: Optional[str] = Query(None, description="Filter by category group"),
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Get summary statistics for all assets"""
-    account = await get_account(current_user=current_user, db=db)
-    
-    # Get all assets
-    query = select(Asset).where(Asset.account_id == account.id)
-    if category_group:
-        # Note: This would require category_group field in Asset model
-        pass
-    
-    result = await db.execute(query)
-    assets = result.scalars().all()
-    
-    if not assets:
-        return {
-            "data": AssetsSummaryResponse(
-                total_assets=0,
-                total_value=Decimal("0.00"),
-                total_estimated_value=Decimal("0.00"),
-                currency="USD",
-                by_category=[],
-                by_category_group=[],
-                recently_added=0,
-                pending_appraisals=0,
-                pending_sales=0
-            )
-        }
-    
-    # Calculate summary
-    total_value = sum([asset.current_value for asset in assets])
-    total_estimated_value = total_value  # Assuming same for now
-    
-    # Get pending appraisals
-    appraisals_result = await db.execute(
-        select(func.count(AssetAppraisal.id)).join(Asset).where(
-            and_(
-                Asset.account_id == account.id,
-                AssetAppraisal.status == AppraisalStatus.PENDING
-            )
-        )
-    )
-    pending_appraisals = appraisals_result.scalar() or 0
-    
-    # Get pending sales
-    sales_result = await db.execute(
-        select(func.count(AssetSaleRequest.id)).join(Asset).where(
-            and_(
-                Asset.account_id == account.id,
-                AssetSaleRequest.status == SaleRequestStatus.PENDING
-            )
-        )
-    )
-    pending_sales = sales_result.scalar() or 0
-    
-    # Get recently added (last 30 days)
-    thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
-    recent_result = await db.execute(
-        select(func.count(Asset.id)).where(
-            and_(
-                Asset.account_id == account.id,
-                Asset.created_at >= thirty_days_ago
-            )
-        )
-    )
-    recently_added = recent_result.scalar() or 0
-    
-    # Group by category (using asset_type for now)
-    by_category = {}
-    for asset in assets:
-        category = asset.asset_type.value
-        if category not in by_category:
-            by_category[category] = {"count": 0, "value": Decimal("0.00")}
-        by_category[category]["count"] += 1
-        by_category[category]["value"] += asset.current_value
-    
-    category_list = [
-        {"category": k, "count": v["count"], "total_value": v["value"]}
-        for k, v in by_category.items()
-    ]
-    
-    return {
-        "data": AssetsSummaryResponse(
-            total_assets=len(assets),
-            total_value=total_value,
-            total_estimated_value=total_estimated_value,
-            currency=assets[0].currency if assets else "USD",
-            by_category=category_list,
-            by_category_group=[],  # Would need category_group implementation
-            recently_added=recently_added,
-            pending_appraisals=pending_appraisals,
-            pending_sales=pending_sales
-        )
-    }
-
 
 @router.get("/value-trends", response_model=ValueTrendsResponse)
 async def get_asset_value_trends(

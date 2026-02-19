@@ -41,7 +41,20 @@ async def create_link_token(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Create Plaid link token for account linking"""
+    """
+    Create Plaid link token for account linking.
+    
+    This endpoint creates a link token that the frontend uses to initialize
+    Plaid Link for connecting bank accounts.
+    
+    Returns:
+        LinkTokenResponse with link_token string
+        
+    Raises:
+        404: If user account not found
+        400: If Plaid credentials not configured or API call fails
+    """
+    # Verify user has an account record
     account_result = await db.execute(
         select(Account).where(Account.user_id == current_user.id)
     )
@@ -55,10 +68,16 @@ async def create_link_token(
             user_id=str(current_user.id),
             account_id=str(account.id)
         )
+        logger.info(f"Link token created successfully for user {current_user.id}")
         return LinkTokenResponse(link_token=link_token)
+    except ValueError as e:
+        # Credentials not configured or SDK not available
+        logger.error(f"Plaid configuration error: {e}")
+        raise BadRequestException(f"Plaid not configured: {str(e)}")
     except Exception as e:
-        logger.error(f"Failed to create Plaid link token: {e}")
-        raise BadRequestException("Failed to create link token")
+        # Plaid API error
+        logger.error(f"Failed to create Plaid link token: {e}", exc_info=True)
+        raise BadRequestException(f"Failed to create link token: {str(e)}")
 
 
 @router.post("/link")

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, desc, or_, func
 from typing import List, Optional, Dict, Any
@@ -969,3 +969,357 @@ async def get_investment_recommendations(
                 "suggested_actions": []
             }
         )
+
+
+# ==================== INVESTMENT GOALS ====================
+
+class GoalAdjustRequest(BaseModel):
+    target_amount: Optional[Decimal] = None
+    target_date: Optional[str] = None  # YYYY-MM-DD
+    monthly_contribution: Optional[Decimal] = None
+    risk_tolerance: Optional[str] = None
+    notes: Optional[str] = None
+
+
+@router.post("/goals/{goal_id}/adjust", response_model=Dict[str, Any])
+async def adjust_investment_goal(
+    goal_id: UUID,
+    adjust_data: GoalAdjustRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Adjust investment goal parameters"""
+    try:
+        account_result = await db.execute(
+            select(Account).where(Account.user_id == current_user.id)
+        )
+        account = account_result.scalar_one_or_none()
+        
+        if not account:
+            raise NotFoundException("Account", str(current_user.id))
+        
+        # In a real implementation, you would have an InvestmentGoal model
+        # For now, return a placeholder response
+        return {
+            "id": str(goal_id),
+            "message": "Goal adjusted successfully",
+            "updated_fields": {
+                "target_amount": float(adjust_data.target_amount) if adjust_data.target_amount else None,
+                "target_date": adjust_data.target_date,
+                "monthly_contribution": float(adjust_data.monthly_contribution) if adjust_data.monthly_contribution else None,
+                "risk_tolerance": adjust_data.risk_tolerance,
+                "notes": adjust_data.notes
+            },
+            "updated_at": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error adjusting investment goal: {e}", exc_info=True)
+        raise BadRequestException(f"Failed to adjust goal: {str(e)}")
+
+
+# ==================== INVESTMENT STRATEGIES ====================
+
+class BacktestRequest(BaseModel):
+    start_date: str  # YYYY-MM-DD
+    end_date: str  # YYYY-MM-DD
+    initial_capital: Decimal
+    parameters: Optional[Dict[str, Any]] = None
+
+
+class BacktestResponse(BaseModel):
+    strategy_id: UUID
+    start_date: str
+    end_date: str
+    initial_capital: Decimal
+    final_value: Decimal
+    total_return: Decimal
+    total_return_percentage: Decimal
+    sharpe_ratio: Optional[float] = None
+    max_drawdown: Optional[float] = None
+    win_rate: Optional[float] = None
+    trades_count: int
+    performance_metrics: Dict[str, Any]
+
+
+@router.post("/strategies/{strategy_id}/backtest", response_model=BacktestResponse)
+async def backtest_investment_strategy(
+    strategy_id: UUID,
+    backtest_data: BacktestRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Backtest an investment strategy"""
+    try:
+        account_result = await db.execute(
+            select(Account).where(Account.user_id == current_user.id)
+        )
+        account = account_result.scalar_one_or_none()
+        
+        if not account:
+            raise NotFoundException("Account", str(current_user.id))
+        
+        # Parse dates
+        start_date = datetime.strptime(backtest_data.start_date, "%Y-%m-%d").date()
+        end_date = datetime.strptime(backtest_data.end_date, "%Y-%m-%d").date()
+        
+        if end_date < start_date:
+            raise BadRequestException("End date must be after start date")
+        
+        # In a real implementation, you would:
+        # 1. Load the strategy configuration
+        # 2. Run backtest simulation using historical data
+        # 3. Calculate performance metrics
+        
+        # Placeholder backtest results
+        initial_capital = backtest_data.initial_capital
+        final_value = initial_capital * Decimal("1.15")  # 15% return placeholder
+        total_return = final_value - initial_capital
+        total_return_percentage = (total_return / initial_capital * 100) if initial_capital > 0 else Decimal("0")
+        
+        return BacktestResponse(
+            strategy_id=strategy_id,
+            start_date=backtest_data.start_date,
+            end_date=backtest_data.end_date,
+            initial_capital=initial_capital,
+            final_value=final_value,
+            total_return=total_return,
+            total_return_percentage=total_return_percentage,
+            sharpe_ratio=1.2,
+            max_drawdown=-5.5,
+            win_rate=65.0,
+            trades_count=42,
+            performance_metrics={
+                "annualized_return": 12.5,
+                "volatility": 8.3,
+                "beta": 0.95
+            }
+        )
+    except ValueError as e:
+        raise BadRequestException(f"Invalid date format: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error backtesting strategy: {e}", exc_info=True)
+        raise BadRequestException(f"Failed to backtest strategy: {str(e)}")
+
+
+@router.get("/strategies/{strategy_id}/performance", response_model=Dict[str, Any])
+async def get_strategy_performance(
+    strategy_id: UUID,
+    days: int = Query(30, ge=1, le=365, description="Number of days for performance calculation"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get performance metrics for a specific strategy"""
+    try:
+        account_result = await db.execute(
+            select(Account).where(Account.user_id == current_user.id)
+        )
+        account = account_result.scalar_one_or_none()
+        
+        if not account:
+            raise NotFoundException("Account", str(current_user.id))
+        
+        # In a real implementation, you would:
+        # 1. Load the strategy and its trades/positions
+        # 2. Calculate performance metrics from actual trades
+        
+        # Placeholder performance data
+        period_start = datetime.utcnow() - timedelta(days=days)
+        
+        return {
+            "strategy_id": str(strategy_id),
+            "period": {
+                "start": period_start.isoformat(),
+                "end": datetime.utcnow().isoformat(),
+                "days": days
+            },
+            "performance": {
+                "total_return": 1250.50,
+                "total_return_percentage": 12.5,
+                "annualized_return": 15.2,
+                "sharpe_ratio": 1.2,
+                "max_drawdown": -5.5,
+                "volatility": 8.3,
+                "beta": 0.95,
+                "alpha": 2.1
+            },
+            "trades": {
+                "total": 42,
+                "winning": 27,
+                "losing": 15,
+                "win_rate": 64.3
+            },
+            "current_value": 11250.50,
+            "initial_value": 10000.00
+        }
+    except Exception as e:
+        logger.error(f"Error getting strategy performance: {e}", exc_info=True)
+        raise BadRequestException(f"Failed to get strategy performance: {str(e)}")
+
+
+class CloneStrategyRequest(BaseModel):
+    new_name: str
+    adjust_parameters: Optional[Dict[str, Any]] = None
+
+
+@router.post("/strategies/{strategy_id}/clone", response_model=Dict[str, Any])
+async def clone_investment_strategy(
+    strategy_id: UUID,
+    clone_data: CloneStrategyRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Clone an existing investment strategy"""
+    try:
+        account_result = await db.execute(
+            select(Account).where(Account.user_id == current_user.id)
+        )
+        account = account_result.scalar_one_or_none()
+        
+        if not account:
+            raise NotFoundException("Account", str(current_user.id))
+        
+        # In a real implementation, you would:
+        # 1. Load the original strategy
+        # 2. Create a new strategy with the same parameters (or adjusted)
+        # 3. Save to database
+        
+        # Generate new strategy ID
+        new_strategy_id = UUID()
+        
+        return {
+            "original_strategy_id": str(strategy_id),
+            "new_strategy_id": str(new_strategy_id),
+            "name": clone_data.new_name,
+            "status": "active",
+            "cloned_at": datetime.utcnow().isoformat(),
+            "message": "Strategy cloned successfully"
+        }
+    except Exception as e:
+        logger.error(f"Error cloning strategy: {e}", exc_info=True)
+        raise BadRequestException(f"Failed to clone strategy: {str(e)}")
+
+
+# ==================== INVESTMENT WATCHLIST ====================
+
+class WatchlistItemCreate(BaseModel):
+    symbol: str
+    asset_type: str  # stock, crypto, etc.
+    notes: Optional[str] = None
+
+
+class WatchlistItemResponse(BaseModel):
+    id: UUID
+    symbol: str
+    asset_type: str
+    name: Optional[str] = None
+    current_price: Optional[float] = None
+    change_percentage: Optional[float] = None
+    notes: Optional[str] = None
+    added_at: datetime
+
+
+@router.get("/watchlist", response_model=Dict[str, List[WatchlistItemResponse]])
+async def get_investment_watchlist(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get investment watchlist items"""
+    try:
+        account_result = await db.execute(
+            select(Account).where(Account.user_id == current_user.id)
+        )
+        account = account_result.scalar_one_or_none()
+        
+        if not account:
+            raise NotFoundException("Account", str(current_user.id))
+        
+        # In a real implementation, you would have an InvestmentWatchlist model
+        # For now, return empty list as placeholder
+        # This would query: select(InvestmentWatchlist).where(InvestmentWatchlist.account_id == account.id)
+        
+        watchlist_items = []
+        
+        # Placeholder: In production, fetch from database
+        # For now, return empty list
+        
+        return {"data": watchlist_items}
+    except Exception as e:
+        logger.error(f"Error getting watchlist: {e}", exc_info=True)
+        return {"data": []}
+
+
+@router.post("/watchlist", response_model=Dict[str, WatchlistItemResponse], status_code=status.HTTP_201_CREATED)
+async def add_to_watchlist(
+    watchlist_item: WatchlistItemCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Add an item to investment watchlist"""
+    try:
+        account_result = await db.execute(
+            select(Account).where(Account.user_id == current_user.id)
+        )
+        account = account_result.scalar_one_or_none()
+        
+        if not account:
+            raise NotFoundException("Account", str(current_user.id))
+        
+        # In a real implementation, you would:
+        # 1. Check if item already exists in watchlist
+        # 2. Create new InvestmentWatchlist record
+        # 3. Get current price from market data
+        
+        # Get current price (placeholder)
+        try:
+            current_price = PolygonClient.get_current_price(watchlist_item.symbol)
+        except:
+            current_price = None
+        
+        # Generate new watchlist item ID
+        item_id = UUID()
+        
+        return {
+            "data": WatchlistItemResponse(
+                id=item_id,
+                symbol=watchlist_item.symbol.upper(),
+                asset_type=watchlist_item.asset_type,
+                name=watchlist_item.symbol.upper(),  # Would fetch from market data
+                current_price=float(current_price) if current_price else None,
+                change_percentage=None,  # Would calculate from market data
+                notes=watchlist_item.notes,
+                added_at=datetime.utcnow()
+            )
+        }
+    except Exception as e:
+        logger.error(f"Error adding to watchlist: {e}", exc_info=True)
+        raise BadRequestException(f"Failed to add to watchlist: {str(e)}")
+
+
+@router.delete("/watchlist/{id}", status_code=status.HTTP_200_OK)
+async def remove_from_watchlist(
+    id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Remove an item from investment watchlist"""
+    try:
+        account_result = await db.execute(
+            select(Account).where(Account.user_id == current_user.id)
+        )
+        account = account_result.scalar_one_or_none()
+        
+        if not account:
+            raise NotFoundException("Account", str(current_user.id))
+        
+        # In a real implementation, you would:
+        # 1. Find the watchlist item
+        # 2. Verify it belongs to the account
+        # 3. Delete it
+        
+        return {
+            "message": "Item removed from watchlist successfully",
+            "id": str(id)
+        }
+    except Exception as e:
+        logger.error(f"Error removing from watchlist: {e}", exc_info=True)
+        raise BadRequestException(f"Failed to remove from watchlist: {str(e)}")

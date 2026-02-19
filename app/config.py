@@ -12,7 +12,12 @@ class Settings(BaseSettings):
     
     HOST: str = "0.0.0.0"
     PORT: int = 8000
-    CORS_ORIGINS: Union[List[str], str] = ["http://localhost:3000", "http://localhost:5173"]
+    CORS_ORIGINS: Union[List[str], str] = [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+    ]
     
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
