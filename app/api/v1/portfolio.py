@@ -33,15 +33,20 @@ class AssetAllocationItem(BaseModel):
     assets: List[Dict[str, Any]] = []
 
 
+class DailyReturnItem(BaseModel):
+    date: str
+    value: Decimal
+    return: Decimal
+    return_percentage: Decimal
+
+
 class PerformanceMetrics(BaseModel):
-    total_return: Decimal
-    total_return_percentage: Decimal
     period_days: int
     current_value: Decimal
     historical_value: Decimal
-    daily_returns: Optional[List[Dict[str, Any]]] = None
-    best_performer: Optional[Dict[str, Any]] = None
-    worst_performer: Optional[Dict[str, Any]] = None
+    total_return: Decimal
+    total_return_percentage: Decimal
+    daily_returns: List[DailyReturnItem]
 
 
 class PortfolioResponse(BaseModel):
@@ -294,6 +299,7 @@ async def calculate_performance(
     snapshot_dates.sort()  # Oldest to newest
     
     # For each snapshot date, compute portfolio value using in-memory valuations
+    previous_value = historical_value
     for snapshot_date in snapshot_dates:
         snapshot_value = Decimal("0.00")
         
@@ -312,51 +318,26 @@ async def calculate_performance(
             else:
                 snapshot_value += historical_values.get(asset.id, asset.current_value)
         
-        daily_returns.append(
-            {
-                "date": snapshot_date.date().isoformat(),
-                "value": float(snapshot_value),
-            }
-        )
-    
-    # Find best and worst performers
-    best_performer = None
-    worst_performer = None
-    max_return = Decimal("-999999")
-    min_return = Decimal("999999")
-    
-    for asset in assets:
-        historical_asset_value = historical_values.get(asset.id, asset.current_value)
-        if historical_asset_value > 0:
-            asset_return = ((asset.current_value - historical_asset_value) / historical_asset_value * 100)
-            
-            if asset_return > max_return:
-                max_return = asset_return
-                best_performer = {
-                    "symbol": asset.symbol or asset.name[:10] if asset.name else "N/A",
-                    "name": asset.name or "Unknown Asset",
-                    "return_percentage": float(asset_return),
-                    "value": float(asset.current_value)
-                }
-            
-            if asset_return < min_return:
-                min_return = asset_return
-                worst_performer = {
-                    "symbol": asset.symbol or asset.name[:10] if asset.name else "N/A",
-                    "name": asset.name or "Unknown Asset",
-                    "return_percentage": float(asset_return),
-                    "value": float(asset.current_value)
-                }
+        # Calculate return from previous day
+        day_return = snapshot_value - previous_value
+        day_return_percentage = (day_return / previous_value * 100) if previous_value > 0 else Decimal("0.00")
+        
+        daily_returns.append(DailyReturnItem(
+            date=snapshot_date.date().isoformat(),
+            value=snapshot_value,
+            return=day_return,
+            return_percentage=day_return_percentage
+        ))
+        
+        previous_value = snapshot_value
     
     return PerformanceMetrics(
-        total_return=total_return,
-        total_return_percentage=total_return_percentage,
         period_days=days,
         current_value=current_value,
         historical_value=historical_value,
-        daily_returns=daily_returns if daily_returns else [],
-        best_performer=best_performer,
-        worst_performer=worst_performer
+        total_return=total_return,
+        total_return_percentage=total_return_percentage,
+        daily_returns=daily_returns if daily_returns else []
     )
 
 
@@ -440,14 +421,12 @@ async def get_performance(
         if not performance_data:
             # Return empty performance if no assets
             return PerformanceMetrics(
-                total_return=Decimal("0.00"),
-                total_return_percentage=Decimal("0.00"),
                 period_days=days,
                 current_value=Decimal("0.00"),
                 historical_value=Decimal("0.00"),
-                daily_returns=[],
-                best_performer=None,
-                worst_performer=None
+                total_return=Decimal("0.00"),
+                total_return_percentage=Decimal("0.00"),
+                daily_returns=[]
             )
         
         return performance_data
@@ -455,18 +434,25 @@ async def get_performance(
         logger.error(f"Error in get_performance endpoint: {e}", exc_info=True)
         # Return empty performance on error instead of 500
         return PerformanceMetrics(
-            total_return=Decimal("0.00"),
-            total_return_percentage=Decimal("0.00"),
             period_days=days,
             current_value=Decimal("0.00"),
             historical_value=Decimal("0.00"),
-            daily_returns=[],
-            best_performer=None,
-            worst_performer=None
+            total_return=Decimal("0.00"),
+            total_return_percentage=Decimal("0.00"),
+            daily_returns=[]
         )
 
 
-@router.get("/history", response_model=List[Dict[str, Any]])
+class PortfolioHistoryItem(BaseModel):
+    date: str
+    value: Decimal
+
+
+class PortfolioHistoryResponse(BaseModel):
+    data: List[PortfolioHistoryItem]
+
+
+@router.get("/history", response_model=PortfolioHistoryResponse)
 async def get_portfolio_history(
     days: int = Query(30, ge=1, le=365, description="Number of days of history"),
     current_user: User = Depends(get_current_user),
@@ -493,7 +479,7 @@ async def get_portfolio_history(
         assets = assets_result.scalars().all()
         
         if not assets:
-            return []
+            return PortfolioHistoryResponse(data=[])
         
         # Use timezone-aware UTC datetimes to avoid naive/aware comparison issues
         now = datetime.now(timezone.utc)
@@ -560,21 +546,20 @@ async def get_portfolio_history(
                     snapshot_value += asset.current_value
 
             history.append(
-                {
-                    "date": snapshot_date.isoformat(),
-                    "value": float(snapshot_value),
-                    "currency": default_currency,
-                }
+                PortfolioHistoryItem(
+                    date=snapshot_date.date().isoformat(),
+                    value=snapshot_value
+                )
             )
 
-        return history
+        return PortfolioHistoryResponse(data=history)
     except NotFoundException:
         # Preserve 404 semantics for missing account
         raise
     except Exception as e:
         # Log and return an empty array instead of propagating an HTML error page
         logger.error(f"Error in get_portfolio_history: {e}", exc_info=True)
-        return []
+        return PortfolioHistoryResponse(data=[])
 
 
 @router.get("/allocation", response_model=List[AssetAllocationItem])
@@ -708,24 +693,22 @@ async def compare_with_benchmark(
 
 class PortfolioSummaryResponse(BaseModel):
     total_portfolio_value: Decimal
-    total_invested: Decimal
+    total_assets: Decimal
+    total_debts: Decimal
+    cash_available: Decimal
     total_returns: Decimal
     return_percentage: Decimal
     today_change: Decimal
     today_change_percentage: Decimal
-    cash_available: Decimal
-    cash_percentage: Decimal
-    asset_types_count: int
-    total_holdings: int
 
 
-@router.get("/summary", response_model=Dict[str, PortfolioSummaryResponse])
+@router.get("/summary")
 async def get_portfolio_summary(
     time_range: Optional[str] = Query("ALL", description="Time range: 1D, 1W, 1M, 3M, 1Y, ALL"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get portfolio summary with key metrics"""
+    """Get high-level portfolio overview"""
     account_result = await db.execute(
         select(Account).where(Account.user_id == current_user.id)
     )
@@ -740,8 +723,8 @@ async def get_portfolio_summary(
     )
     assets = assets_result.scalars().all()
     
-    # Calculate totals
-    total_portfolio_value = sum([asset.current_value for asset in assets]) if assets else Decimal("0.00")
+    # Calculate total assets value
+    total_assets = sum([asset.current_value for asset in assets]) if assets else Decimal("0.00")
     
     # Calculate total invested (sum of initial values or cost basis)
     total_invested = Decimal("0.00")
@@ -759,13 +742,14 @@ async def get_portfolio_summary(
         else:
             total_invested += asset.current_value  # Fallback
     
-    total_returns = total_portfolio_value - total_invested
+    total_returns = total_assets - total_invested
     return_percentage = (total_returns / total_invested * 100) if total_invested > 0 else Decimal("0.00")
     
     # Calculate today's change (compare with yesterday's value)
-    today = datetime.utcnow().date()
+    now = datetime.now(timezone.utc)
+    today = now.date()
     yesterday = today - timedelta(days=1)
-    today_value = total_portfolio_value
+    today_value = total_assets
     
     yesterday_value = Decimal("0.00")
     for asset in assets:
@@ -774,7 +758,7 @@ async def get_portfolio_summary(
             .where(
                 and_(
                     AssetValuation.asset_id == asset.id,
-                    AssetValuation.valuation_date <= datetime.combine(yesterday, datetime.min.time())
+                    AssetValuation.valuation_date <= datetime.combine(yesterday, datetime.min.time()).replace(tzinfo=timezone.utc)
                 )
             )
             .order_by(desc(AssetValuation.valuation_date))
@@ -789,19 +773,8 @@ async def get_portfolio_summary(
     today_change = today_value - yesterday_value
     today_change_percentage = (today_change / yesterday_value * 100) if yesterday_value > 0 else Decimal("0.00")
     
-    # Get cash available (from linked accounts or Alpaca)
+    # Get cash available (from linked accounts)
     cash_available = Decimal("0.00")
-    try:
-        alpaca_account = AlpacaClient.get_account()
-        if alpaca_account:
-            if isinstance(alpaca_account, dict):
-                cash_available = Decimal(str(alpaca_account.get("cash", 0)))
-            else:
-                cash_available = Decimal(str(getattr(alpaca_account, "cash", 0)))
-    except:
-        pass
-    
-    # Also check linked accounts
     linked_accounts_result = await db.execute(
         select(LinkedAccount).where(
             and_(
@@ -815,27 +788,23 @@ async def get_portfolio_summary(
         if linked_account.balance:
             cash_available += linked_account.balance
     
-    cash_percentage = (cash_available / total_portfolio_value * 100) if total_portfolio_value > 0 else Decimal("0.00")
+    # Calculate total debts (simplified - could be from loans, credit cards, etc.)
+    # For now, set to 0 or calculate from debt assets if any
+    total_debts = Decimal("0.00")
     
-    # Count asset types
-    asset_types = set([asset.asset_type.value for asset in assets])
-    asset_types_count = len(asset_types)
-    total_holdings = len(assets)
+    # Total portfolio value = assets + cash - debts
+    total_portfolio_value = total_assets + cash_available - total_debts
     
-    return {
-        "data": PortfolioSummaryResponse(
-            total_portfolio_value=total_portfolio_value,
-            total_invested=total_invested,
-            total_returns=total_returns,
-            return_percentage=return_percentage,
-            today_change=today_change,
-            today_change_percentage=today_change_percentage,
-            cash_available=cash_available,
-            cash_percentage=cash_percentage,
-            asset_types_count=asset_types_count,
-            total_holdings=total_holdings
-        )
-    }
+    return PortfolioSummaryResponse(
+        total_portfolio_value=total_portfolio_value,
+        total_assets=total_assets,
+        total_debts=total_debts,
+        cash_available=cash_available,
+        total_returns=total_returns,
+        return_percentage=return_percentage,
+        today_change=today_change,
+        today_change_percentage=today_change_percentage
+    )
 
 
 @router.get("/holdings/top", response_model=Dict[str, List[Dict[str, Any]]])

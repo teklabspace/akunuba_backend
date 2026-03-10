@@ -43,17 +43,21 @@ These are **required** and will cause errors if not set:
 
 ### 1. **PLAID_SECRET_KEY** (Required for Banking/Linked Accounts)
 ```
-PLAID_SECRET_KEY=your_plaid_secret_key_here
+PLAID_SECRET_KEY=49f680c66cc54b7aa43c2ab53a8c83  # Your sandbox secret
 ```
-- **Where to get it**: Plaid Dashboard → API Keys → Secret Key
+- **Where to get it**: Plaid Dashboard → Team Settings → Keys → Secret Key
 - **Impact**: Banking/linked accounts feature won't work without this
+- **Your value**: `49f680c66cc54b7aa43c2ab53a8c83` (sandbox secret)
+- **Also verify**: `PLAID_CLIENT_ID=692b0eb3111b5200219bd3b4` is set
 
-### 2. **PLAID_PUBLIC_KEY** (Required for Banking/Linked Accounts)
+### 2. **PLAID_PUBLIC_KEY** (Optional - Not Used in Backend)
 ```
 PLAID_PUBLIC_KEY=your_plaid_public_key_here
 ```
-- **Where to get it**: Plaid Dashboard → API Keys → Public Key
-- **Impact**: Plaid Link initialization will fail without this
+- **Status**: ⚠️ Optional - Not used in backend code
+- **Impact**: 🟢 None - Backend creates link tokens server-side via `/api/v1/banking/link-token` endpoint
+- **Note**: Only needed if frontend initializes Plaid Link directly (without using backend API)
+- **Where to get it**: Plaid Dashboard → Team Settings → Keys → Public Key (if needed)
 
 ### 3. **STRIPE_WEBHOOK_SECRET** (Required for Stripe Webhooks)
 ```
@@ -160,20 +164,20 @@ PERSONA_REDIRECT_URI=https://akunuba.io/kyc/complete
 ## 📋 Summary: What to Add to Render
 
 ### **MUST ADD (Critical):**
-1. `PLAID_SECRET_KEY` - Get from Plaid Dashboard
-2. `PLAID_PUBLIC_KEY` - Get from Plaid Dashboard  
-3. `STRIPE_WEBHOOK_SECRET` - Get from Stripe Dashboard (replace placeholder)
+1. `PLAID_SECRET_KEY` - Set to: `49f680c66cc54b7aa43c2ab53a8c83` (your sandbox secret)
+2. `STRIPE_WEBHOOK_SECRET` - Get from Stripe Dashboard (replace placeholder)
 
 ### **SHOULD ADD (Recommended):**
 4. `RESEND_API_KEY` - Get from Resend Dashboard (for email functionality)
 5. `EMAIL_FROM_NAME=Akunuba` - Set to match your app name
 
 ### **OPTIONAL (Nice to have):**
-6. `POSTHOG_PROJECT_API_KEY` - If using PostHog analytics
-7. `GOOGLE_CLIENT_ID` - If using Google OAuth
-8. `GOOGLE_CLIENT_SECRET` - If using Google OAuth
-9. `GOOGLE_REDIRECT_URI` - Update to production domain if using Google OAuth
-10. `PERSONA_REDIRECT_URI` - If you want custom KYC redirect
+6. `PLAID_PUBLIC_KEY` - Only if frontend initializes Plaid Link directly (not needed for backend)
+7. `POSTHOG_PROJECT_API_KEY` - If using PostHog analytics
+8. `GOOGLE_CLIENT_ID` - If using Google OAuth
+9. `GOOGLE_CLIENT_SECRET` - If using Google OAuth
+10. `GOOGLE_REDIRECT_URI` - Update to production domain if using Google OAuth
+11. `PERSONA_REDIRECT_URI` - If you want custom KYC redirect
 
 ---
 

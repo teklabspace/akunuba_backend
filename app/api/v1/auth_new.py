@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -18,6 +18,7 @@ except ImportError:
     TOTP_AVAILABLE = False
     pyotp = None
 from app.core.exceptions import UnauthorizedException, ConflictException, NotFoundException, BadRequestException
+from app.core.rate_limit import limiter, LOGIN_RATE_LIMIT, AUTH_RATE_LIMIT
 from app.schemas.user import UserCreate, UserLogin, TokenResponse, LoginUserResponse, OTPRequest, OTPVerify, PasswordResetRequest, PasswordReset, RefreshTokenRequest, EmailVerificationRequest
 from app.utils.logger import logger
 from datetime import timedelta, datetime, timezone
@@ -82,7 +83,8 @@ async def get_user_verification_status(user: User, db: AsyncSession) -> dict:
     }
 
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
-async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
+@limiter.limit(LOGIN_RATE_LIMIT)
+async def register(request: Request, user_data: UserCreate, db: AsyncSession = Depends(get_db)):
     existing_user = await db.execute(select(User).where(User.email == user_data.email))
     if existing_user.scalar_one_or_none():
         raise ConflictException("User with this email already exists")
@@ -133,7 +135,8 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/login")
-async def login(credentials: UserLogin, db: AsyncSession = Depends(get_db)):
+@limiter.limit(LOGIN_RATE_LIMIT)
+async def login(request: Request, credentials: UserLogin, db: AsyncSession = Depends(get_db)):
     """
     Login endpoint with 2FA support.
     
@@ -238,14 +241,15 @@ async def login(credentials: UserLogin, db: AsyncSession = Depends(get_db)):
     )
 
 @router.post("/refresh", response_model=TokenResponse)
-async def refresh_token_endpoint(request: RefreshTokenRequest, db: AsyncSession = Depends(get_db)):
-    payload = decode_refresh_token(request.refresh_token)
+@limiter.limit(AUTH_RATE_LIMIT)
+async def refresh_token_endpoint(request: Request, body: RefreshTokenRequest, db: AsyncSession = Depends(get_db)):
+    payload = decode_refresh_token(body.refresh_token)
     if not payload:
         raise UnauthorizedException("Invalid refresh token")
     user_id = payload.get("sub")
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
-    if not user or user.refresh_token != request.refresh_token:
+    if not user or user.refresh_token != body.refresh_token:
         raise UnauthorizedException("Invalid refresh token")
     access_token = create_access_token(data={"sub": str(user.id)})
     new_refresh_token = create_refresh_token(data={"sub": str(user.id)})
@@ -334,8 +338,9 @@ async def verify_otp(request: OTPVerify, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/request-password-reset")
-async def request_password_reset(request: PasswordResetRequest, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).where(User.email == request.email))
+@limiter.limit(AUTH_RATE_LIMIT)
+async def request_password_reset(request: Request, body: PasswordResetRequest, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).where(User.email == body.email))
     user = result.scalar_one_or_none()
     if not user:
         return {"message": "If the email exists, a password reset link has been sent"}
@@ -359,26 +364,27 @@ async def request_password_reset(request: PasswordResetRequest, db: AsyncSession
     return {"message": "If the email exists, a password reset link has been sent"}
 
 @router.post("/reset-password")
-async def reset_password(request: PasswordReset, db: AsyncSession = Depends(get_db)):
+@limiter.limit(AUTH_RATE_LIMIT)
+async def reset_password(request: Request, body: PasswordReset, db: AsyncSession = Depends(get_db)):
     # Support both token-based and OTP-based password reset
-    if request.token:
+    if body.token:
         # Token-based reset (original method)
-        result = await db.execute(select(User).where(User.password_reset_token == request.token))
+        result = await db.execute(select(User).where(User.password_reset_token == body.token))
         user = result.scalar_one_or_none()
         if not user:
             raise BadRequestException("Invalid reset token")
         if user.password_reset_expires_at and user.password_reset_expires_at < datetime.now(timezone.utc):
             raise BadRequestException("Reset token has expired")
-    elif request.email and request.otp_code:
+    elif body.email and body.otp_code:
         # OTP-based reset
-        result = await db.execute(select(User).where(User.email == request.email))
+        result = await db.execute(select(User).where(User.email == body.email))
         user = result.scalar_one_or_none()
         if not user:
-            raise NotFoundException("User", request.email)
+            raise NotFoundException("User", body.email)
         
         # Verify OTP
         user_otp = str(user.otp_code) if user.otp_code else None
-        request_otp = str(request.otp_code).strip()
+        request_otp = str(body.otp_code).strip()
         
         if not user_otp or user_otp != request_otp:
             raise BadRequestException("Invalid OTP code")
@@ -391,7 +397,7 @@ async def reset_password(request: PasswordReset, db: AsyncSession = Depends(get_
         raise BadRequestException("No reset token found. Please use the link from your email or request a new password reset.")
     
     # Reset password
-    user.hashed_password = get_password_hash(request.new_password)
+    user.hashed_password = get_password_hash(body.new_password)
     user.password_reset_token = None
     user.password_reset_expires_at = None
     user.otp_code = None

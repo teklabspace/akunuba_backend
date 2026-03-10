@@ -9,6 +9,7 @@ from app.api.deps import get_current_user
 from app.models.user import User
 from app.models.user_preferences import UserPreferences
 from app.models.account import Account
+from app.models.kyc import KYCVerification
 from app.schemas.user import UserResponse, UserUpdate
 from app.core.exceptions import NotFoundException, BadRequestException
 from app.core.permissions import Role, Permission, has_permission
@@ -101,10 +102,54 @@ class DeleteAccountRequest(BaseModel):
     confirmation_text: str
 
 
-@router.get("/me", response_model=UserResponse)
-async def get_current_user_info(current_user: User = Depends(get_current_user)):
-    """Get current user information"""
-    return current_user
+class UserProfileResponse(BaseModel):
+    id: UUID
+    email: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    phone: Optional[str] = None
+    email_verified: bool
+    kyc_status: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+@router.get("/me", response_model=UserProfileResponse)
+async def get_current_user_info(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get current user profile information"""
+    # Get KYC status
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+    
+    kyc_status = "not_started"
+    if account:
+        kyc_result = await db.execute(
+            select(KYCVerification).where(KYCVerification.account_id == account.id)
+        )
+        kyc = kyc_result.scalar_one_or_none()
+        if kyc:
+            kyc_status = kyc.status.value
+    
+    # Check email verification
+    email_verified = current_user.email_verified_at is not None
+    
+    return UserProfileResponse(
+        id=current_user.id,
+        email=current_user.email,
+        first_name=current_user.first_name,
+        last_name=current_user.last_name,
+        phone=current_user.phone,
+        email_verified=email_verified,
+        kyc_status=kyc_status,
+        created_at=current_user.created_at
+    )
 
 
 @router.put("/me", response_model=UserResponse)

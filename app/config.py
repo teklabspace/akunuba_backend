@@ -99,6 +99,21 @@ class Settings(BaseSettings):
     MAX_UPLOAD_SIZE: int = 10485760
     ALLOWED_FILE_TYPES: List[str] = ["pdf", "doc", "docx", "jpg", "jpeg", "png"]
     
+    # Redis Configuration (for WebSocket pub/sub and caching)
+    REDIS_URL: str = "redis://localhost:6379/0"
+    
+    # Sentry (optional - set SENTRY_DSN for production error tracking)
+    SENTRY_DSN: str = ""
+    SENTRY_ENVIRONMENT: str = "development"
+    SENTRY_TRACES_SAMPLE_RATE: float = 0.1
+    
+    # Webhook secrets for verification (Persona, Plaid)
+    PERSONA_WEBHOOK_SECRET: str = ""
+    PLAID_WEBHOOK_SECRET: str = ""  # Optional; Plaid uses JWT verification
+    
+    # Rate limiting (optional overrides)
+    RATE_LIMIT_ENABLED: bool = True
+    
     class Config:
         env_file = ".env"
         case_sensitive = True

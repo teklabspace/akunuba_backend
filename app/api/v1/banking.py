@@ -134,12 +134,29 @@ async def link_account(
         raise BadRequestException("Failed to link account")
 
 
-@router.get("/accounts", response_model=List[LinkedAccountResponse])
+class BankingAccountResponse(BaseModel):
+    id: UUID
+    institution_name: str
+    account_name: str
+    account_type: str
+    balance: Optional[Decimal] = None
+    currency: str
+    last_synced: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class BankingAccountsResponse(BaseModel):
+    data: List[BankingAccountResponse]
+
+
+@router.get("/accounts", response_model=BankingAccountsResponse)
 async def get_linked_accounts(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get all linked accounts"""
+    """Get all linked bank accounts"""
     account_result = await db.execute(
         select(Account).where(Account.user_id == current_user.id)
     )
@@ -156,7 +173,27 @@ async def get_linked_accounts(
     )
     linked_accounts = result.scalars().all()
     
-    return linked_accounts
+    # Map to spec format
+    account_type_map = {
+        AccountType.BANKING: "checking",
+        AccountType.BROKERAGE: "brokerage",
+        AccountType.CRYPTO: "crypto"
+    }
+    
+    data = []
+    for linked_account in linked_accounts:
+        account_type = account_type_map.get(linked_account.account_type, "checking")
+        data.append(BankingAccountResponse(
+            id=linked_account.id,
+            institution_name=linked_account.institution_name or "Unknown Institution",
+            account_name=linked_account.account_name,
+            account_type=account_type,
+            balance=linked_account.balance,
+            currency=linked_account.currency,
+            last_synced=linked_account.last_synced_at
+        ))
+    
+    return BankingAccountsResponse(data=data)
 
 
 @router.post("/sync/{linked_account_id}")

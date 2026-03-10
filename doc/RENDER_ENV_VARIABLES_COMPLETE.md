@@ -80,16 +80,19 @@ STRIPE_WEBHOOK_SECRET=whsec_your_actual_webhook_secret_here
 ## 🏦 Plaid Configuration (Banking/Linked Accounts)
 
 ```
-PLAID_CLIENT_ID=your_plaid_client_id_here
+PLAID_CLIENT_ID=692b0eb3111b5200219bd3b4
 PLAID_ENV=sandbox
-PLAID_SECRET_KEY=your_plaid_secret_key_here
-PLAID_PUBLIC_KEY=your_plaid_public_key_here
+PLAID_SECRET_KEY=49f680c66cc54b7aa43c2ab53a8c83
+PLAID_PUBLIC_KEY=  # Optional - not used in backend code
 ```
 
-**⚠️ IMPORTANT:** Replace with your actual Plaid keys:
-1. Go to Plaid Dashboard → API Keys
-2. Copy "Secret Key" → Set as `PLAID_SECRET_KEY`
-3. Copy "Public Key" → Set as `PLAID_PUBLIC_KEY`
+**⚠️ IMPORTANT:** 
+- **Required**: `PLAID_CLIENT_ID` and `PLAID_SECRET_KEY` are required for backend functionality
+- **Optional**: `PLAID_PUBLIC_KEY` is not used in backend code (only needed if frontend initializes Plaid Link directly)
+- **Your keys**: 
+  - Client ID: `692b0eb3111b5200219bd3b4`
+  - Sandbox Secret: `49f680c66cc54b7aa43c2ab53a8c83`
+- **How it works**: Backend creates link tokens server-side via `/api/v1/banking/link-token` endpoint, so frontend doesn't need public key
 
 ---
 
@@ -226,8 +229,8 @@ PYTHON_VERSION=3.11.9
 
 ### ⚠️ Need to Add/Update
 - [ ] **STRIPE_WEBHOOK_SECRET** - Replace placeholder with actual webhook secret
-- [ ] **PLAID_SECRET_KEY** - Get from Plaid Dashboard
-- [ ] **PLAID_PUBLIC_KEY** - Get from Plaid Dashboard
+- [ ] **PLAID_SECRET_KEY** - Set to: `49f680c66cc54b7aa43c2ab53a8c83` (your sandbox secret)
+- [ ] **PLAID_PUBLIC_KEY** - Optional (not used in backend, only if frontend initializes Plaid Link directly)
 - [ ] **RESEND_API_KEY** - Get from Resend Dashboard
 - [ ] **EMAIL_FROM_NAME** - Set to "Akunuba"
 - [ ] **GOOGLE_CLIENT_ID** - ✅ Provided above

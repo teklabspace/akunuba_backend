@@ -22,6 +22,10 @@ from app.models.entity import (
     EntityAuditTrail, AuditAction
 )
 from app.models.notification import Notification
+from app.models.referral import Referral, ReferralReward, ReferralStatus
+from app.models.chat import Conversation, ConversationParticipant, Message, MessageAttachment, MessageRead
+from app.models.task import Task, Reminder
+from app.models.watchlist import InvestmentWatchlist
 from app.models.kyc import KYCVerification
 from app.models.kyb import KYBVerification
 from app.models.user_preferences import UserPreferences
@@ -92,6 +96,9 @@ __all__ = [
     "EntityAuditTrail",
     "AuditAction",
     "Notification",
+    "Referral",
+    "ReferralReward",
+    "ReferralStatus",
     "KYCVerification",
     "KYBVerification",
     "UserPreferences",
@@ -114,5 +121,13 @@ __all__ = [
     "ReportStatus",
     "ReportFormat",
     "PolicyStatus",
+    "Conversation",
+    "ConversationParticipant",
+    "Message",
+    "MessageAttachment",
+    "MessageRead",
+    "Task",
+    "Reminder",
+    "InvestmentWatchlist",
 ]
 

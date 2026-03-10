@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, status, HTTPException, Query, Body
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, and_
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -538,7 +538,7 @@ async def get_account_stats(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get account statistics"""
+    """Get account statistics and metrics"""
     account_result = await db.execute(
         select(Account).where(Account.user_id == current_user.id)
     )
@@ -558,14 +558,20 @@ async def get_account_stats(
             created_at = created_at.replace(tzinfo=timezone.utc)
         account_age_days = (now - created_at).days
     
-    # Total transactions
-    transactions_result = await db.execute(
-        select(func.count(Payment.id)).where(
-            Payment.account_id == account.id,
-            Payment.status == PaymentStatus.COMPLETED
+    # Total assets count
+    assets_count_result = await db.execute(
+        select(func.count(Asset.id)).where(Asset.account_id == account.id)
+    )
+    total_assets = assets_count_result.scalar() or 0
+    
+    # Total accounts linked (banking accounts)
+    linked_accounts_count_result = await db.execute(
+        select(func.count(LinkedAccount.id)).where(
+            LinkedAccount.account_id == account.id,
+            LinkedAccount.is_active == True
         )
     )
-    total_transactions = transactions_result.scalar() or 0
+    total_accounts_linked = linked_accounts_count_result.scalar() or 0
     
     # Portfolio value
     assets_result = await db.execute(
@@ -573,29 +579,39 @@ async def get_account_stats(
     )
     portfolio_value = assets_result.scalar() or Decimal("0")
     
-    # KYC status
-    kyc_result = await db.execute(
-        select(KYCVerification).where(KYCVerification.account_id == account.id)
+    # Last activity (most recent payment or asset update)
+    last_payment_result = await db.execute(
+        select(Payment.created_at).where(
+            Payment.account_id == account.id
+        ).order_by(Payment.created_at.desc()).limit(1)
     )
-    kyc = kyc_result.scalar_one_or_none()
-    kyc_status = kyc.status.value if kyc else "not_started"
+    last_payment = last_payment_result.scalar_one_or_none()
     
-    # Subscription status
-    from app.models.payment import Subscription
-    subscription_result = await db.execute(
-        select(Subscription).where(Subscription.account_id == account.id)
+    last_asset_result = await db.execute(
+        select(Asset.updated_at).where(
+            Asset.account_id == account.id
+        ).order_by(Asset.updated_at.desc()).limit(1)
     )
-    subscription = subscription_result.scalar_one_or_none()
-    subscription_status = subscription.status.value if subscription else "none"
+    last_asset = last_asset_result.scalar_one_or_none()
+    
+    # Get most recent activity (most recent payment or asset update)
+    last_activity = None
+    if last_payment and last_asset:
+        # Compare both and get the most recent
+        last_payment_tz = last_payment.replace(tzinfo=timezone.utc) if last_payment.tzinfo is None else last_payment
+        last_asset_tz = last_asset.replace(tzinfo=timezone.utc) if last_asset.tzinfo is None else last_asset
+        last_activity = max(last_payment_tz, last_asset_tz)
+    elif last_payment:
+        last_activity = last_payment.replace(tzinfo=timezone.utc) if last_payment.tzinfo is None else last_payment
+    elif last_asset:
+        last_activity = last_asset.replace(tzinfo=timezone.utc) if last_asset.tzinfo is None else last_asset
     
     return {
         "account_age_days": account_age_days,
-        "total_transactions": total_transactions,
+        "total_assets": total_assets,
+        "total_accounts_linked": total_accounts_linked,
         "portfolio_value": float(portfolio_value),
-        "kyc_status": kyc_status,
-        "subscription_status": subscription_status,
-        "is_verified": current_user.is_verified,
-        "is_joint": account.is_joint
+        "last_activity": last_activity.isoformat() if last_activity else None
     }
 
 

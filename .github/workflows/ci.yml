@@ -1,0 +1,57 @@
+# CI: lint, env validation, tests (if any)
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate environment (required vars only)
+        env:
+          DATABASE_URL: postgresql://u:p@localhost/db
+          SUPABASE_URL: https://example.supabase.co
+          SUPABASE_ANON_KEY: x
+          SUPABASE_SERVICE_ROLE_KEY: x
+          SUPABASE_JWT_SECRET: x
+          STRIPE_SECRET_KEY: sk_test_x
+          STRIPE_PUBLISHABLE_KEY: pk_test_x
+          STRIPE_WEBHOOK_SECRET: whsec_x
+          PERSONA_API_KEY: x
+          SENDBIRD_APP_ID: x
+          SENDBIRD_API_TOKEN: x
+          SECRET_KEY: secret
+        run: python scripts/validate_env.py
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t fullego-backend .
+      - name: Run container
+        run: |
+          docker run -d -e DATABASE_URL=postgresql://u:p@host/db \
+            -e SUPABASE_URL=x -e SUPABASE_ANON_KEY=x -e SUPABASE_SERVICE_ROLE_KEY=x \
+            -e SUPABASE_JWT_SECRET=x -e STRIPE_SECRET_KEY=x -e STRIPE_PUBLISHABLE_KEY=x \
+            -e STRIPE_WEBHOOK_SECRET=x -e PERSONA_API_KEY=x -e SENDBIRD_APP_ID=x \
+            -e SENDBIRD_API_TOKEN=x -e SECRET_KEY=secret -p 8000:8000 --name api fullego-backend
+          sleep 5
+          curl -sf http://localhost:8000/health || true
+          docker stop api

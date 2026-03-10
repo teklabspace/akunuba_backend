@@ -1,18 +1,39 @@
+from urllib.parse import urlparse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from app.utils.logger import logger
 from app.config import settings
+from app.core.scheduler_locks import with_lock
+from app.core.metrics import record_job_failure
 
-scheduler = AsyncIOScheduler(timezone="UTC")
+# Optional Redis jobstore so jobs persist across restarts and are shared across instances
+_jobstores = None
+try:
+    if getattr(settings, "REDIS_URL", None) and settings.REDIS_URL.startswith("redis://"):
+        from apscheduler.jobstores.redis import RedisJobStore
+        u = urlparse(settings.REDIS_URL)
+        _jobstores = {
+            "default": RedisJobStore(
+                host=u.hostname or "localhost",
+                port=u.port or 6379,
+                db=int((u.path or "/0").strip("/") or 0),
+                password=u.password or None,
+            )
+        }
+        logger.info("Scheduler using Redis jobstore for persistence")
+except Exception as e:
+    logger.warning(f"Redis jobstore not used, jobs in-memory only: {e}")
+
+scheduler = AsyncIOScheduler(timezone="UTC", jobstores=_jobstores or {})
 
 
 def setup_scheduled_tasks():
-    """Setup all scheduled background tasks"""
+    """Setup all scheduled background tasks. Jobs use Redis lock so only one instance runs each."""
     try:
         # Offer expiration - check every hour
         scheduler.add_job(
-            expire_offers,
+            with_lock("expire_offers", expire_offers),
             IntervalTrigger(hours=1),
             id='expire_offers',
             replace_existing=True,
@@ -21,7 +42,7 @@ def setup_scheduled_tasks():
         
         # Portfolio recalculation - daily at 2 AM UTC
         scheduler.add_job(
-            recalculate_portfolios,
+            with_lock("recalculate_portfolios", recalculate_portfolios),
             CronTrigger(hour=2, minute=0),
             id='recalculate_portfolios',
             replace_existing=True,
@@ -30,7 +51,7 @@ def setup_scheduled_tasks():
         
         # Subscription renewal check - daily at 3 AM UTC
         scheduler.add_job(
-            process_subscription_renewals,
+            with_lock("subscription_renewals", process_subscription_renewals),
             CronTrigger(hour=3, minute=0),
             id='subscription_renewals',
             replace_existing=True,
@@ -39,7 +60,7 @@ def setup_scheduled_tasks():
         
         # Listing expiration - daily at 4 AM UTC
         scheduler.add_job(
-            expire_listings,
+            with_lock("expire_listings", expire_listings),
             CronTrigger(hour=4, minute=0),
             id='expire_listings',
             replace_existing=True,
@@ -48,9 +69,27 @@ def setup_scheduled_tasks():
         
         # SLA monitoring - every 6 hours
         scheduler.add_job(
-            monitor_sla_breaches,
+            with_lock("monitor_sla", monitor_sla_breaches),
             IntervalTrigger(hours=6),
             id='monitor_sla',
+            replace_existing=True,
+            max_instances=1
+        )
+        
+        # Banking auto-sync: sync all linked accounts every 6 hours
+        scheduler.add_job(
+            with_lock("banking_sync_all", banking_sync_all),
+            IntervalTrigger(hours=6),
+            id='banking_sync_all',
+            replace_existing=True,
+            max_instances=1
+        )
+        
+        # Subscription payment retry sync & downgrade - daily at 4:30 AM UTC
+        scheduler.add_job(
+            with_lock("subscription_retry_downgrade", process_subscription_retry_and_downgrade),
+            CronTrigger(hour=4, minute=30),
+            id='subscription_retry_downgrade',
             replace_existing=True,
             max_instances=1
         )
@@ -132,6 +171,7 @@ async def expire_offers():
             await db.commit()
     except Exception as e:
         logger.error(f"Error expiring offers: {e}")
+        record_job_failure("expire_offers")
 
 
 async def expire_listings():
@@ -169,6 +209,7 @@ async def expire_listings():
             logger.info(f"Expired {len(old_listings)} listings")
     except Exception as e:
         logger.error(f"Error expiring listings: {e}")
+        record_job_failure("expire_listings")
 
 
 async def recalculate_portfolios():
@@ -213,6 +254,7 @@ async def recalculate_portfolios():
             logger.info(f"Recalculated portfolios for {len(accounts)} accounts")
     except Exception as e:
         logger.error(f"Error recalculating portfolios: {e}")
+        record_job_failure("recalculate_portfolios")
 
 
 async def process_subscription_renewals():
@@ -272,6 +314,7 @@ async def process_subscription_renewals():
             logger.info(f"Processed {len(expired_subscriptions)} expired subscriptions")
     except Exception as e:
         logger.error(f"Error processing subscription renewals: {e}")
+        record_job_failure("subscription_renewals")
 
 
 async def monitor_sla_breaches():
@@ -304,4 +347,80 @@ async def monitor_sla_breaches():
             logger.info(f"Monitored {len(open_tickets)} tickets, {breached_count} SLA breaches detected")
     except Exception as e:
         logger.error(f"Error monitoring SLA breaches: {e}")
+        record_job_failure("monitor_sla")
+
+
+async def banking_sync_all():
+    """Sync transactions and balance for all active linked bank accounts. Runs every 6 hours."""
+    from app.database import AsyncSessionLocal
+    from app.models.banking import LinkedAccount
+    from app.services.banking_sync_service import sync_linked_account_transactions, refresh_linked_account_balance
+    from sqlalchemy import select
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(LinkedAccount).where(LinkedAccount.is_active == True)
+            )
+            linked_accounts = result.scalars().all()
+            for la in linked_accounts:
+                try:
+                    await sync_linked_account_transactions(db, la.id)
+                    await refresh_linked_account_balance(db, la.id)
+                except Exception as e:
+                    logger.warning(f"Banking sync failed for linked account {la.id}: {e}")
+            logger.info(f"Banking sync completed for {len(linked_accounts)} linked accounts")
+    except Exception as e:
+        logger.error(f"Error in banking_sync_all: {e}")
+        record_job_failure("banking_sync_all")
+
+
+async def process_subscription_retry_and_downgrade():
+    """Sync past_due from Stripe; downgrade to FREE after prolonged failure. Runs daily."""
+    from app.database import AsyncSessionLocal
+    from app.models.payment import Subscription, SubscriptionStatus, SubscriptionPlan
+    from app.services.notification_service import NotificationService, NotificationType
+    from sqlalchemy import select
+    from datetime import datetime, timedelta
+    import stripe
+    try:
+        async with AsyncSessionLocal() as db:
+            # Sync past_due status from Stripe
+            past_due_result = await db.execute(
+                select(Subscription).where(Subscription.status == SubscriptionStatus.PAST_DUE)
+            )
+            for sub in past_due_result.scalars().all():
+                if sub.stripe_subscription_id:
+                    try:
+                        stripe_sub = stripe.Subscription.retrieve(sub.stripe_subscription_id)
+                        if stripe_sub.status == "active":
+                            sub.status = SubscriptionStatus.ACTIVE
+                            sub.current_period_start = datetime.fromtimestamp(stripe_sub.current_period_start)
+                            sub.current_period_end = datetime.fromtimestamp(stripe_sub.current_period_end)
+                        elif stripe_sub.status == "canceled" or stripe_sub.status == "unpaid":
+                            sub.status = SubscriptionStatus.EXPIRED
+                    except Exception as e:
+                        logger.warning(f"Stripe sync for subscription {sub.id}: {e}")
+            # Downgrade expired subscriptions (e.g. after 7 days) to FREE
+            cutoff = datetime.utcnow() - timedelta(days=7)
+            expired_result = await db.execute(
+                select(Subscription).where(
+                    Subscription.status.in_([SubscriptionStatus.EXPIRED, SubscriptionStatus.CANCELLED]),
+                    Subscription.updated_at < cutoff
+                )
+            )
+            for sub in expired_result.scalars().all():
+                if sub.plan != SubscriptionPlan.FREE:
+                    sub.plan = SubscriptionPlan.FREE
+                    await NotificationService.create_notification(
+                        db=db,
+                        account_id=sub.account_id,
+                        notification_type=NotificationType.GENERAL,
+                        title="Subscription ended",
+                        message="Your subscription has ended. You are now on the Free plan."
+                    )
+            await db.commit()
+        logger.info("Subscription retry and downgrade job completed")
+    except Exception as e:
+        logger.error(f"Error in process_subscription_retry_and_downgrade: {e}")
+        record_job_failure("subscription_retry_downgrade")
 

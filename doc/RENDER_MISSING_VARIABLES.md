@@ -10,19 +10,21 @@ These are **required** and will cause errors if not set:
 
 ### 1. **PLAID_SECRET_KEY**
 ```
-PLAID_SECRET_KEY=your_plaid_secret_key_here
+PLAID_SECRET_KEY=49f680c66cc54b7aa43c2ab53a8c83  # Your sandbox secret
 ```
 - **Status**: ❌ Missing
 - **Impact**: Banking/linked accounts feature won't work
-- **Where to get**: Plaid Dashboard → API Keys → Secret Key
+- **Where to get**: Plaid Dashboard → Team Settings → Keys → Secret Key
+- **Your value**: `49f680c66cc54b7aa43c2ab53a8c83` (sandbox secret)
 
-### 2. **PLAID_PUBLIC_KEY**
+### 2. **PLAID_PUBLIC_KEY** (Optional - Not Used in Backend)
 ```
 PLAID_PUBLIC_KEY=your_plaid_public_key_here
 ```
-- **Status**: ❌ Missing
-- **Impact**: Plaid Link initialization will fail
-- **Where to get**: Plaid Dashboard → API Keys → Public Key
+- **Status**: ⚠️ Optional - Not used in backend code
+- **Impact**: 🟢 None - Backend creates link tokens server-side, so this key is not needed
+- **Note**: Only needed if frontend initializes Plaid Link directly (without using backend API)
+- **Where to get**: Plaid Dashboard → API Keys → Public Key (if needed)
 
 ### 3. **STRIPE_WEBHOOK_SECRET** (Currently has placeholder)
 ```
@@ -178,9 +180,15 @@ Copy and paste these into Render Dashboard → Environment tab:
 
 ### Critical (Must Add):
 ```
-PLAID_SECRET_KEY=your_plaid_secret_key_here
-PLAID_PUBLIC_KEY=your_plaid_public_key_here
+PLAID_CLIENT_ID=692b0eb3111b5200219bd3b4  # Already set, but verify
+PLAID_SECRET_KEY=49f680c66cc54b7aa43c2ab53a8c83  # Your sandbox secret
+PLAID_ENV=sandbox  # Already set, but verify
 STRIPE_WEBHOOK_SECRET=whsec_your_actual_webhook_secret
+```
+
+### Optional (Only if frontend initializes Plaid Link directly):
+```
+PLAID_PUBLIC_KEY=your_plaid_public_key_here  # Not used in backend
 ```
 
 ### Important (Should Add):
@@ -206,18 +214,18 @@ APP_VERSION=1.0.0
 ## 📊 Summary
 
 **Total Missing:**
-- **Critical**: 3 variables (2 missing + 1 placeholder)
+- **Critical**: 2 variables (1 missing + 1 placeholder)
 - **Important**: 5 variables
-- **Optional**: 5 variables
+- **Optional**: 6 variables (including PLAID_PUBLIC_KEY)
 
 **Priority Order:**
 1. 🔴 **Fix STRIPE_WEBHOOK_SECRET** (replace placeholder)
-2. 🔴 **Add PLAID_SECRET_KEY** (for banking feature)
-3. 🔴 **Add PLAID_PUBLIC_KEY** (for banking feature)
-4. 🟡 **Add RESEND_API_KEY** (for email functionality)
-5. 🟡 **Add Google OAuth variables** (3 variables)
-6. 🟡 **Add EMAIL_FROM_NAME**
-7. 🟢 **Add optional variables** (if needed)
+2. 🔴 **Add PLAID_SECRET_KEY** (for banking feature) - Use: `49f680c66cc54b7aa43c2ab53a8c83`
+3. 🟡 **Add RESEND_API_KEY** (for email functionality)
+4. 🟡 **Add Google OAuth variables** (3 variables)
+5. 🟡 **Add EMAIL_FROM_NAME**
+6. 🟢 **Add optional variables** (if needed)
+7. 🟢 **Add PLAID_PUBLIC_KEY** (only if frontend initializes Plaid Link directly - not needed for backend)
 
 ---
 

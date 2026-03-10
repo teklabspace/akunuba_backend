@@ -4,7 +4,7 @@ from sqlalchemy import select, and_, desc, or_, func
 from typing import List, Optional, Dict, Any
 from decimal import Decimal
 from datetime import datetime, timedelta
-from uuid import UUID
+from uuid import UUID, uuid4
 from app.database import get_db
 from app.api.deps import get_current_user
 from app.models.user import User
@@ -1210,15 +1210,20 @@ class WatchlistItemCreate(BaseModel):
 class WatchlistItemResponse(BaseModel):
     id: UUID
     symbol: str
-    asset_type: str
     name: Optional[str] = None
-    current_price: Optional[float] = None
-    change_percentage: Optional[float] = None
-    notes: Optional[str] = None
-    added_at: datetime
+    assetType: str
+    currentPrice: Optional[float] = None
+    change: Optional[float] = None
+    changePercentage: Optional[float] = None
+    addedAt: datetime
 
 
-@router.get("/watchlist", response_model=Dict[str, List[WatchlistItemResponse]])
+class WatchlistListResponse(BaseModel):
+    data: List[WatchlistItemResponse]
+    total: int
+
+
+@router.get("/watchlist", response_model=WatchlistListResponse)
 async def get_investment_watchlist(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
@@ -1233,16 +1238,44 @@ async def get_investment_watchlist(
         if not account:
             raise NotFoundException("Account", str(current_user.id))
         
-        # In a real implementation, you would have an InvestmentWatchlist model
-        # For now, return empty list as placeholder
-        # This would query: select(InvestmentWatchlist).where(InvestmentWatchlist.account_id == account.id)
-        
-        watchlist_items = []
-        
-        # Placeholder: In production, fetch from database
-        # For now, return empty list
-        
-        return {"data": watchlist_items}
+        from app.models.watchlist import InvestmentWatchlist, AssetType as WatchlistAssetType
+
+        result = await db.execute(
+            select(InvestmentWatchlist).where(InvestmentWatchlist.account_id == account.id)
+        )
+        items = result.scalars().all()
+
+        response_items: List[WatchlistItemResponse] = []
+        for item in items:
+            symbol = item.symbol.upper()
+            current_price = None
+            change = None
+            change_pct = None
+            try:
+                current_price = PolygonClient.get_current_price(symbol)
+                if current_price:
+                    yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+                    prev_data = PolygonClient.get_daily_open_close(symbol, yesterday)
+                    prev_price = prev_data.get("close") if prev_data else current_price
+                    change = current_price - prev_price
+                    change_pct = (change / prev_price * 100) if prev_price > 0 else 0
+            except Exception as e:
+                logger.warning(f"Failed to get watchlist price for {symbol}: {e}")
+
+            response_items.append(
+                WatchlistItemResponse(
+                    id=item.id,
+                    symbol=symbol,
+                    name=item.name or symbol,
+                    assetType=item.asset_type.value if hasattr(item.asset_type, "value") else str(item.asset_type),
+                    currentPrice=round(current_price, 2) if current_price is not None else None,
+                    change=round(change, 2) if change is not None else None,
+                    changePercentage=round(change_pct, 2) if change_pct is not None else None,
+                    addedAt=item.added_at,
+                )
+            )
+
+        return WatchlistListResponse(data=response_items, total=len(response_items))
     except Exception as e:
         logger.error(f"Error getting watchlist: {e}", exc_info=True)
         return {"data": []}
@@ -1264,30 +1297,67 @@ async def add_to_watchlist(
         if not account:
             raise NotFoundException("Account", str(current_user.id))
         
-        # In a real implementation, you would:
-        # 1. Check if item already exists in watchlist
-        # 2. Create new InvestmentWatchlist record
-        # 3. Get current price from market data
-        
-        # Get current price (placeholder)
+        from app.models.watchlist import InvestmentWatchlist, AssetType as WatchlistAssetType
+
+        # Check if already exists
+        existing_result = await db.execute(
+            select(InvestmentWatchlist).where(
+                and_(
+                    InvestmentWatchlist.account_id == account.id,
+                    InvestmentWatchlist.symbol == watchlist_item.symbol.upper(),
+                )
+            )
+        )
+        existing = existing_result.scalar_one_or_none()
+        if existing:
+            raise BadRequestException("Symbol already in watchlist")
+
+        # Get current price (optional)
         try:
             current_price = PolygonClient.get_current_price(watchlist_item.symbol)
         except:
             current_price = None
-        
-        # Generate new watchlist item ID
-        item_id = UUID()
-        
+
+        # Map asset_type string to enum if possible
+        asset_type_value = watchlist_item.asset_type.lower()
+        try:
+            asset_type_enum = WatchlistAssetType(asset_type_value)
+        except ValueError:
+            asset_type_enum = WatchlistAssetType.OTHER
+
+        item = InvestmentWatchlist(
+            account_id=account.id,
+            symbol=watchlist_item.symbol.upper(),
+            name=watchlist_item.symbol.upper(),
+            asset_type=asset_type_enum,
+        )
+
+        db.add(item)
+        await db.commit()
+        await db.refresh(item)
+
+        change = None
+        change_pct = None
+        if current_price:
+            try:
+                yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+                prev_data = PolygonClient.get_daily_open_close(watchlist_item.symbol, yesterday)
+                prev_price = prev_data.get("close") if prev_data else current_price
+                change = current_price - prev_price
+                change_pct = (change / prev_price * 100) if prev_price > 0 else 0
+            except Exception:
+                pass
+
         return {
-            "data": WatchlistItemResponse(
-                id=item_id,
-                symbol=watchlist_item.symbol.upper(),
-                asset_type=watchlist_item.asset_type,
-                name=watchlist_item.symbol.upper(),  # Would fetch from market data
-                current_price=float(current_price) if current_price else None,
-                change_percentage=None,  # Would calculate from market data
-                notes=watchlist_item.notes,
-                added_at=datetime.utcnow()
+            "watchlistItem": WatchlistItemResponse(
+                id=item.id,
+                symbol=item.symbol,
+                name=item.name,
+                assetType=item.asset_type.value if hasattr(item.asset_type, "value") else str(item.asset_type),
+                currentPrice=round(current_price, 2) if current_price is not None else None,
+                change=round(change, 2) if change is not None else None,
+                changePercentage=round(change_pct, 2) if change_pct is not None else None,
+                addedAt=item.added_at,
             )
         }
     except Exception as e:
@@ -1295,7 +1365,7 @@ async def add_to_watchlist(
         raise BadRequestException(f"Failed to add to watchlist: {str(e)}")
 
 
-@router.delete("/watchlist/{id}", status_code=status.HTTP_200_OK)
+@router.delete("/watchlist/{id}", status_code=status.HTTP_204_NO_CONTENT)
 async def remove_from_watchlist(
     id: UUID,
     current_user: User = Depends(get_current_user),
@@ -1311,15 +1381,24 @@ async def remove_from_watchlist(
         if not account:
             raise NotFoundException("Account", str(current_user.id))
         
-        # In a real implementation, you would:
-        # 1. Find the watchlist item
-        # 2. Verify it belongs to the account
-        # 3. Delete it
-        
-        return {
-            "message": "Item removed from watchlist successfully",
-            "id": str(id)
-        }
+        from app.models.watchlist import InvestmentWatchlist
+
+        result = await db.execute(
+            select(InvestmentWatchlist).where(
+                and_(
+                    InvestmentWatchlist.id == id,
+                    InvestmentWatchlist.account_id == account.id,
+                )
+            )
+        )
+        item = result.scalar_one_or_none()
+        if not item:
+            raise NotFoundException("Watchlist item", str(id))
+
+        await db.delete(item)
+        await db.commit()
+
+        return None
     except Exception as e:
         logger.error(f"Error removing from watchlist: {e}", exc_info=True)
         raise BadRequestException(f"Failed to remove from watchlist: {str(e)}")

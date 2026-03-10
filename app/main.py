@@ -4,9 +4,55 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
+import time
 from app.config import settings
-from app.api.v1 import auth_new as auth, users, accounts, assets, portfolio, trading, marketplace, payments, subscriptions, banking, documents, support, notifications, reports, kyc, kyb, chat, analytics, admin, files, investment, concierge, crm, entities, compliance
+from app.api.v1 import (
+    auth_new as auth,
+    users,
+    accounts,
+    assets,
+    portfolio,
+    trading,
+    marketplace,
+    payments,
+    subscriptions,
+    banking,
+    documents,
+    support,
+    notifications,
+    reports,
+    kyc,
+    kyb,
+    chat,
+    analytics,
+    admin,
+    files,
+    investment,
+    concierge,
+    crm,
+    entities,
+    compliance,
+    referrals,
+    market,
+    tasks,
+    reminders,
+    chat_conversations,
+    websocket_chat,
+    webhooks,
+)
 from app.utils.logger import logger
+
+# Sentry (optional - set SENTRY_DSN for production)
+if getattr(settings, "SENTRY_DSN", None) and settings.SENTRY_DSN:
+    import sentry_sdk
+    from sentry_sdk.integrations.fastapi import FastApiIntegration
+    from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
+    sentry_sdk.init(
+        dsn=settings.SENTRY_DSN,
+        environment=getattr(settings, "SENTRY_ENVIRONMENT", None) or settings.APP_ENV,
+        traces_sample_rate=getattr(settings, "SENTRY_TRACES_SAMPLE_RATE", 0.1),
+        integrations=[FastApiIntegration(), SqlalchemyIntegration()],
+    )
 
 
 class NormalizePathMiddleware(BaseHTTPMiddleware):
@@ -29,8 +75,33 @@ app = FastAPI(
     debug=settings.APP_DEBUG,
 )
 
+# Rate limiting (slowapi) - 60/min default; auth routes use 5/min
+if getattr(settings, "RATE_LIMIT_ENABLED", True):
+    from slowapi import _rate_limit_exceeded_handler
+    from slowapi.errors import RateLimitExceeded
+    from app.core.rate_limit import limiter
+    app.state.limiter = limiter
+    limiter.init(app)
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+class RequestTimingMiddleware(BaseHTTPMiddleware):
+    """Record request duration for /health metrics."""
+    async def dispatch(self, request: Request, call_next):
+        start = time.perf_counter()
+        response = await call_next(request)
+        duration = time.perf_counter() - start
+        try:
+            from app.core.metrics import record_request_time
+            record_request_time(duration)
+        except Exception:
+            pass
+        return response
+
+
 # Add path normalization middleware first (before CORS)
 app.add_middleware(NormalizePathMiddleware)
+app.add_middleware(RequestTimingMiddleware)
 
 # CORS configuration - must be added before other middleware
 # Allows requests from frontend origins and includes proper CORS headers
@@ -117,13 +188,22 @@ app.include_router(support.router, prefix=f"{settings.API_V1_PREFIX}/support", t
 app.include_router(notifications.router, prefix=f"{settings.API_V1_PREFIX}/notifications", tags=["Notifications"])
 app.include_router(reports.router, prefix=f"{settings.API_V1_PREFIX}/reports", tags=["Reports"])
 app.include_router(chat.router, prefix=f"{settings.API_V1_PREFIX}/chat", tags=["Chat"])
+app.include_router(chat_conversations.router, prefix=f"{settings.API_V1_PREFIX}/chat", tags=["Chat"])
+# WebSocket route (registered directly on app, not via router)
+from app.api.v1.websocket_chat import websocket_chat_endpoint
+app.websocket("/ws/chat")(websocket_chat_endpoint)
 app.include_router(analytics.router, prefix=f"{settings.API_V1_PREFIX}/analytics", tags=["Analytics"])
 app.include_router(admin.router, prefix=f"{settings.API_V1_PREFIX}/admin", tags=["Admin"])
 app.include_router(investment.router, prefix=f"{settings.API_V1_PREFIX}/investment", tags=["Investment"])
+app.include_router(market.router, prefix=f"{settings.API_V1_PREFIX}/market", tags=["Market"])
+app.include_router(tasks.router, prefix=f"{settings.API_V1_PREFIX}/tasks", tags=["Tasks"])
+app.include_router(reminders.router, prefix=f"{settings.API_V1_PREFIX}/reminders", tags=["Reminders"])
 app.include_router(concierge.router, prefix=f"{settings.API_V1_PREFIX}/concierge", tags=["Concierge"])
 app.include_router(crm.router, prefix=f"{settings.API_V1_PREFIX}/crm", tags=["CRM"])
 app.include_router(entities.router, prefix=f"{settings.API_V1_PREFIX}/entities", tags=["Entities"])
 app.include_router(compliance.router, prefix=f"{settings.API_V1_PREFIX}/compliance", tags=["Compliance"])
+app.include_router(referrals.router, prefix=f"{settings.API_V1_PREFIX}/referrals", tags=["Referrals"])
+app.include_router(webhooks.router, prefix=f"{settings.API_V1_PREFIX}/webhooks", tags=["Webhooks"])
 
 
 # Helper function to check if origin is allowed
@@ -280,16 +360,42 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    return {
+    """Production health: status, version, DB/Redis checks, and metrics."""
+    from app.core.metrics import get_metrics
+    payload = {
         "status": "healthy",
-        "version": settings.APP_VERSION
+        "version": settings.APP_VERSION,
     }
+    # Optional: DB check
+    try:
+        from app.database import engine
+        from sqlalchemy import text
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        payload["database"] = "ok"
+    except Exception as e:
+        payload["database"] = "error"
+        payload["status"] = "degraded"
+    # Optional: Redis check
+    try:
+        import redis
+        r = redis.from_url(settings.REDIS_URL)
+        r.ping()
+        payload["redis"] = "ok"
+    except Exception:
+        payload["redis"] = "unavailable"
+    payload["metrics"] = get_metrics()
+    return payload
 
 
 @app.on_event("startup")
 async def startup_event():
     try:
         logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
+        
+        # Initialize Redis for WebSocket pub/sub
+        from app.core.websocket_manager import manager
+        await manager.connect_redis()
         
         # Check 2FA libraries availability
         try:
@@ -351,6 +457,7 @@ async def shutdown_event():
     try:
         from app.integrations.posthog_client import PosthogClient
         from app.core.scheduler import scheduler
+        from app.core.websocket_manager import manager
         
         try:
             scheduler.shutdown()
@@ -361,6 +468,11 @@ async def shutdown_event():
             PosthogClient.shutdown()
         except Exception as e:
             logger.error(f"Error shutting down PostHog: {e}")
+        
+        try:
+            await manager.disconnect_redis()
+        except Exception as e:
+            logger.error(f"Error disconnecting Redis: {e}")
         
         logger.info("Shutting down application")
     except Exception as e:
