@@ -34,7 +34,6 @@ class WebSocketMessage(BaseModel):
 
 # WebSocket endpoint (will be registered directly on app in main.py)
 async def websocket_chat_endpoint(
-async def websocket_chat_endpoint(
     websocket: WebSocket,
     token: str = Query(..., description="JWT access token")
 ):
@@ -67,6 +66,11 @@ async def websocket_chat_endpoint(
         try:
             # Authenticate user
             user = await get_user_from_token(token, db)
+        except Exception as e:
+            logger.warning(f"WebSocket auth failed: {e}")
+            await websocket.close(code=1008, reason="Invalid authentication token")
+            return
+
         if not user:
             await websocket.close(code=1008, reason="Invalid authentication token")
             return
