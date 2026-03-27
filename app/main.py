@@ -81,7 +81,8 @@ if getattr(settings, "RATE_LIMIT_ENABLED", True):
     from slowapi.errors import RateLimitExceeded
     from app.core.rate_limit import limiter
     app.state.limiter = limiter
-    limiter.init(app)
+    # slowapi integrates via app.state.limiter + exception handler.
+    # Some slowapi versions don't expose limiter.init(app).
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
