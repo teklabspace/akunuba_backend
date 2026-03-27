@@ -123,12 +123,6 @@ async def websocket_chat_endpoint(
                         message.data.get("message_id") if message.data else None,
                         db
                     )
-        
-        finally:
-            # Close database session
-            if db:
-                await db.close()
-                
                 else:
                     await manager.send_personal_message(websocket, {
                         "type": "error",
@@ -161,6 +155,10 @@ async def websocket_chat_endpoint(
             await websocket.close(code=1011, reason="Internal server error")
         except:
             pass
+    finally:
+        # Always close database session
+        if db:
+            await db.close()
 
 
 async def handle_join_conversation(
