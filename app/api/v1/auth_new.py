@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi.responses import RedirectResponse
 from fastapi.security import HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -27,6 +28,10 @@ from app.integrations.supabase_client import SupabaseClient
 from app.services.email_service import EmailService
 import httpx
 import secrets
+
+GOOGLE_AUTH_BASE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 
 router = APIRouter()
 security = HTTPBearer()
@@ -81,6 +86,155 @@ async def get_user_verification_status(user: User, db: AsyncSession) -> dict:
         "is_kyc_verified": is_kyc_verified,
         "is_email_verified": is_email_verified
     }
+
+
+def get_frontend_google_redirect_url() -> str:
+    if settings.APP_ENV == "development":
+        return "http://localhost:3000/auth/google/callback"
+    return "https://akunuba.io/auth/google/callback"
+
+
+@router.get("/google/login")
+async def google_login():
+    """
+    Start Google OAuth2 flow by redirecting to Google's authorization endpoint.
+    """
+    if not settings.GOOGLE_CLIENT_ID or not settings.GOOGLE_CLIENT_SECRET or not settings.GOOGLE_REDIRECT_URI:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google OAuth is not configured on the server",
+        )
+
+    params = {
+        "client_id": settings.GOOGLE_CLIENT_ID,
+        "redirect_uri": settings.GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+
+    url = httpx.URL(GOOGLE_AUTH_BASE_URL).copy_add_params(params)
+    return RedirectResponse(url)
+
+
+@router.get("/google/callback")
+async def google_callback(
+    code: str | None = None,
+    error: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Google OAuth2 callback handler.
+    Exchanges authorization code for tokens, fetches user info,
+    creates/logs in the user, then redirects to frontend with tokens.
+    """
+    if error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Google OAuth error: {error}")
+
+    if not code:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing authorization code from Google")
+
+    if not settings.GOOGLE_CLIENT_ID or not settings.GOOGLE_CLIENT_SECRET or not settings.GOOGLE_REDIRECT_URI:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google OAuth is not configured on the server",
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            token_resp = await client.post(
+                GOOGLE_TOKEN_URL,
+                data={
+                    "code": code,
+                    "client_id": settings.GOOGLE_CLIENT_ID,
+                    "client_secret": settings.GOOGLE_CLIENT_SECRET,
+                    "redirect_uri": settings.GOOGLE_REDIRECT_URI,
+                    "grant_type": "authorization_code",
+                },
+            )
+
+        if token_resp.status_code != 200:
+            logger.error(f"Google token exchange failed: {token_resp.status_code} {token_resp.text}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Failed to exchange authorization code with Google",
+            )
+
+        token_data = token_resp.json()
+        access_token = token_data.get("access_token")
+
+        if not access_token:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No access token returned from Google",
+            )
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            userinfo_resp = await client.get(
+                GOOGLE_USERINFO_URL,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+
+        if userinfo_resp.status_code != 200:
+            logger.error(f"Google userinfo fetch failed: {userinfo_resp.status_code} {userinfo_resp.text}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Failed to fetch user info from Google",
+            )
+
+        userinfo = userinfo_resp.json()
+        email = userinfo.get("email")
+        first_name = userinfo.get("given_name") or ""
+        last_name = userinfo.get("family_name") or ""
+
+        if not email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Google did not provide an email address",
+            )
+
+        result = await db.execute(select(User).where(User.email == email))
+        user = result.scalar_one_or_none()
+
+        if not user:
+            user = User(
+                email=email,
+                first_name=first_name,
+                last_name=last_name,
+                is_verified=True,
+                email_verified_at=datetime.utcnow(),
+                is_active=True,
+                hashed_password=get_password_hash(secrets.token_urlsafe(16)),
+            )
+            db.add(user)
+            await db.commit()
+            await db.refresh(user)
+
+        user.last_login = datetime.utcnow()
+        access_token_app = create_access_token(data={"sub": str(user.id)})
+        refresh_token_app = create_refresh_token(data={"sub": str(user.id)})
+        user.refresh_token = refresh_token_app
+        await db.commit()
+
+        frontend_redirect = get_frontend_google_redirect_url()
+        redirect_url = httpx.URL(frontend_redirect).copy_add_params(
+            {
+                "access_token": access_token_app,
+                "refresh_token": refresh_token_app,
+            }
+        )
+
+        return RedirectResponse(str(redirect_url))
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error handling Google OAuth callback: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to complete Google login",
+        )
 
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 @limiter.limit(LOGIN_RATE_LIMIT)
