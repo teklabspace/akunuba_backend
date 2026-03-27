@@ -28,6 +28,7 @@ from app.integrations.supabase_client import SupabaseClient
 from app.services.email_service import EmailService
 import httpx
 import secrets
+from urllib.parse import urlencode
 
 GOOGLE_AUTH_BASE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -114,7 +115,7 @@ async def google_login():
         "prompt": "consent",
     }
 
-    url = httpx.URL(GOOGLE_AUTH_BASE_URL).copy_add_params(params)
+    url = f"{GOOGLE_AUTH_BASE_URL}?{urlencode(params)}"
     return RedirectResponse(url)
 
 
@@ -218,14 +219,8 @@ async def google_callback(
         await db.commit()
 
         frontend_redirect = get_frontend_google_redirect_url()
-        redirect_url = httpx.URL(frontend_redirect).copy_add_params(
-            {
-                "access_token": access_token_app,
-                "refresh_token": refresh_token_app,
-            }
-        )
-
-        return RedirectResponse(str(redirect_url))
+        redirect_url = f"{frontend_redirect}?{urlencode({'access_token': access_token_app, 'refresh_token': refresh_token_app})}"
+        return RedirectResponse(redirect_url)
 
     except HTTPException:
         raise
