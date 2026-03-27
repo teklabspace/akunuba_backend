@@ -36,8 +36,12 @@ class AssetAllocationItem(BaseModel):
 class DailyReturnItem(BaseModel):
     date: str
     value: Decimal
-    return: Decimal
+    return_value: Decimal = Field(..., alias="return")
     return_percentage: Decimal
+
+    model_config = {
+        "populate_by_name": True,
+    }
 
 
 class PerformanceMetrics(BaseModel):
@@ -325,7 +329,7 @@ async def calculate_performance(
         daily_returns.append(DailyReturnItem(
             date=snapshot_date.date().isoformat(),
             value=snapshot_value,
-            return=day_return,
+            return_value=day_return,
             return_percentage=day_return_percentage
         ))
         
