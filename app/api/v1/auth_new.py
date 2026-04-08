@@ -156,10 +156,27 @@ async def google_callback(
             )
 
         if token_resp.status_code != 200:
-            logger.error(f"Google token exchange failed: {token_resp.status_code} {token_resp.text}")
+            google_error = None
+            google_error_description = None
+            try:
+                token_error_payload = token_resp.json()
+                google_error = token_error_payload.get("error")
+                google_error_description = token_error_payload.get("error_description")
+            except Exception:
+                token_error_payload = {"raw": token_resp.text}
+
+            logger.error(
+                "Google token exchange failed: "
+                f"status={token_resp.status_code}, "
+                f"error={google_error}, "
+                f"error_description={google_error_description}, "
+                f"payload={token_error_payload}"
+            )
+
+            error_hint = google_error or "token_exchange_failed"
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Failed to exchange authorization code with Google",
+                detail=f"Failed to exchange authorization code with Google ({error_hint})",
             )
 
         token_data = token_resp.json()
