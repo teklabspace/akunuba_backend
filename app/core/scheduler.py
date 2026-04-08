@@ -4,7 +4,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from app.utils.logger import logger
 from app.config import settings
-from app.core.scheduler_locks import with_lock
+from app.core.scheduler_locks import try_acquire_job_lock, release_job_lock
 from app.core.metrics import record_job_failure
 
 # Optional Redis jobstore so jobs persist across restarts and are shared across instances
@@ -28,12 +28,51 @@ except Exception as e:
 scheduler = AsyncIOScheduler(timezone="UTC", jobstores=_jobstores or {})
 
 
+async def _run_job_with_lock(job_id: str, job_coro):
+    """Run scheduled job only when distributed lock is acquired."""
+    if not await try_acquire_job_lock(job_id):
+        logger.info(f"Skipping job {job_id}: lock held by another instance")
+        return
+    try:
+        await job_coro()
+    finally:
+        release_job_lock(job_id)
+
+
+async def run_expire_offers_job():
+    await _run_job_with_lock("expire_offers", expire_offers)
+
+
+async def run_recalculate_portfolios_job():
+    await _run_job_with_lock("recalculate_portfolios", recalculate_portfolios)
+
+
+async def run_subscription_renewals_job():
+    await _run_job_with_lock("subscription_renewals", process_subscription_renewals)
+
+
+async def run_expire_listings_job():
+    await _run_job_with_lock("expire_listings", expire_listings)
+
+
+async def run_monitor_sla_job():
+    await _run_job_with_lock("monitor_sla", monitor_sla_breaches)
+
+
+async def run_banking_sync_all_job():
+    await _run_job_with_lock("banking_sync_all", banking_sync_all)
+
+
+async def run_subscription_retry_downgrade_job():
+    await _run_job_with_lock("subscription_retry_downgrade", process_subscription_retry_and_downgrade)
+
+
 def setup_scheduled_tasks():
     """Setup all scheduled background tasks. Jobs use Redis lock so only one instance runs each."""
     try:
         # Offer expiration - check every hour
         scheduler.add_job(
-            with_lock("expire_offers", expire_offers),
+            run_expire_offers_job,
             IntervalTrigger(hours=1),
             id='expire_offers',
             replace_existing=True,
@@ -42,7 +81,7 @@ def setup_scheduled_tasks():
         
         # Portfolio recalculation - daily at 2 AM UTC
         scheduler.add_job(
-            with_lock("recalculate_portfolios", recalculate_portfolios),
+            run_recalculate_portfolios_job,
             CronTrigger(hour=2, minute=0),
             id='recalculate_portfolios',
             replace_existing=True,
@@ -51,7 +90,7 @@ def setup_scheduled_tasks():
         
         # Subscription renewal check - daily at 3 AM UTC
         scheduler.add_job(
-            with_lock("subscription_renewals", process_subscription_renewals),
+            run_subscription_renewals_job,
             CronTrigger(hour=3, minute=0),
             id='subscription_renewals',
             replace_existing=True,
@@ -60,7 +99,7 @@ def setup_scheduled_tasks():
         
         # Listing expiration - daily at 4 AM UTC
         scheduler.add_job(
-            with_lock("expire_listings", expire_listings),
+            run_expire_listings_job,
             CronTrigger(hour=4, minute=0),
             id='expire_listings',
             replace_existing=True,
@@ -69,7 +108,7 @@ def setup_scheduled_tasks():
         
         # SLA monitoring - every 6 hours
         scheduler.add_job(
-            with_lock("monitor_sla", monitor_sla_breaches),
+            run_monitor_sla_job,
             IntervalTrigger(hours=6),
             id='monitor_sla',
             replace_existing=True,
@@ -78,7 +117,7 @@ def setup_scheduled_tasks():
         
         # Banking auto-sync: sync all linked accounts every 6 hours
         scheduler.add_job(
-            with_lock("banking_sync_all", banking_sync_all),
+            run_banking_sync_all_job,
             IntervalTrigger(hours=6),
             id='banking_sync_all',
             replace_existing=True,
@@ -87,7 +126,7 @@ def setup_scheduled_tasks():
         
         # Subscription payment retry sync & downgrade - daily at 4:30 AM UTC
         scheduler.add_job(
-            with_lock("subscription_retry_downgrade", process_subscription_retry_and_downgrade),
+            run_subscription_retry_downgrade_job,
             CronTrigger(hour=4, minute=30),
             id='subscription_retry_downgrade',
             replace_existing=True,
