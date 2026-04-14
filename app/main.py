@@ -402,9 +402,9 @@ async def startup_event():
         try:
             import pyotp
             import qrcode
-            logger.info("✅ 2FA libraries (pyotp, qrcode) are available")
+            logger.info("[OK] 2FA libraries (pyotp, qrcode) are available")
         except ImportError as e:
-            logger.warning(f"⚠️  2FA libraries not available: {e}")
+            logger.warning(f"[WARN] 2FA libraries not available: {e}")
             logger.warning("   Install with: pip install pyotp qrcode[pil]")
             logger.warning("   Or: python -m pip install pyotp qrcode[pil]")
         
@@ -422,16 +422,16 @@ async def startup_event():
                         conn.execute(text("SELECT 1")),
                         timeout=30.0  # 30 seconds timeout
                     )
-                logger.info("✅ Database connection verified successfully")
+                logger.info("[OK] Database connection verified successfully")
             except asyncio.TimeoutError:
-                logger.warning("⚠️ Database connection test timed out after 30 seconds")
+                logger.warning("[WARN] Database connection test timed out after 30 seconds")
                 logger.warning("   The connection might work for actual requests.")
                 logger.warning("   If login fails, check:")
                 logger.warning("   1. DATABASE_URL is correct (host, port, credentials)")
                 logger.warning("   2. Supabase network restrictions allow all IPs")
                 logger.warning("   3. Try Transaction Pooler (port 6543) instead of Session (5432)")
             except Exception as e:
-                logger.warning(f"⚠️ Database connection test failed: {type(e).__name__}: {e}")
+                logger.warning(f"[WARN] Database connection test failed: {type(e).__name__}: {e}")
                 logger.warning("   The connection might still work for actual requests.")
         
         # Run test in background (don't await - non-blocking)

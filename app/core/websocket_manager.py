@@ -48,18 +48,29 @@ class ConnectionManager:
     async def connect_redis(self):
         """Initialize Redis connection and pub/sub"""
         try:
-            self.redis_client = await redis.from_url(
-                settings.REDIS_URL,
-                encoding="utf-8",
-                decode_responses=True
-            )
+            # Never block app startup on Redis connectivity (common local-dev pain).
+            async def _connect():
+                client = redis.from_url(
+                    settings.REDIS_URL,
+                    encoding="utf-8",
+                    decode_responses=True,
+                )
+                await client.ping()
+                return client
+
+            self.redis_client = await asyncio.wait_for(_connect(), timeout=5.0)
             self.redis_pubsub = self.redis_client.pubsub()
-            logger.info("✅ Redis connected for WebSocket pub/sub")
+            logger.info("[OK] Redis connected for WebSocket pub/sub")
             
             # Start listening to Redis messages
             self._redis_task = asyncio.create_task(self._listen_redis())
+        except asyncio.TimeoutError:
+            logger.warning("[WARN] Redis connection timed out during startup; continuing without Redis pub/sub")
+            logger.warning("   WebSocket will work in single-instance mode only")
+            self.redis_client = None
+            self.redis_pubsub = None
         except Exception as e:
-            logger.warning(f"⚠️ Redis connection failed: {e}")
+            logger.warning(f"[WARN] Redis connection failed: {e}")
             logger.warning("   WebSocket will work in single-instance mode only")
             self.redis_client = None
             self.redis_pubsub = None
