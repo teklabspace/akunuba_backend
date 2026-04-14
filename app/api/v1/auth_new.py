@@ -28,7 +28,8 @@ from app.integrations.supabase_client import SupabaseClient
 from app.services.email_service import EmailService
 import httpx
 import secrets
-from urllib.parse import urlencode
+import base64
+from urllib.parse import urlencode, urlparse
 
 GOOGLE_AUTH_BASE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -95,16 +96,121 @@ def get_frontend_google_redirect_url() -> str:
     return "https://akunuba.io/auth/google/callback"
 
 
+def _normalize_origin(origin: str) -> str:
+    return origin.rstrip("/")
+
+
+def _allowed_oauth_return_origins() -> set[str]:
+    """
+    Allowlist for where we may redirect after Google OAuth completes.
+
+    Primary source: CORS_ORIGINS (already maintained for browser origins).
+    Also include common local dev origins even if CORS_ORIGINS is production-only.
+    """
+    origins: set[str] = set()
+    for o in getattr(settings, "CORS_ORIGINS", []) or []:
+        if o:
+            origins.add(_normalize_origin(str(o)))
+
+    # Common local dev ports (explicit, safe defaults)
+    origins.update(
+        {
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:3001",
+            "http://127.0.0.1:3001",
+        }
+    )
+
+    # Production defaults (even if CORS_ORIGINS string parsing differs)
+    origins.update(
+        {
+            "https://akunuba.io",
+            "https://www.akunuba.io",
+            "https://akunuba.vercel.app",
+        }
+    )
+
+    return origins
+
+
+def _validate_frontend_callback_url(url: str) -> str:
+    """
+    Validate a full callback URL like https://example.com/auth/google/callback
+    to prevent open redirects.
+    """
+    if not url:
+        raise BadRequestException("return_to is required")
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise BadRequestException("return_to must be http(s)")
+
+    if not parsed.netloc:
+        raise BadRequestException("return_to must include a host")
+
+    # Require exact callback path (frontend route)
+    if not parsed.path.endswith("/auth/google/callback"):
+        raise BadRequestException("return_to must end with /auth/google/callback")
+
+    origin = _normalize_origin(f"{parsed.scheme}://{parsed.netloc}")
+    if origin not in _allowed_oauth_return_origins():
+        raise BadRequestException("return_to origin is not allowed")
+
+    # Disallow weird embedded credentials in netloc
+    if "@" in parsed.netloc:
+        raise BadRequestException("return_to is invalid")
+
+    return url
+
+
+def _encode_oauth_state(return_to: str) -> str:
+    raw = return_to.encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_oauth_state(state: str) -> str:
+    if not state:
+        raise BadRequestException("Missing OAuth state")
+    padded = state + "=" * ((4 - len(state) % 4) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    except Exception:
+        raise BadRequestException("Invalid OAuth state")
+    return _validate_frontend_callback_url(decoded)
+
+
 @router.get("/google/login")
-async def google_login():
+async def google_login(return_to: str | None = None, state: str | None = None):
     """
     Start Google OAuth2 flow by redirecting to Google's authorization endpoint.
+
+    Optional:
+    - return_to: full URL to your frontend callback route, e.g.
+      http://localhost:3000/auth/google/callback
+      This is passed through Google OAuth using the `state` parameter and echoed back
+      to `/google/callback`, then used for the final redirect with tokens.
+
+    Advanced:
+    - state: if you already encode return_to yourself, you can pass state directly
+      (must be base64url of the full return_to URL).
     """
     if not settings.GOOGLE_CLIENT_ID or not settings.GOOGLE_CLIENT_SECRET or not settings.GOOGLE_REDIRECT_URI:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Google OAuth is not configured on the server",
         )
+
+    oauth_state: str | None = None
+    if return_to:
+        validated = _validate_frontend_callback_url(return_to)
+        oauth_state = _encode_oauth_state(validated)
+    elif state:
+        # Validate by decoding (also supports clients pre-encoding state)
+        validated = _decode_oauth_state(state)
+        oauth_state = _encode_oauth_state(validated)
 
     params = {
         "client_id": settings.GOOGLE_CLIENT_ID,
@@ -114,6 +220,8 @@ async def google_login():
         "access_type": "offline",
         "prompt": "consent",
     }
+    if oauth_state:
+        params["state"] = oauth_state
 
     url = f"{GOOGLE_AUTH_BASE_URL}?{urlencode(params)}"
     return RedirectResponse(url)
@@ -123,6 +231,7 @@ async def google_login():
 async def google_callback(
     code: str | None = None,
     error: str | None = None,
+    state: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -235,7 +344,10 @@ async def google_callback(
         user.refresh_token = refresh_token_app
         await db.commit()
 
-        frontend_redirect = get_frontend_google_redirect_url()
+        if state:
+            frontend_redirect = _decode_oauth_state(state)
+        else:
+            frontend_redirect = get_frontend_google_redirect_url()
         redirect_url = f"{frontend_redirect}?{urlencode({'access_token': access_token_app, 'refresh_token': refresh_token_app})}"
         return RedirectResponse(redirect_url)
 
