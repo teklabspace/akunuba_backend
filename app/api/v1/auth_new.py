@@ -3,6 +3,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.security import HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from pydantic import BaseModel
 from app.database import get_db
 from app.models.user import User
@@ -91,9 +92,27 @@ async def get_user_verification_status(user: User, db: AsyncSession) -> dict:
 
 
 def get_frontend_google_redirect_url() -> str:
+    """
+    Default post-OAuth redirect target (when `state`/`return_to` is not used).
+
+    Configure via FRONTEND_BASE_URL (Render env), e.g.:
+    - https://akunuba.vercel.app
+    - https://akunuba.io
+    """
     if settings.APP_ENV == "development":
         return "http://localhost:3000/auth/google/callback"
-    return "https://akunuba.io/auth/google/callback"
+
+    base = (getattr(settings, "FRONTEND_BASE_URL", "") or "").strip()
+    if not base:
+        base = "https://akunuba.io"
+
+    parsed = urlparse(base)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        # Fail safe to a known-good production domain
+        base = "https://akunuba.io"
+
+    base = _normalize_origin(base)
+    return f"{base}/auth/google/callback"
 
 
 def _normalize_origin(origin: str) -> str:
@@ -132,6 +151,13 @@ def _allowed_oauth_return_origins() -> set[str]:
             "https://akunuba.vercel.app",
         }
     )
+
+    # Also allow whatever FRONTEND_BASE_URL is configured to (normalized origin)
+    fb = (getattr(settings, "FRONTEND_BASE_URL", "") or "").strip()
+    if fb:
+        p = urlparse(fb)
+        if p.scheme in ("http", "https") and p.netloc:
+            origins.add(_normalize_origin(f"{p.scheme}://{p.netloc}"))
 
     return origins
 
@@ -312,37 +338,40 @@ async def google_callback(
 
         userinfo = userinfo_resp.json()
         email = userinfo.get("email")
-        first_name = userinfo.get("given_name") or ""
-        last_name = userinfo.get("family_name") or ""
-
         if not email:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Google did not provide an email address",
             )
 
-        result = await db.execute(select(User).where(User.email == email))
-        user = result.scalar_one_or_none()
+        try:
+            result = await db.execute(select(User).where(User.email == email))
+            user = result.scalar_one_or_none()
+        except SQLAlchemyError as e:
+            logger.error(f"Database error while fetching user for Google OAuth callback ({email}): {e}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Database connection error. Please try again later.",
+            )
 
         if not user:
-            user = User(
-                email=email,
-                first_name=first_name,
-                last_name=last_name,
-                is_verified=True,
-                email_verified_at=datetime.utcnow(),
-                is_active=True,
-                hashed_password=get_password_hash(secrets.token_urlsafe(16)),
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="User not registered. Please sign up first.",
             )
-            db.add(user)
-            await db.commit()
-            await db.refresh(user)
 
         user.last_login = datetime.utcnow()
         access_token_app = create_access_token(data={"sub": str(user.id)})
         refresh_token_app = create_refresh_token(data={"sub": str(user.id)})
         user.refresh_token = refresh_token_app
-        await db.commit()
+        try:
+            await db.commit()
+        except SQLAlchemyError as e:
+            logger.error(f"Database error while updating login tokens for user {user.id}: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Database connection error. Please try again later.",
+            )
 
         if state:
             frontend_redirect = _decode_oauth_state(state)

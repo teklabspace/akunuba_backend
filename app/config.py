@@ -95,6 +95,10 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_ID: str = ""
     GOOGLE_CLIENT_SECRET: str = ""
     GOOGLE_REDIRECT_URI: str = "http://localhost:3000/auth/google/callback"
+
+    # Where the backend should redirect the browser after Google OAuth completes.
+    # Must match a real deployed frontend route: {FRONTEND_BASE_URL}/auth/google/callback
+    FRONTEND_BASE_URL: str = "https://akunuba.io"
     
     MAX_UPLOAD_SIZE: int = 10485760
     ALLOWED_FILE_TYPES: List[str] = ["pdf", "doc", "docx", "jpg", "jpeg", "png"]
