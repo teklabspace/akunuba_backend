@@ -5,6 +5,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from pydantic import BaseModel
+
+# asyncpg errors (e.g. InternalServerError) are not subclasses of SQLAlchemyError
+_DB_SESSION_ERRORS: tuple[type[BaseException], ...] = (SQLAlchemyError,)
+try:
+    from asyncpg.exceptions import PostgresError as _AsyncpgPostgresError
+
+    _DB_SESSION_ERRORS = (SQLAlchemyError, _AsyncpgPostgresError)
+except ImportError:
+    pass
 from app.database import get_db
 from app.models.user import User
 from app.models.account import Account
@@ -309,9 +318,16 @@ async def google_callback(
             )
 
             error_hint = google_error or "token_exchange_failed"
+            if google_error == "invalid_grant":
+                detail = (
+                    "Google authorization code expired or was already used. "
+                    "Start the Google sign-in flow again from your app (do not refresh this page)."
+                )
+            else:
+                detail = f"Failed to exchange authorization code with Google ({error_hint})"
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Failed to exchange authorization code with Google ({error_hint})",
+                detail=detail,
             )
 
         token_data = token_resp.json()
@@ -347,7 +363,7 @@ async def google_callback(
         try:
             result = await db.execute(select(User).where(User.email == email))
             user = result.scalar_one_or_none()
-        except SQLAlchemyError as e:
+        except _DB_SESSION_ERRORS as e:
             logger.error(f"Database error while fetching user for Google OAuth callback ({email}): {e}", exc_info=True)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -366,7 +382,7 @@ async def google_callback(
         user.refresh_token = refresh_token_app
         try:
             await db.commit()
-        except SQLAlchemyError as e:
+        except _DB_SESSION_ERRORS as e:
             logger.error(f"Database error while updating login tokens for user {user.id}: {e}", exc_info=True)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -382,6 +398,12 @@ async def google_callback(
 
     except HTTPException:
         raise
+    except _DB_SESSION_ERRORS as e:
+        logger.error(f"Database error during Google OAuth callback: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection error. Please try again later.",
+        )
     except Exception as e:
         logger.error(f"Error handling Google OAuth callback: {e}", exc_info=True)
         raise HTTPException(
