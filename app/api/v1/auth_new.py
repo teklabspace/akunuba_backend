@@ -124,6 +124,29 @@ def get_frontend_google_redirect_url() -> str:
     return f"{base}/auth/google/callback"
 
 
+def get_frontend_signup_url() -> str:
+    """Signup page used when Google returns a user who has no account yet."""
+    if settings.APP_ENV == "development":
+        return "http://localhost:3000/signup"
+
+    base = (getattr(settings, "FRONTEND_BASE_URL", "") or "").strip()
+    if not base:
+        base = "https://akunuba.io"
+
+    parsed = urlparse(base)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        base = "https://akunuba.io"
+
+    base = _normalize_origin(base)
+    return f"{base}/signup"
+
+
+# Values for `oauth_next` query param — lets the SPA route immediately (no /auth/refresh wait).
+OAUTH_NEXT_DASHBOARD = "dashboard"
+OAUTH_NEXT_PERSONA_WAIT = "persona_wait"
+OAUTH_NEXT_VERIFY_EMAIL = "verify_email"
+
+
 def _normalize_origin(origin: str) -> str:
     return origin.rstrip("/")
 
@@ -354,6 +377,8 @@ async def google_callback(
 
         userinfo = userinfo_resp.json()
         email = userinfo.get("email")
+        google_first = userinfo.get("given_name") or ""
+        google_last = userinfo.get("family_name") or ""
         if not email:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -371,10 +396,16 @@ async def google_callback(
             )
 
         if not user:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="User not registered. Please sign up first.",
+            signup_url = get_frontend_signup_url()
+            signup_qs = urlencode(
+                {
+                    "email": email,
+                    "first_name": google_first,
+                    "last_name": google_last,
+                    "oauth": "google",
+                }
             )
+            return RedirectResponse(f"{signup_url}?{signup_qs}")
 
         user.last_login = datetime.utcnow()
         access_token_app = create_access_token(data={"sub": str(user.id)})
@@ -393,7 +424,19 @@ async def google_callback(
             frontend_redirect = _decode_oauth_state(state)
         else:
             frontend_redirect = get_frontend_google_redirect_url()
-        redirect_url = f"{frontend_redirect}?{urlencode({'access_token': access_token_app, 'refresh_token': refresh_token_app})}"
+
+        verification_status = await get_user_verification_status(user, db)
+        if verification_status["is_kyc_verified"]:
+            oauth_next = OAUTH_NEXT_DASHBOARD
+        elif verification_status["is_email_verified"]:
+            oauth_next = OAUTH_NEXT_PERSONA_WAIT
+        else:
+            oauth_next = OAUTH_NEXT_VERIFY_EMAIL
+
+        redirect_url = (
+            f"{frontend_redirect}?"
+            f"{urlencode({'access_token': access_token_app, 'refresh_token': refresh_token_app, 'oauth_next': oauth_next})}"
+        )
         return RedirectResponse(redirect_url)
 
     except HTTPException:
