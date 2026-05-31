@@ -9,10 +9,10 @@ from app.models.user import User
 from app.models.account import Account, AccountType
 from app.models.kyc import KYCVerification, KYCStatus
 from app.integrations.persona_client import PersonaClient
+from app.config import settings
 from app.core.exceptions import NotFoundException, BadRequestException, UnauthorizedException
 from app.core.permissions import Role, Permission, has_permission
 from app.utils.logger import logger
-from app.utils.helpers import generate_reference_id
 from uuid import UUID
 from pydantic import BaseModel
 from datetime import datetime
@@ -77,68 +77,62 @@ async def start_kyc(
     if kyc and kyc.status == KYCStatus.APPROVED:
         raise BadRequestException("KYC already approved")
     
-    # Create Persona inquiry (optional in development)
+    # Create Persona inquiry (API) or fall back to template-based Hosted Flow
     from app.config import settings
-    reference_id = generate_reference_id(f"KYC-{account.id}")
+    reference_id = PersonaClient.kyc_reference_id(str(account.id))
     inquiry_id = None
     persona_response = None
-    
+    verification_url = None
+
     try:
-        persona_response = PersonaClient.create_inquiry(
+        result = PersonaClient.start_verification(
             account_id=str(account.id),
-            reference_id=reference_id
+            reference_id=reference_id,
         )
-        inquiry_id = persona_response.get("data", {}).get("id")
-        if not inquiry_id:
+        inquiry_id = result["inquiry_id"]
+        persona_response = result["persona_response"]
+        verification_url = result["verification_url"]
+
+        if not inquiry_id and result["flow_mode"] == "api":
             logger.error(f"Persona inquiry created but no inquiry ID returned: {persona_response}")
             if settings.APP_ENV != "development":
                 raise BadRequestException("Failed to start KYC verification: No inquiry ID returned")
-            else:
-                logger.warning("Persona inquiry ID missing, continuing without Persona in development mode")
+            logger.warning("Persona inquiry ID missing, continuing without Persona in development mode")
     except ValueError as e:
-        # Template ID validation error
         logger.warning(f"Persona configuration error: {e}")
-        if settings.APP_ENV != "development":
+        if settings.APP_ENV != "development" and not settings.PERSONA_TEMPLATE_ID:
             raise BadRequestException(str(e))
-        else:
-            logger.warning("Persona template not configured, continuing without Persona in development mode")
+        logger.warning("Persona template not configured, continuing without Persona in development mode")
     except httpx.HTTPStatusError as e:
-        # Persona API error - extract the actual error message
-        error_msg = str(e)
-        try:
-            if hasattr(e, 'response') and e.response is not None:
-                error_body = e.response.text
-                try:
-                    error_json = e.response.json()
-                    # Try to extract meaningful error message from Persona response
-                    if isinstance(error_json, dict):
-                        errors = error_json.get("errors", [])
-                        if errors:
-                            error_details = "; ".join([err.get("detail", str(err)) for err in errors])
-                            error_msg = f"Persona API error: {error_details}"
-                        elif "detail" in error_json:
-                            error_msg = f"Persona API error: {error_json['detail']}"
-                except:
-                    if error_body:
-                        error_msg = f"Persona API error: {error_body[:500]}"  # Limit length
-        except:
-            pass
-        if settings.APP_ENV != "development":
-            logger.error(f"Failed to create Persona inquiry: {error_msg}", exc_info=True)
+        error_msg = PersonaClient.parse_http_error(e)
+        logger.warning(f"Persona API create failed: {error_msg}")
+        if settings.APP_ENV != "development" and not settings.PERSONA_TEMPLATE_ID:
             raise BadRequestException(f"Failed to start KYC verification: {error_msg}")
-        else:
-            logger.warning(f"Failed to create Persona inquiry, continuing without Persona in development mode: {error_msg}")
     except BadRequestException:
-        if settings.APP_ENV != "development":
+        if settings.APP_ENV != "development" and not settings.PERSONA_TEMPLATE_ID:
             raise
-        else:
-            logger.warning("Persona BadRequestException, continuing without Persona in development mode")
+        logger.warning("Persona BadRequestException, continuing without Persona in development mode")
     except Exception as e:
-        if settings.APP_ENV != "development":
-            logger.error(f"Failed to create Persona inquiry: {e}", exc_info=True)
+        logger.warning(f"Persona API create failed: {e}")
+        if settings.APP_ENV != "development" and not settings.PERSONA_TEMPLATE_ID:
             raise BadRequestException(f"Failed to start KYC verification: {str(e)}")
-        else:
-            logger.warning(f"Failed to create Persona inquiry, continuing without Persona in development mode: {e}")
+
+    # Last-resort fallback: hosted template flow (no server-side create permission needed)
+    if not verification_url and settings.PERSONA_TEMPLATE_ID:
+        redirect_uri = PersonaClient.get_redirect_uri()
+        verification_url = PersonaClient.get_hosted_flow_url(reference_id, redirect_uri)
+        persona_response = persona_response or {
+            "flow_mode": "hosted_template",
+            "reference_id": reference_id,
+            "verification_url": verification_url,
+        }
+        logger.info(f"Using Persona hosted template flow for account {account.id}")
+
+    if not verification_url:
+        raise BadRequestException(
+            "Failed to start KYC verification: Persona is not configured correctly"
+        )
+        logger.warning(f"Failed to create Persona inquiry, continuing without Persona in development mode: {e}")
     
     # Create or update KYC verification
     if kyc:
@@ -163,25 +157,14 @@ async def start_kyc(
     await db.refresh(kyc)
     
     # Get verification URL for Persona hosted flow
-    verification_url = None
-    if inquiry_id:
-        # Get redirect URI from settings or construct from CORS origins
-        from app.config import settings
-        if settings.PERSONA_REDIRECT_URI:
-            redirect_uri = settings.PERSONA_REDIRECT_URI
-        else:
-            # Fallback to first CORS origin + default path
-            base_url = settings.CORS_ORIGINS[0] if isinstance(settings.CORS_ORIGINS, list) and settings.CORS_ORIGINS else 'http://localhost:3000'
-            redirect_uri = f"{base_url}/kyc/verification-complete"
-        
-        # Try to extract from response, otherwise construct it
+    if not verification_url and inquiry_id:
+        redirect_uri = PersonaClient.get_redirect_uri()
         if persona_response:
             verification_url = PersonaClient.extract_verification_url_from_response(
                 persona_response,
                 redirect_uri=redirect_uri
             )
         else:
-            # Construct verification URL directly if we have inquiry_id
             verification_url = PersonaClient.get_verification_url(inquiry_id, redirect_uri)
     
     logger.info(f"KYC started for account {account.id}, verification URL: {verification_url}")
@@ -355,6 +338,19 @@ async def get_kyc_status(
                     verification_url = PersonaClient.get_verification_url(kyc.persona_inquiry_id, redirect_uri)
         except Exception as e:
             logger.error(f"[KYC STATUS SYNC] Failed to sync Persona status: {e}", exc_info=True)
+
+    if (
+        not verification_url
+        and kyc.status == KYCStatus.IN_PROGRESS
+        and settings.PERSONA_TEMPLATE_ID
+    ):
+        if isinstance(kyc.persona_response, dict):
+            verification_url = kyc.persona_response.get("verification_url")
+        if not verification_url:
+            verification_url = PersonaClient.get_hosted_flow_url(
+                PersonaClient.kyc_reference_id(str(account.id)),
+                PersonaClient.get_redirect_uri(),
+            )
     
     return {
         "id": kyc.id,
@@ -619,6 +615,22 @@ async def persona_webhook(
         kyc = kyc_result.scalar_one_or_none()
         
         if not kyc:
+            attributes = payload.get("data", {}).get("attributes", {})
+            ref_id = attributes.get("reference-id") or attributes.get("reference_id")
+            if ref_id and str(ref_id).startswith("KYC-"):
+                try:
+                    account_uuid = UUID(str(ref_id)[4:])
+                    kyc_result = await db.execute(
+                        select(KYCVerification).where(KYCVerification.account_id == account_uuid)
+                    )
+                    kyc = kyc_result.scalar_one_or_none()
+                    if kyc:
+                        kyc.persona_inquiry_id = inquiry_id
+                        logger.info(f"Linked inquiry {inquiry_id} to KYC via reference-id {ref_id}")
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Could not parse reference-id {ref_id}: {e}")
+
+        if not kyc:
             logger.warning(f"KYC not found for inquiry {inquiry_id}")
             # Log all existing inquiry IDs for debugging
             all_kyc_result = await db.execute(
@@ -750,28 +762,35 @@ async def resubmit_kyc(
     if kyc.status != KYCStatus.REJECTED:
         raise BadRequestException("Can only resubmit rejected KYC")
     
-    # Create new inquiry
-    reference_id = generate_reference_id(f"KYC-{account.id}")
+    # Create new inquiry (API) or fall back to hosted template flow
+    reference_id = PersonaClient.kyc_reference_id(str(account.id))
     try:
-        persona_response = PersonaClient.create_inquiry(
+        result = PersonaClient.start_verification(
             account_id=str(account.id),
-            reference_id=reference_id
+            reference_id=reference_id,
         )
-        inquiry_id = persona_response.get("data", {}).get("id")
-        
+        inquiry_id = result["inquiry_id"]
+
         kyc.persona_inquiry_id = inquiry_id
         kyc.status = KYCStatus.IN_PROGRESS
         kyc.rejection_reason = None
-        kyc.persona_response = persona_response
-        
+        kyc.persona_response = result["persona_response"]
+
         # Set user as NOT verified when resubmitting (KYC is in progress again)
         account.user.is_verified = False
-        
+
         await db.commit()
         await db.refresh(kyc)
-        
-        logger.info(f"KYC resubmitted for account {account.id}")
-        return kyc
+
+        logger.info(f"KYC resubmitted for account {account.id} (flow={result['flow_mode']})")
+        return {
+            "id": kyc.id,
+            "status": kyc.status.value if hasattr(kyc.status, 'value') else str(kyc.status),
+            "persona_inquiry_id": kyc.persona_inquiry_id,
+            "verification_url": result["verification_url"],
+            "verification_level": kyc.verification_level,
+            "verified_at": kyc.verified_at,
+        }
     except Exception as e:
         logger.error(f"Failed to resubmit KYC: {e}")
         raise BadRequestException("Failed to resubmit KYC verification")

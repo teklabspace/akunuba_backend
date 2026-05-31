@@ -50,13 +50,13 @@ services:
       - key: ACCESS_TOKEN_EXPIRE_MINUTES
         value: 1440
 
-      # Email Service (SendGrid)
-      - key: SENDGRID_API_KEY
+      # Email Service (Resend)
+      - key: RESEND_API_KEY
         sync: false # Set this manually in Render dashboard
       - key: EMAIL_FROM_ADDRESS
-        value: noreply@fullego.com
+        value: noreply@yourdomain.com
       - key: EMAIL_FROM_NAME
-        value: Fullego
+        value: Akunuba
       - key: EMAIL_ENABLED
         value: true
 
@@ -85,6 +85,8 @@ services:
         sync: false # Set this manually in Render dashboard
       - key: PERSONA_FILE_ACCESS_TOKEN_EXPIRY
         value: 21600
+      - key: PERSONA_REDIRECT_URI
+        sync: false # e.g. https://akunuba.io/kyc/complete
 
       # Sendbird
       - key: SENDBIRD_APP_ID

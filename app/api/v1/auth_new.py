@@ -659,9 +659,13 @@ async def request_otp(request: OTPRequest, db: AsyncSession = Depends(get_db)):
     user.otp_expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
     await db.commit()
     user_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "User"
-    await EmailService.send_otp_email(to_email=user.email, to_name=user_name, otp_code=otp_code)
+    email_sent = await EmailService.send_otp_email(to_email=user.email, to_name=user_name, otp_code=otp_code)
     if settings.APP_ENV == "development":
         return {"message": "OTP sent to your email", "otp": otp_code}
+    if not email_sent:
+        raise BadRequestException(
+            "Unable to send verification email. The email service may not be configured for this recipient."
+        )
     return {"message": "OTP sent to your email"}
 
 @router.post("/verify-otp")

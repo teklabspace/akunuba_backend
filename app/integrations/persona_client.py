@@ -1,11 +1,12 @@
 import httpx
+from urllib.parse import urlencode
 from app.config import settings
 from app.utils.logger import logger
 from typing import Optional, Dict, Any
 
 
 class PersonaClient:
-    BASE_URL = "https://withpersona.com/api/v1"
+    BASE_URL = "https://api.withpersona.com/api/v1"
     API_VERSION = "2024-01-01"  # Persona API version (YYYY-MM-DD format)
 
     @staticmethod
@@ -184,6 +185,104 @@ class PersonaClient:
         except Exception as e:
             logger.error(f"Failed to redact Persona inquiry: {e}")
             return None
+
+    @staticmethod
+    def kyc_reference_id(account_id: str) -> str:
+        """Stable reference ID for linking Persona inquiries to an account."""
+        return f"KYC-{account_id}"
+
+    @staticmethod
+    def get_redirect_uri() -> Optional[str]:
+        if settings.PERSONA_REDIRECT_URI:
+            return settings.PERSONA_REDIRECT_URI
+        cors = settings.CORS_ORIGINS
+        if isinstance(cors, list) and cors:
+            return f"{cors[0].rstrip('/')}/kyc/verification-complete"
+        return None
+
+    @staticmethod
+    def parse_http_error(error: httpx.HTTPStatusError) -> str:
+        try:
+            if error.response is not None:
+                error_json = error.response.json()
+                if isinstance(error_json, dict):
+                    errors = error_json.get("errors", [])
+                    if errors:
+                        parts = []
+                        for err in errors:
+                            detail = err.get("details") or err.get("detail") or str(err)
+                            parts.append(str(detail))
+                        return f"Persona API error: {'; '.join(parts)}"
+                    if "detail" in error_json:
+                        return f"Persona API error: {error_json['detail']}"
+                return f"Persona API error: {error.response.text[:500]}"
+        except Exception:
+            pass
+        return str(error)
+
+    @staticmethod
+    def is_inquiry_create_disabled(error: httpx.HTTPStatusError) -> bool:
+        if error.response is None:
+            return False
+        if error.response.status_code == 403:
+            return True
+        return "inquiries.create" in error.response.text.lower()
+
+    @staticmethod
+    def get_hosted_flow_url(reference_id: str, redirect_uri: Optional[str] = None) -> str:
+        """
+        Build a Persona Hosted Flow URL that creates an inquiry client-side.
+        Does not require inquiries.create.api permission on the server API key.
+        """
+        params = {
+            "inquiry-template-id": settings.PERSONA_TEMPLATE_ID,
+            "reference-id": reference_id,
+        }
+        if redirect_uri:
+            params["redirect-uri"] = redirect_uri
+        return f"https://inquiry.withpersona.com/verify?{urlencode(params)}"
+
+    @staticmethod
+    def start_verification(
+        account_id: str,
+        reference_id: str,
+        redirect_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Start KYC verification via API when permitted, otherwise fall back to
+        Persona's template-based Hosted Flow (no server-side create permission needed).
+        """
+        redirect_uri = redirect_uri or PersonaClient.get_redirect_uri()
+
+        try:
+            persona_response = PersonaClient.create_inquiry(account_id, reference_id)
+            inquiry_id = persona_response.get("data", {}).get("id")
+            verification_url = PersonaClient.extract_verification_url_from_response(
+                persona_response, redirect_uri
+            )
+            return {
+                "inquiry_id": inquiry_id,
+                "persona_response": persona_response,
+                "verification_url": verification_url,
+                "flow_mode": "api",
+            }
+        except httpx.HTTPStatusError as e:
+            if PersonaClient.is_inquiry_create_disabled(e):
+                logger.warning(
+                    "Persona inquiries.create.api not enabled; using hosted template flow"
+                )
+                verification_url = PersonaClient.get_hosted_flow_url(reference_id, redirect_uri)
+                return {
+                    "inquiry_id": None,
+                    "persona_response": {
+                        "flow_mode": "hosted_template",
+                        "reference_id": reference_id,
+                        "verification_url": verification_url,
+                    },
+                    "verification_url": verification_url,
+                    "flow_mode": "hosted_template",
+                }
+            raise
 
     @staticmethod
     def get_verification_url(inquiry_id: str, redirect_uri: Optional[str] = None) -> str:
