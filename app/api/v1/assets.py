@@ -31,6 +31,11 @@ from app.core.features import get_limit, check_usage_limit
 from app.utils.logger import logger
 from app.integrations.supabase_client import SupabaseClient
 from app.config import settings
+from app.utils.upload_helpers import (
+    resolve_content_type,
+    storage_bucket_for_file_type,
+    validate_image_content_type,
+)
 from uuid import UUID
 from pydantic import BaseModel
 import secrets
@@ -1628,9 +1633,11 @@ async def upload_asset_photo(
     if not asset:
         raise NotFoundException("Asset", str(asset_id))
     
-    # Validate file type
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise BadRequestException("File must be an image")
+    # Validate and resolve image content type (JPG, PNG, GIF, WEBP only)
+    try:
+        content_type = validate_image_content_type(file.filename or "upload", file.content_type)
+    except ValueError as e:
+        raise BadRequestException(str(e))
     
     # Read file
     file_data = await file.read()
@@ -1646,12 +1653,12 @@ async def upload_asset_photo(
             bucket="images",
             file_path=file_path,
             file_data=file_data,
-            content_type=file.content_type
+            content_type=content_type,
         )
         url = SupabaseClient.get_file_url("images", file_path)
     except Exception as e:
         logger.error(f"Failed to upload photo: {e}")
-        raise BadRequestException("Failed to upload photo")
+        raise BadRequestException(f"Failed to upload photo: {e}")
     
     # Create photo record
     photo = AssetPhoto(
@@ -2682,22 +2689,41 @@ async def upload_file_assets(
     if file_size > settings.MAX_UPLOAD_SIZE:
         raise BadRequestException(f"File size exceeds maximum allowed size")
     
-    # Upload to Supabase
+    import uuid
+
+    file_extension = file.filename.split(".")[-1] if "." in file.filename else ""
+    base_name = file.filename.rsplit(".", 1)[0] if "." in file.filename else file.filename
+    base_name = "".join(c for c in base_name if c.isalnum() or c in (" ", "-", "_")).strip()
+    base_name = base_name.replace(" ", "_")[:50]
+    unique_id = str(uuid.uuid4())[:8]
+    unique_filename = (
+        f"{base_name}_{unique_id}.{file_extension}" if file_extension else f"{base_name}_{unique_id}"
+    )
+
+    bucket_name = storage_bucket_for_file_type(file_type)
     folder = "assets" if asset_id else "general"
-    file_path = f"{folder}/{account.id}/{file.filename}"
-    
+    file_path = f"{folder}/{account.id}/{unique_filename}"
+
+    try:
+        if file_type == "photo":
+            content_type = validate_image_content_type(file.filename or unique_filename, file.content_type)
+        else:
+            content_type = resolve_content_type(file.filename or unique_filename, file.content_type)
+    except ValueError as e:
+        raise BadRequestException(str(e))
+
     try:
         SupabaseClient.upload_file(
-            bucket="documents",
+            bucket=bucket_name,
             file_path=file_path,
             file_data=file_data,
-            content_type=file.content_type or "application/octet-stream"
+            content_type=content_type,
         )
-        url = SupabaseClient.get_file_url("documents", file_path)
+        url = SupabaseClient.get_file_url(bucket_name, file_path)
         thumbnail_url = url if file_type == "photo" else None
     except Exception as e:
         logger.error(f"Failed to upload file: {e}")
-        raise BadRequestException("Failed to upload file")
+        raise BadRequestException(f"Failed to upload file: {e}")
     
     # If asset_id provided, create asset photo/document record
     file_id = None

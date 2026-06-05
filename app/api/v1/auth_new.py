@@ -48,6 +48,49 @@ GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 router = APIRouter()
 security = HTTPBearer()
 
+
+def _should_expose_otp_in_response(email_sent: bool) -> bool:
+    if settings.APP_ENV == "development":
+        return True
+    return not email_sent and settings.EMAIL_RETURN_OTP_ON_FAILURE
+
+
+async def _send_otp_and_build_response(user: User, otp_code: str) -> dict:
+    """Send OTP email and return a consistent payload for register/request-otp."""
+    user_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "User"
+    email_sent = await EmailService.send_otp_email(
+        to_email=user.email,
+        to_name=user_name,
+        otp_code=otp_code,
+    )
+
+    if email_sent:
+        response = {
+            "message": "OTP sent to your email",
+            "email_sent": True,
+            "requires_email_verification": True,
+            "next_step": "verify_otp",
+        }
+    else:
+        logger.error(f"OTP email delivery failed for {user.email}")
+        response = {
+            "message": "Account created. Enter the verification code to continue.",
+            "email_sent": False,
+            "requires_email_verification": True,
+            "next_step": "verify_otp",
+            "detail": (
+                "We could not deliver the verification email. "
+                "If you do not receive a code, contact support or try again later."
+            ),
+        }
+
+    if _should_expose_otp_in_response(email_sent):
+        response["otp"] = otp_code
+        if not email_sent:
+            response["message"] = "Verification code generated. Enter it below to continue."
+
+    return response
+
 class GoogleAuthRequest(BaseModel):
     code: str
     redirect_uri: str = None
@@ -463,7 +506,16 @@ async def register(request: Request, user_data: UserCreate, db: AsyncSession = D
     hashed_password = get_password_hash(user_data.password)
     verification_token = generate_verification_token()
     otp_code = generate_otp()
-    user = User(email=user_data.email, hashed_password=hashed_password, first_name=user_data.first_name, last_name=user_data.last_name, phone=user_data.phone, email_verification_token=verification_token, otp_code=otp_code, otp_expires_at=datetime.utcnow() + timedelta(minutes=10))
+    user = User(
+        email=user_data.email,
+        hashed_password=hashed_password,
+        first_name=user_data.first_name,
+        last_name=user_data.last_name,
+        phone=user_data.phone,
+        email_verification_token=verification_token,
+        otp_code=otp_code,
+        otp_expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+    )
     db.add(user)
     await db.commit()
     await db.refresh(user)
@@ -478,9 +530,11 @@ async def register(request: Request, user_data: UserCreate, db: AsyncSession = D
     await db.commit()
     await db.refresh(user)
     user_name = f"{user_data.first_name or ''} {user_data.last_name or ''}".strip() or "User"
-    await EmailService.send_verification_email(to_email=user.email, to_name=user_name, verification_token=verification_token)
-    await EmailService.send_otp_email(to_email=user.email, to_name=user_name, otp_code=otp_code)
-    logger.info(f"User registered: {user.email}")
+    await EmailService.send_verification_email(
+        to_email=user.email, to_name=user_name, verification_token=verification_token
+    )
+    otp_delivery = await _send_otp_and_build_response(user, otp_code)
+    logger.info(f"User registered: {user.email}, email_sent={otp_delivery['email_sent']}")
     
     # Get verification status (KYC and email)
     verification_status = await get_user_verification_status(user, db)
@@ -498,10 +552,10 @@ async def register(request: Request, user_data: UserCreate, db: AsyncSession = D
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
-        "user": user_response
+        "user": user_response,
+        **otp_delivery,
     }
     if settings.APP_ENV == "development":
-        response_data["otp"] = otp_code
         response_data["verification_token"] = verification_token
     return response_data
 
@@ -658,15 +712,7 @@ async def request_otp(request: OTPRequest, db: AsyncSession = Depends(get_db)):
     user.otp_code = otp_code
     user.otp_expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
     await db.commit()
-    user_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "User"
-    email_sent = await EmailService.send_otp_email(to_email=user.email, to_name=user_name, otp_code=otp_code)
-    if settings.APP_ENV == "development":
-        return {"message": "OTP sent to your email", "otp": otp_code}
-    if not email_sent:
-        raise BadRequestException(
-            "Unable to send verification email. The email service may not be configured for this recipient."
-        )
-    return {"message": "OTP sent to your email"}
+    return await _send_otp_and_build_response(user, otp_code)
 
 @router.post("/verify-otp")
 async def verify_otp(request: OTPVerify, db: AsyncSession = Depends(get_db)):
@@ -694,6 +740,7 @@ async def verify_otp(request: OTPVerify, db: AsyncSession = Depends(get_db)):
             user.otp_code = None
             user.otp_expires_at = None
             user.is_verified = True
+            user.email_verified_at = now
         # For password reset, keep the OTP so it can be used in reset-password endpoint
         
         await db.commit()

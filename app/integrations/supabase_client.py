@@ -1,10 +1,14 @@
+import httpx
+
 try:
     from supabase import create_client, Client
     SUPABASE_AVAILABLE = True
-except ImportError:
+    _IMPORT_ERROR = None
+except ImportError as exc:
     SUPABASE_AVAILABLE = False
     create_client = None
     Client = None
+    _IMPORT_ERROR = exc
 
 from typing import Optional
 from app.config import settings
@@ -12,55 +16,139 @@ from app.utils.logger import logger
 
 
 class SupabaseClient:
-    _instance: Client = None
+    _instance: Optional["Client"] = None
 
     @classmethod
-    def get_client(cls) -> Optional[Client]:
+    def _storage_base_url(cls) -> str:
+        return f"{settings.SUPABASE_URL.rstrip('/')}/storage/v1"
+
+    @classmethod
+    def _auth_headers(cls, content_type: Optional[str] = None, upsert: bool = False) -> dict:
+        headers = {
+            "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}",
+            "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
+        }
+        if content_type:
+            headers["Content-Type"] = content_type
+        if upsert:
+            headers["x-upsert"] = "true"
+        return headers
+
+    @classmethod
+    def _ensure_configured(cls) -> None:
+        if not settings.SUPABASE_URL or not settings.SUPABASE_SERVICE_ROLE_KEY:
+            raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured")
+
+    @classmethod
+    def get_client(cls) -> Optional["Client"]:
         if not SUPABASE_AVAILABLE:
-            logger.warning("Supabase SDK not installed. Install with: pip install supabase")
+            if _IMPORT_ERROR:
+                logger.warning(
+                    "Supabase SDK import failed (%s). Using HTTP storage fallback.",
+                    _IMPORT_ERROR,
+                )
+            else:
+                logger.warning("Supabase SDK not installed. Using HTTP storage fallback.")
             return None
         if cls._instance is None:
-            try:
-                cls._instance = create_client(
-                    settings.SUPABASE_URL,
-                    settings.SUPABASE_SERVICE_ROLE_KEY
-                )
-                logger.info("Supabase client initialized")
-            except Exception as e:
-                logger.error(f"Failed to initialize Supabase client: {e}")
-                raise
+            cls._ensure_configured()
+            cls._instance = create_client(
+                settings.SUPABASE_URL,
+                settings.SUPABASE_SERVICE_ROLE_KEY,
+            )
+            logger.info("Supabase client initialized")
         return cls._instance
 
     @classmethod
-    def upload_file(cls, bucket: str, file_path: str, file_data: bytes, content_type: str = "application/octet-stream", upsert: bool = True) -> str:
+    def _upload_via_http(
+        cls,
+        bucket: str,
+        file_path: str,
+        file_data: bytes,
+        content_type: str,
+        upsert: bool = True,
+    ) -> str:
+        cls._ensure_configured()
+        url = f"{cls._storage_base_url()}/object/{bucket}/{file_path}"
+        headers = cls._auth_headers(content_type=content_type, upsert=upsert)
+        with httpx.Client(timeout=60.0) as client:
+            response = client.post(url, content=file_data, headers=headers)
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"Supabase storage upload failed ({response.status_code}): {response.text[:500]}"
+                )
+        return file_path
+
+    @classmethod
+    def _get_public_url_via_http(cls, bucket: str, file_path: str) -> str:
+        cls._ensure_configured()
+        return (
+            f"{settings.SUPABASE_URL.rstrip('/')}/storage/v1/object/public/"
+            f"{bucket}/{file_path}"
+        )
+
+    @classmethod
+    def _delete_via_http(cls, bucket: str, file_path: str) -> bool:
+        cls._ensure_configured()
+        url = f"{cls._storage_base_url()}/object/{bucket}/{file_path}"
+        headers = cls._auth_headers()
+        with httpx.Client(timeout=30.0) as client:
+            response = client.delete(url, headers=headers)
+            if response.status_code >= 400:
+                logger.error(
+                    "Supabase storage delete failed (%s): %s",
+                    response.status_code,
+                    response.text[:500],
+                )
+                return False
+        return True
+
+    @classmethod
+    def _download_via_http(cls, bucket: str, file_path: str) -> bytes:
+        cls._ensure_configured()
+        url = f"{cls._storage_base_url()}/object/{bucket}/{file_path}"
+        headers = cls._auth_headers()
+        with httpx.Client(timeout=60.0) as client:
+            response = client.get(url, headers=headers)
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"Supabase storage download failed ({response.status_code}): {response.text[:500]}"
+                )
+            return response.content
+
+    @classmethod
+    def upload_file(
+        cls,
+        bucket: str,
+        file_path: str,
+        file_data: bytes,
+        content_type: str = "application/octet-stream",
+        upsert: bool = True,
+    ) -> str:
         client = cls.get_client()
+        if client is None:
+            return cls._upload_via_http(bucket, file_path, file_data, content_type, upsert=upsert)
+
+        file_options = {"content-type": content_type}
         try:
-            # Supabase Python client - file_options should only contain string values
-            # The upsert parameter should be passed separately or as a string, not as a boolean in file_options
-            file_options = {"content-type": content_type}
-            
-            # Try to upload - if upsert is needed, handle duplicates separately
-            # Some Supabase client versions don't support upsert in file_options
             try:
                 response = client.storage.from_(bucket).upload(
                     file_path,
                     file_data,
-                    file_options=file_options
+                    file_options=file_options,
                 )
             except Exception as upload_error:
-                # If upload fails due to duplicate and upsert is True, try to delete and re-upload
-                if upsert and ("already exists" in str(upload_error).lower() or "duplicate" in str(upload_error).lower()):
-                    logger.warning(f"File exists, attempting to overwrite: {file_path}")
-                    try:
-                        cls.delete_file(bucket, file_path)
-                        response = client.storage.from_(bucket).upload(
-                            file_path,
-                            file_data,
-                            file_options=file_options
-                        )
-                    except Exception as retry_error:
-                        logger.error(f"Failed to overwrite file: {retry_error}")
-                        raise
+                if upsert and (
+                    "already exists" in str(upload_error).lower()
+                    or "duplicate" in str(upload_error).lower()
+                ):
+                    logger.warning("File exists, attempting to overwrite: %s", file_path)
+                    cls.delete_file(bucket, file_path)
+                    response = client.storage.from_(bucket).upload(
+                        file_path,
+                        file_data,
+                        file_options=file_options,
+                    )
                 else:
                     raise
             if isinstance(response, dict):
@@ -68,116 +156,116 @@ class SupabaseClient:
             return file_path
         except Exception as e:
             error_str = str(e)
-            # Check if it's a duplicate error
             if "already exists" in error_str.lower() or "duplicate" in error_str.lower():
-                logger.warning(f"File already exists at {file_path}, attempting overwrite")
-                # Try to delete first, then upload
                 try:
                     cls.delete_file(bucket, file_path)
                     response = client.storage.from_(bucket).upload(
                         file_path,
                         file_data,
-                        file_options=file_options
+                        file_options=file_options,
                     )
                     if isinstance(response, dict):
                         return response.get("path", file_path)
                     return file_path
                 except Exception as delete_error:
-                    logger.error(f"Failed to overwrite existing file: {delete_error}")
+                    logger.error("Failed to overwrite existing file: %s", delete_error)
                     raise
-            # Check for header value error (boolean in header)
             if "Header value must be str or bytes" in error_str or "not <class 'bool'>" in error_str:
-                logger.error(f"Supabase client header error - this may be a client library issue: {e}")
-                # Try without file_options to see if that helps
                 try:
-                    response = client.storage.from_(bucket).upload(
-                        file_path,
-                        file_data
-                    )
+                    response = client.storage.from_(bucket).upload(file_path, file_data)
                     if isinstance(response, dict):
                         return response.get("path", file_path)
                     return file_path
                 except Exception as fallback_error:
-                    logger.error(f"Failed to upload even without file_options: {fallback_error}")
-                    raise
-            logger.error(f"Failed to upload file to Supabase Storage: {e}")
-            raise
+                    logger.warning("SDK upload failed, trying HTTP fallback: %s", fallback_error)
+                    return cls._upload_via_http(
+                        bucket, file_path, file_data, content_type, upsert=upsert
+                    )
+            logger.warning("SDK upload failed, trying HTTP fallback: %s", e)
+            return cls._upload_via_http(bucket, file_path, file_data, content_type, upsert=upsert)
 
     @classmethod
     def get_file_url(cls, bucket: str, file_path: str) -> str:
-        """
-        Get public URL for a file in Supabase storage.
-        Returns absolute URL that can be accessed from anywhere (if bucket is public).
-        
-        IMPORTANT: The 'documents' bucket must be set to PUBLIC in Supabase Storage settings
-        for these URLs to be accessible without authentication.
-        
-        Returns format: https://<project-id>.supabase.co/storage/v1/object/public/<bucket>/<file_path>
-        """
         client = cls.get_client()
+        if client is None:
+            return cls._get_public_url_via_http(bucket, file_path)
+
         try:
             response = client.storage.from_(bucket).get_public_url(file_path)
             if isinstance(response, dict):
                 public_url = response.get("publicUrl", "")
             else:
                 public_url = str(response) if response else ""
-            
-            # Ensure URL is absolute (starts with https://)
-            if public_url and not public_url.startswith(('http://', 'https://')):
-                # If somehow not absolute, construct from SUPABASE_URL
-                if public_url.startswith('/'):
+
+            if public_url and not public_url.startswith(("http://", "https://")):
+                if public_url.startswith("/"):
                     public_url = f"{settings.SUPABASE_URL}{public_url}"
                 else:
-                    public_url = f"{settings.SUPABASE_URL}/storage/v1/object/public/{bucket}/{file_path}"
-            
-            # Remove trailing query params if empty (e.g., trailing "?")
-            if public_url and public_url.endswith('?'):
-                public_url = public_url.rstrip('?')
-            
-            return public_url
+                    public_url = (
+                        f"{settings.SUPABASE_URL}/storage/v1/object/public/{bucket}/{file_path}"
+                    )
+
+            if public_url and public_url.endswith("?"):
+                public_url = public_url.rstrip("?")
+
+            return public_url or cls._get_public_url_via_http(bucket, file_path)
         except Exception as e:
-            logger.error(f"Failed to get file URL from Supabase Storage: {e}")
-            raise
+            logger.warning("SDK get_file_url failed, using HTTP URL: %s", e)
+            return cls._get_public_url_via_http(bucket, file_path)
 
     @classmethod
     def delete_file(cls, bucket: str, file_path: str) -> bool:
         client = cls.get_client()
+        if client is None:
+            return cls._delete_via_http(bucket, file_path)
+
         try:
             response = client.storage.from_(bucket).remove([file_path])
-            # Check if deletion was successful
             if isinstance(response, list) and len(response) > 0:
                 return True
-            return True  # Assume success if no error
+            return True
         except Exception as e:
-            logger.error(f"Failed to delete file from Supabase Storage: {e}")
-            return False
-    
+            logger.error("Failed to delete file from Supabase Storage: %s", e)
+            return cls._delete_via_http(bucket, file_path)
+
     @classmethod
     def download_file(cls, bucket: str, file_path: str) -> bytes:
-        """Download a file from Supabase Storage"""
         client = cls.get_client()
+        if client is None:
+            return cls._download_via_http(bucket, file_path)
+
         try:
             response = client.storage.from_(bucket).download(file_path)
             if isinstance(response, bytes):
                 return response
-            elif isinstance(response, dict):
-                # Some Supabase clients return dict with data
+            if isinstance(response, dict):
                 return response.get("data", b"")
             return b""
         except Exception as e:
-            logger.error(f"Failed to download file from Supabase Storage: {e}")
-            raise
-    
+            logger.warning("SDK download failed, trying HTTP fallback: %s", e)
+            return cls._download_via_http(bucket, file_path)
+
     @classmethod
     def list_files(cls, bucket: str, folder: str = "") -> list:
-        """List files in a bucket/folder"""
         client = cls.get_client()
+        if client is None:
+            cls._ensure_configured()
+            url = f"{cls._storage_base_url()}/object/list/{bucket}"
+            headers = cls._auth_headers(content_type="application/json")
+            payload = {"prefix": folder, "limit": 100, "offset": 0}
+            with httpx.Client(timeout=30.0) as http_client:
+                response = http_client.post(url, json=payload, headers=headers)
+                if response.status_code >= 400:
+                    logger.error("Supabase list files failed: %s", response.text[:500])
+                    return []
+                data = response.json()
+                return data if isinstance(data, list) else []
+
         try:
             response = client.storage.from_(bucket).list(folder)
             if isinstance(response, list):
                 return response
             return []
         except Exception as e:
-            logger.error(f"Failed to list files from Supabase Storage: {e}")
+            logger.error("Failed to list files from Supabase Storage: %s", e)
             return []
-

@@ -193,12 +193,22 @@ class PersonaClient:
 
     @staticmethod
     def get_redirect_uri() -> Optional[str]:
+        """Only return redirect URI when explicitly enabled and configured in Persona."""
+        if not settings.PERSONA_USE_REDIRECT_URI:
+            return None
         if settings.PERSONA_REDIRECT_URI:
-            return settings.PERSONA_REDIRECT_URI
-        cors = settings.CORS_ORIGINS
-        if isinstance(cors, list) and cors:
-            return f"{cors[0].rstrip('/')}/kyc/verification-complete"
+            return settings.PERSONA_REDIRECT_URI.strip()
         return None
+
+    @staticmethod
+    def _hosted_flow_environment_param() -> Dict[str, str]:
+        if settings.PERSONA_ENVIRONMENT_ID:
+            return {"environment-id": settings.PERSONA_ENVIRONMENT_ID}
+        if settings.PERSONA_API_KEY.startswith("persona_sandbox_"):
+            return {"environment": "sandbox"}
+        if settings.PERSONA_API_KEY.startswith("persona_production_"):
+            return {"environment": "production"}
+        return {}
 
     @staticmethod
     def parse_http_error(error: httpx.HTTPStatusError) -> str:
@@ -237,6 +247,7 @@ class PersonaClient:
         params = {
             "inquiry-template-id": settings.PERSONA_TEMPLATE_ID,
             "reference-id": reference_id,
+            **PersonaClient._hosted_flow_environment_param(),
         }
         if redirect_uri:
             params["redirect-uri"] = redirect_uri

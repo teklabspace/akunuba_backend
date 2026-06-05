@@ -59,6 +59,8 @@ services:
         value: Akunuba
       - key: EMAIL_ENABLED
         value: true
+      - key: EMAIL_RETURN_OTP_ON_FAILURE
+        value: true
 
       # Stripe
       - key: STRIPE_SECRET_KEY
@@ -83,10 +85,12 @@ services:
         sync: false # Set this manually in Render dashboard
       - key: PERSONA_TEMPLATE_ID
         sync: false # Set this manually in Render dashboard
+      - key: PERSONA_ENVIRONMENT_ID
+        sync: false # Sandbox env ID from Persona dashboard (starts with env_)
       - key: PERSONA_FILE_ACCESS_TOKEN_EXPIRY
         value: 21600
       - key: PERSONA_REDIRECT_URI
-        sync: false # e.g. https://akunuba.io/kyc/complete
+        sync: false # Must exactly match Persona template allowed redirect URI
 
       # Sendbird
       - key: SENDBIRD_APP_ID

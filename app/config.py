@@ -47,9 +47,14 @@ class Settings(BaseSettings):
     
     PERSONA_API_KEY: str
     PERSONA_TEMPLATE_ID: str = ""  # Inquiry Template ID (starts with 'itmpl_') - defines verification flow
+    PERSONA_ENVIRONMENT_ID: str = ""  # Sandbox/production env ID (starts with 'env_') for hosted flow
     PERSONA_FILE_ACCESS_TOKEN_EXPIRY: int = 21600  # seconds (6 hours default)
-    PERSONA_REDIRECT_URI: str = ""  # Redirect URI after Persona verification completes (e.g., https://yourapp.com/kyc/complete)
-    
+    PERSONA_REDIRECT_URI: str = ""  # Must exactly match Persona template allowed redirect URIs
+    PERSONA_USE_REDIRECT_URI: bool = False  # Set true only after URI is allowlisted in Persona
+
+    # When true, return OTP in API response if email delivery fails (use until Resend domain is verified)
+    EMAIL_RETURN_OTP_ON_FAILURE: bool = False
+
     SENDBIRD_APP_ID: str
     SENDBIRD_API_TOKEN: str
     

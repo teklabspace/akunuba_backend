@@ -328,13 +328,7 @@ async def get_kyc_status(
                 
                 # Get verification URL if inquiry is still in progress
                 if kyc.status == KYCStatus.IN_PROGRESS:
-                    from app.config import settings
-                    if settings.PERSONA_REDIRECT_URI:
-                        redirect_uri = settings.PERSONA_REDIRECT_URI
-                    else:
-                        base_url = settings.CORS_ORIGINS[0] if isinstance(settings.CORS_ORIGINS, list) and settings.CORS_ORIGINS else 'http://localhost:3000'
-                        redirect_uri = f"{base_url}/kyc/verification-complete"
-                    
+                    redirect_uri = PersonaClient.get_redirect_uri()
                     verification_url = PersonaClient.get_verification_url(kyc.persona_inquiry_id, redirect_uri)
         except Exception as e:
             logger.error(f"[KYC STATUS SYNC] Failed to sync Persona status: {e}", exc_info=True)

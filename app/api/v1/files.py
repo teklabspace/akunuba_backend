@@ -13,7 +13,11 @@ from app.config import settings
 
 router = APIRouter()
 
-
+from app.utils.upload_helpers import (
+    resolve_content_type,
+    storage_bucket_for_file_type,
+    validate_image_content_type,
+)
 @router.post("/upload", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
 async def upload_file(
     file: UploadFile = File(...),
@@ -53,17 +57,24 @@ async def upload_file(
     
     # Use appropriate bucket based on file type
     # Photos go to 'images' bucket, documents go to 'documents' bucket
-    bucket_name = "images" if file_type == "photo" else "documents"
+    bucket_name = storage_bucket_for_file_type(file_type)
     folder = "assets" if asset_id else "general"
     file_path = f"{folder}/{account.id}/{unique_filename}"
-    
+
+    try:
+        if file_type == "photo":
+            content_type = validate_image_content_type(file.filename or unique_filename, file.content_type)
+        else:
+            content_type = resolve_content_type(file.filename or unique_filename, file.content_type)
+    except ValueError as e:
+        raise BadRequestException(str(e))
     try:
         # Upload to Supabase Storage - photos to images bucket, documents to documents bucket
         upload_result = SupabaseClient.upload_file(
             bucket=bucket_name,
             file_path=file_path,
             file_data=file_data,
-            content_type=file.content_type or "application/octet-stream"
+            content_type=content_type,
         )
         logger.info(f"File uploaded successfully. Path: {file_path}, Bucket: {bucket_name}, Result: {upload_result}")
         
@@ -71,8 +82,17 @@ async def upload_file(
         url = SupabaseClient.get_file_url(bucket_name, file_path)
         logger.info(f"Generated public URL: {url}")
         thumbnail_url = url if file_type == "photo" else None
+    except RuntimeError as e:
+        error_msg = str(e)
+        if "SUPABASE_URL" in error_msg or "SUPABASE_SERVICE_ROLE_KEY" in error_msg:
+            logger.error("Supabase storage is not configured: %s", e)
+            raise BadRequestException(
+                "File storage is not configured. Contact support."
+            )
+        logger.error("Failed to upload file to Supabase Storage: %s", e)
+        raise BadRequestException(f"Failed to upload file: {error_msg}")
     except Exception as e:
-        logger.error(f"Failed to upload file to Supabase Storage: {e}")
+        logger.error("Failed to upload file to Supabase Storage: %s", e)
         # If duplicate error (shouldn't happen with UUID, but handle it)
         if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
             # Generate new UUID and retry
@@ -84,7 +104,7 @@ async def upload_file(
                     bucket=bucket_name,
                     file_path=file_path,
                     file_data=file_data,
-                    content_type=file.content_type or "application/octet-stream"
+                    content_type=content_type,
                 )
                 url = SupabaseClient.get_file_url(bucket_name, file_path)
                 thumbnail_url = url if file_type == "photo" else None
