@@ -1,4 +1,5 @@
-import resend
+import base64
+import httpx
 from app.config import settings
 from app.utils.logger import logger
 from typing import Optional, Dict, Any
@@ -10,25 +11,33 @@ class EmailService:
     
     @classmethod
     def _initialize(cls) -> bool:
-        """Initialize Resend client"""
+        """Initialize Mailpit client settings."""
         if not settings.EMAIL_ENABLED:
             return False
         
-        if not settings.RESEND_API_KEY:
-            logger.warning("Resend API key not configured, email service disabled")
+        if not settings.MAILPIT_API_BASE_URL:
+            logger.warning("MAILPIT_API_BASE_URL not configured, email service disabled")
             return False
         
         if not cls._initialized:
             try:
-                resend.api_key = settings.RESEND_API_KEY
                 cls._initialized = True
-                logger.info("Resend client initialized")
+                logger.info("Mailpit email service initialized")
                 return True
             except Exception as e:
-                logger.error(f"Failed to initialize Resend client: {e}")
+                logger.error(f"Failed to initialize Mailpit email service: {e}")
                 return False
         
         return True
+
+    @classmethod
+    def _build_auth_header(cls) -> Dict[str, str]:
+        username = settings.MAILPIT_API_USERNAME or ""
+        password = settings.MAILPIT_API_PASSWORD or ""
+        if not username:
+            return {}
+        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("utf-8")
+        return {"Authorization": f"Basic {token}"}
     
     @classmethod
     async def send_email(
@@ -40,7 +49,7 @@ class EmailService:
         from_email: Optional[str] = None,
         from_name: Optional[str] = None
     ) -> bool:
-        """Send an email via Resend"""
+        """Send an email via Mailpit HTTP API."""
         if not settings.EMAIL_ENABLED:
             logger.debug("Email service disabled, skipping email send")
             return False
@@ -52,40 +61,33 @@ class EmailService:
             from_address = from_email or settings.EMAIL_FROM_ADDRESS
             from_name_str = from_name or settings.EMAIL_FROM_NAME
             
-            # Format from address with name if provided
-            if from_name_str and from_name_str != "Fullego":
-                from_addr = f"{from_name_str} <{from_address}>"
-            else:
-                from_addr = from_address
-            
-            email_params = {
-                "from": from_addr,
-                "to": to_email,
-                "subject": subject,
-                "html": html_content,
+            payload: Dict[str, Any] = {
+                "From": {"Email": from_address, "Name": from_name_str},
+                "To": [{"Email": to_email}],
+                "Subject": subject,
+                "HTML": html_content,
             }
             
-            # Add text content if provided
             if text_content:
-                email_params["text"] = text_content
-            
-            # Run Resend send in thread to avoid blocking
-            import asyncio
-            response = await asyncio.to_thread(resend.Emails.send, email_params)
-            
-            if response and hasattr(response, 'id'):
-                logger.info(f"Email sent successfully to {to_email} (ID: {response.id})")
+                payload["Text"] = text_content
+
+            headers = {"Content-Type": "application/json", **cls._build_auth_header()}
+            endpoint = f"{settings.MAILPIT_API_BASE_URL.rstrip('/')}/api/v1/send"
+
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(endpoint, json=payload, headers=headers)
+
+            if response.status_code < 400:
+                logger.info("Email sent successfully to %s via Mailpit", to_email)
                 return True
-            elif response:
-                # Check if response is a dict with error
-                if isinstance(response, dict) and 'error' in response:
-                    logger.error(f"Failed to send email: {response.get('message', 'Unknown error')}")
-                else:
-                    logger.error(f"Failed to send email: Unexpected response format: {response}")
-                return False
-            else:
-                logger.error(f"Failed to send email: No response received")
-                return False
+
+            logger.error(
+                "Failed to send email to %s via Mailpit (%s): %s",
+                to_email,
+                response.status_code,
+                response.text[:500],
+            )
+            return False
                 
         except Exception as e:
             logger.error(f"Error sending email to {to_email}: {e}")

@@ -46,9 +46,10 @@ class AssetCreate(BaseModel):
     # Additional metadata
     metadata: Optional[Dict[str, Any]] = None
     
-    # Photos and documents (URLs of already uploaded files - primary identifier)
-    photos: Optional[List[str]] = None  # Array of public URLs
-    documents: Optional[List[str]] = None  # Array of public URLs
+    # Photos and documents (URLs or UUIDs of already uploaded files)
+    photos: Optional[List[str]] = None
+    images: Optional[List[str]] = None  # Alias accepted alongside photos
+    documents: Optional[List[str]] = None
 
 
 class AssetUpdate(BaseModel):

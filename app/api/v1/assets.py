@@ -250,14 +250,15 @@ async def create_asset(
         account = await get_account(current_user=current_user, db=db)
         plan = await get_user_subscription_plan(account=account, db=db)
         
-        # Check usage limit
-        assets_count = await db.execute(
-            select(func.count(Asset.id)).where(Asset.account_id == account.id)
-        )
-        current_count = assets_count.scalar() or 0
-        if not check_usage_limit(plan, "assets", current_count):
-            limit = get_limit(plan, "assets")
-            raise ForbiddenException(f"Asset limit reached. Maximum {limit} assets allowed for your plan.")
+        # Check usage limit — admins are exempt
+        if current_user.role.value != "admin":
+            assets_count = await db.execute(
+                select(func.count(Asset.id)).where(Asset.account_id == account.id)
+            )
+            current_count = assets_count.scalar() or 0
+            if not check_usage_limit(plan, "assets", current_count):
+                limit = get_limit(plan, "assets")
+                raise ForbiddenException(f"Asset limit reached. Maximum {limit} assets allowed for your plan.")
         
         # Resolve category if category name provided
         category_id = asset_data.category_id
@@ -281,7 +282,26 @@ async def create_asset(
                     category_group_enum = category.category_group
                 logger.info(f"Found category: {category.name} (ID: {category_id})")
             else:
-                logger.warning(f"Category not found: {asset_data.category}")
+                # Auto-create the category so category_id is always saved
+                cg = category_group_enum
+                if cg is None and asset_data.category_group:
+                    # category_group_enum not resolved yet — do a quick parse
+                    try:
+                        cg = CategoryGroup(asset_data.category_group) if isinstance(asset_data.category_group, str) else asset_data.category_group
+                    except ValueError:
+                        cg = CategoryGroup.ASSETS
+                if cg is None:
+                    cg = CategoryGroup.ASSETS
+                new_category = AssetCategory(
+                    name=asset_data.category,
+                    category_group=cg,
+                    is_active=True,
+                )
+                db.add(new_category)
+                await db.flush()  # get the id without full commit
+                category_id = new_category.id
+                category_group_enum = cg
+                logger.info(f"Auto-created category: {asset_data.category} (ID: {category_id})")
         
         # Handle category_group - convert string to enum if needed
         # Database expects title case: "Assets", "Portfolio", "Governance", etc.
@@ -468,7 +488,15 @@ async def create_asset(
         )
         db.add(ownership)
         
+        # Merge images field into photos (frontend may send either or both)
+        all_photo_refs = list(dict.fromkeys(
+            (asset_data.photos or []) + (asset_data.images or [])
+        ))
+
         # Link photos if provided (using URLs or IDs as identifiers)
+        if all_photo_refs:
+            asset_data.photos = all_photo_refs
+
         if asset_data.photos:
             for photo_ref in asset_data.photos:
                 try:
@@ -559,40 +587,21 @@ async def create_asset(
                     logger.warning(f"Failed to link document with reference {doc_ref}: {e}")
         
         await db.commit()
-        
-        # Reload asset with category relationship for response
+
+        # Reload asset with all relationships for full response
         result = await db.execute(
             select(Asset)
-            .options(selectinload(Asset.category))
+            .options(
+                selectinload(Asset.category),
+                selectinload(Asset.photos),
+                selectinload(Asset.documents),
+            )
             .where(Asset.id == asset.id)
         )
         asset = result.scalar_one()
-        
-        # Get category name
-        category_name = None
-        if asset.category_id:
-            try:
-                category_result = await db.execute(
-                    select(AssetCategory).where(AssetCategory.id == asset.category_id)
-                )
-                category = category_result.scalar_one_or_none()
-                if category:
-                    category_name = category.name
-            except Exception as e:
-                logger.warning(f"Failed to load category: {e}")
-        
-        # Build minimal response as per ASSETS_CREATION_PAYLOAD.md specification
-        response = {
-            "id": str(asset.id),
-            "name": asset.name,
-            "category": category_name or asset_data.category,
-            "category_group": asset.category_group.value if asset.category_group else asset_data.category_group.value if asset_data.category_group else None,
-            "created_at": asset.created_at.isoformat() if asset.created_at else None,
-            "updated_at": asset.updated_at.isoformat() if asset.updated_at else None,
-        }
-        
+
         logger.info(f"Asset created: {asset.id} for account {account.id}")
-        return {"data": response}
+        return {"data": build_asset_response(asset)}
     except HTTPException:
         raise
     except Exception as e:
@@ -1587,19 +1596,27 @@ async def get_asset_stats(
 
 # ==================== CATEGORIES ====================
 
-@router.get("/categories", response_model=Dict[str, List[CategoryResponse]])
+@router.get("/categories", response_model=Dict[str, Any])
 async def get_categories(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get all available asset categories"""
+    """Get all available asset categories grouped by category_group."""
+    from collections import defaultdict
     result = await db.execute(
-        select(AssetCategory).where(AssetCategory.is_active == True)
+        select(AssetCategory)
+        .where(AssetCategory.is_active == True)
+        .order_by(AssetCategory.category_group, AssetCategory.name)
     )
     categories = result.scalars().all()
-    
+
+    grouped: dict = defaultdict(list)
+    for cat in categories:
+        grouped[cat.category_group.value].append(CategoryResponse.model_validate(cat))
+
     return {
-        "data": [CategoryResponse.model_validate(c) for c in categories]
+        "data": {group: cats for group, cats in grouped.items()},
+        "total": len(categories),
     }
 
 
@@ -2725,43 +2742,47 @@ async def upload_file_assets(
         logger.error(f"Failed to upload file: {e}")
         raise BadRequestException(f"Failed to upload file: {e}")
     
-    # If asset_id provided, create asset photo/document record
-    file_id = None
+    # Always create a DB record so the file always gets an ID.
+    # asset_id is nullable — record is "floating" until linked to an asset.
+    linked_asset_id = None
     if asset_id:
         asset_result = await db.execute(
             select(Asset).where(and_(Asset.id == asset_id, Asset.account_id == account.id))
         )
-        asset = asset_result.scalar_one_or_none()
-        if asset:
-            if file_type == "photo":
-                photo = AssetPhoto(
-                    asset_id=asset.id,
-                    file_name=file.filename,
-                    file_path=file_path,
-                    file_size=file_size,
-                    mime_type=file.content_type,
-                    url=url,
-                    supabase_storage_path=file_path
-                )
-                db.add(photo)
-                await db.commit()
-                await db.refresh(photo)
-                file_id = photo.id
-            else:
-                document = AssetDocument(
-                    asset_id=asset.id,
-                    name=file.filename,
-                    file_name=file.filename,
-                    file_path=file_path,
-                    file_size=file_size,
-                    mime_type=file.content_type,
-                    url=url,
-                    supabase_storage_path=file_path
-                )
-                db.add(document)
-                await db.commit()
-                await db.refresh(document)
-                file_id = document.id
+        found_asset = asset_result.scalar_one_or_none()
+        if found_asset:
+            linked_asset_id = found_asset.id
+
+    file_id = None
+    if file_type == "photo":
+        photo = AssetPhoto(
+            asset_id=linked_asset_id,
+            file_name=file.filename,
+            file_path=file_path,
+            file_size=file_size,
+            mime_type=file.content_type,
+            url=url,
+            supabase_storage_path=file_path
+        )
+        db.add(photo)
+        await db.commit()
+        await db.refresh(photo)
+        file_id = photo.id
+    else:
+        document = AssetDocument(
+            asset_id=linked_asset_id,
+            name=file.filename,
+            file_name=file.filename,
+            file_path=file_path,
+            file_size=file_size,
+            mime_type=file.content_type,
+            url=url,
+            supabase_storage_path=file_path
+        )
+        db.add(document)
+        await db.commit()
+        await db.refresh(document)
+        file_id = document.id
     
     return {
         "data": {

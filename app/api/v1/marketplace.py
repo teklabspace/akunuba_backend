@@ -110,17 +110,18 @@ async def create_listing(
     from app.services.account_restrictions_service import AccountRestrictionsService
     await AccountRestrictionsService.require_kyb_verification(db, account, "create marketplace listings")
     
-    # Check usage limit
-    active_listings_count = await db.execute(
-        select(func.count(MarketplaceListing.id)).where(
-            MarketplaceListing.account_id == account.id,
-            MarketplaceListing.status == ListingStatus.ACTIVE
+    # Check usage limit — admins are exempt
+    if current_user.role.value != "admin":
+        active_listings_count = await db.execute(
+            select(func.count(MarketplaceListing.id)).where(
+                MarketplaceListing.account_id == account.id,
+                MarketplaceListing.status == ListingStatus.ACTIVE
+            )
         )
-    )
-    current_count = active_listings_count.scalar() or 0
-    if not check_usage_limit(plan, "listings", current_count):
-        limit = get_limit(plan, "listings")
-        raise ForbiddenException(f"Listing limit reached. Maximum {limit} active listings allowed for your plan.")
+        current_count = active_listings_count.scalar() or 0
+        if not check_usage_limit(plan, "listings", current_count):
+            limit = get_limit(plan, "listings")
+            raise ForbiddenException(f"Listing limit reached. Maximum {limit} active listings allowed for your plan.")
     
     # Verify asset belongs to account
     asset_result = await db.execute(
@@ -247,17 +248,18 @@ async def create_offer(
     if not has_feature(plan, Feature.MARKETPLACE_OFFER):
         raise ForbiddenException("Making offers requires a subscription")
     
-    # Check usage limit for offers
-    pending_offers_count = await db.execute(
-        select(func.count(Offer.id)).where(
-            Offer.account_id == account.id,
-            Offer.status == OfferStatus.PENDING
+    # Check usage limit for offers — admins are exempt
+    if current_user.role.value != "admin":
+        pending_offers_count = await db.execute(
+            select(func.count(Offer.id)).where(
+                Offer.account_id == account.id,
+                Offer.status == OfferStatus.PENDING
+            )
         )
-    )
-    current_count = pending_offers_count.scalar() or 0
-    if not check_usage_limit(plan, "offers", current_count):
-        limit = get_limit(plan, "offers")
-        raise ForbiddenException(f"Offer limit reached. Maximum {limit} active offers allowed for your plan.")
+        current_count = pending_offers_count.scalar() or 0
+        if not check_usage_limit(plan, "offers", current_count):
+            limit = get_limit(plan, "offers")
+            raise ForbiddenException(f"Offer limit reached. Maximum {limit} active offers allowed for your plan.")
     
     listing_result = await db.execute(
         select(MarketplaceListing).where(MarketplaceListing.id == listing_id)

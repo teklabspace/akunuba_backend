@@ -38,6 +38,7 @@ ENV/
 .env
 .env.local
 .env.*.local
+.env.example
 
 # Database
 *.db
@@ -46,6 +47,10 @@ ENV/
 # Logs
 *.log
 logs/
+
+# Docs / scripts
+*.md
+*.bat
 
 # Testing
 .pytest_cache/

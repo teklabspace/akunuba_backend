@@ -50,9 +50,13 @@ services:
       - key: ACCESS_TOKEN_EXPIRE_MINUTES
         value: 1440
 
-      # Email Service (Resend)
-      - key: RESEND_API_KEY
-        sync: false # Set this manually in Render dashboard
+      # Email Service (Mailpit API)
+      - key: MAILPIT_API_BASE_URL
+        sync: false # e.g. https://mailpit.example.com
+      - key: MAILPIT_API_USERNAME
+        sync: false # Optional basic auth username
+      - key: MAILPIT_API_PASSWORD
+        sync: false # Optional basic auth password
       - key: EMAIL_FROM_ADDRESS
         value: noreply@yourdomain.com
       - key: EMAIL_FROM_NAME

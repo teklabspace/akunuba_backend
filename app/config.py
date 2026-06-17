@@ -90,11 +90,14 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
     
-    # Email Service (Resend)
-    RESEND_API_KEY: str = ""
-    EMAIL_FROM_ADDRESS: str = "onboarding@resend.dev"
+    # Email Service (Mailpit API v1)
+    MAILPIT_API_BASE_URL: str = ""
+    MAILPIT_API_USERNAME: str = ""
+    MAILPIT_API_PASSWORD: str = ""
+    EMAIL_FROM_ADDRESS: str = "noreply@fullego.local"
     EMAIL_FROM_NAME: str = "Fullego"
     EMAIL_ENABLED: bool = True
+    RESEND_API_KEY: str = ""
     
     # Google OAuth
     GOOGLE_CLIENT_ID: str = ""

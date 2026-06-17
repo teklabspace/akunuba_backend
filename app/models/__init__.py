@@ -15,6 +15,7 @@ from app.models.banking import LinkedAccount, Transaction
 from app.models.document import Document
 from app.models.document_share import DocumentShare, SharePermission
 from app.models.support import SupportTicket
+from app.models.ticket_reply import TicketReply
 from app.models.report import Report, ReportType as ReportTypeEnum, ReportStatus, ReportFormat
 from app.models.entity import (
     Entity, EntityType, EntityStatus, EntityCompliance, ComplianceStatus,
@@ -79,6 +80,7 @@ __all__ = [
     "DocumentShare",
     "SharePermission",
     "SupportTicket",
+    "TicketReply",
     "Report",
     "ReportTypeEnum",
     "ReportStatus",
