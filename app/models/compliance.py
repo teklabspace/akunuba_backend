@@ -3,6 +3,10 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database import Base
+# Native PG enums in this module are created with lowercase *values* (see migration 011).
+# EnumValueType persists enum values instead of names so queries don't send uppercase
+# member names (e.g. "PENDING") that don't exist in the DB enum type.
+from app.models.asset import EnumValueType
 import uuid
 from enum import Enum
 from decimal import Decimal
@@ -80,8 +84,8 @@ class ComplianceTask(Base):
     description = Column(Text)
     assignee_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
     due_date = Column(Date, nullable=False)
-    status = Column(SQLEnum(TaskStatus), default=TaskStatus.NOT_STARTED, nullable=False)
-    priority = Column(SQLEnum(TaskPriority), default=TaskPriority.MEDIUM, nullable=False)
+    status = Column(EnumValueType(TaskStatus), default=TaskStatus.NOT_STARTED, nullable=False)
+    priority = Column(EnumValueType(TaskPriority), default=TaskPriority.MEDIUM, nullable=False)
     category = Column(String(50))  # AML, KYC, GDPR, etc.
     completion_notes = Column(Text)
     completed_at = Column(DateTime(timezone=True), nullable=True)
@@ -141,8 +145,8 @@ class ComplianceAudit(Base):
     account_id = Column(UUID(as_uuid=True), ForeignKey("accounts.id"), nullable=False)
     entity_id = Column(UUID(as_uuid=True), ForeignKey("entities.id"), nullable=True)
     audit_name = Column(String(255), nullable=False)
-    audit_type = Column(SQLEnum(AuditType), nullable=False)
-    status = Column(SQLEnum(AuditStatus), default=AuditStatus.PENDING, nullable=False)
+    audit_type = Column(EnumValueType(AuditType), nullable=False)
+    status = Column(EnumValueType(AuditStatus), default=AuditStatus.PENDING, nullable=False)
     scheduled_date = Column(Date, nullable=False)
     due_date = Column(Date, nullable=False)
     auditor_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
@@ -166,8 +170,8 @@ class ComplianceAlert(Base):
     account_id = Column(UUID(as_uuid=True), ForeignKey("accounts.id"), nullable=False)
     entity_id = Column(UUID(as_uuid=True), ForeignKey("entities.id"), nullable=True)
     alert_type = Column(String(100), nullable=False)  # policy_violation, deadline_missed, etc.
-    severity = Column(SQLEnum(AlertSeverity), nullable=False)
-    status = Column(SQLEnum(AlertStatus), default=AlertStatus.OPEN, nullable=False)
+    severity = Column(EnumValueType(AlertSeverity), nullable=False)
+    status = Column(EnumValueType(AlertStatus), default=AlertStatus.OPEN, nullable=False)
     title = Column(String(255), nullable=False)
     description = Column(Text, nullable=False)
     notes = Column(Text)
@@ -224,10 +228,10 @@ class ComplianceReport(Base):
     account_id = Column(UUID(as_uuid=True), ForeignKey("accounts.id"), nullable=False)
     entity_id = Column(UUID(as_uuid=True), ForeignKey("entities.id"), nullable=True)
     report_type = Column(String(50), nullable=False)  # summary, detailed, etc.
-    status = Column(SQLEnum(ReportStatus), default=ReportStatus.GENERATING, nullable=False)
+    status = Column(EnumValueType(ReportStatus), default=ReportStatus.GENERATING, nullable=False)
     date_from = Column(Date, nullable=False)
     date_to = Column(Date, nullable=False)
-    format = Column(SQLEnum(ReportFormat), nullable=False)
+    format = Column(EnumValueType(ReportFormat), nullable=False)
     include_sections = Column(JSONB)  # Array of strings: ["score", "tasks", "audits", "alerts"]
     file_path = Column(String(500), nullable=True)
     download_url = Column(String(500), nullable=True)
@@ -251,7 +255,7 @@ class CompliancePolicy(Base):
     entity_id = Column(UUID(as_uuid=True), ForeignKey("entities.id"), nullable=True)
     policy_name = Column(String(255), nullable=False)
     category = Column(String(50), nullable=False)  # AML, KYC, GDPR, etc.
-    status = Column(SQLEnum(PolicyStatus), default=PolicyStatus.DRAFT, nullable=False)
+    status = Column(EnumValueType(PolicyStatus), default=PolicyStatus.DRAFT, nullable=False)
     version = Column(String(50), nullable=False)
     effective_date = Column(Date, nullable=False)
     expiry_date = Column(Date, nullable=True)
