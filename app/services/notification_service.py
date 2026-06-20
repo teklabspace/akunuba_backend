@@ -26,7 +26,7 @@ class NotificationService:
             notification_type=notification_type,
             title=title,
             message=message,
-            metadata=metadata,
+            meta_data=metadata,
         )
         
         db.add(notification)

@@ -105,9 +105,10 @@ async def get_referral_stats(
     completed_referrals = len([r for r in referrals if r.status == ReferralStatus.COMPLETED])
     pending_referrals = len([r for r in referrals if r.status == ReferralStatus.PENDING])
     
-    # Calculate rewards
-    total_rewards_earned = sum([r.reward_amount for r in referrals])
-    total_rewards_paid = sum([r.reward_amount for r in referrals if r.reward_paid])
+    # Calculate rewards (use Decimal start value so an empty list yields
+    # Decimal("0.00") rather than int 0, matching the response schema)
+    total_rewards_earned = sum((r.reward_amount for r in referrals), Decimal("0.00"))
+    total_rewards_paid = sum((r.reward_amount for r in referrals if r.reward_paid), Decimal("0.00"))
     pending_rewards = total_rewards_earned - total_rewards_paid
     
     return ReferralStatsResponse(

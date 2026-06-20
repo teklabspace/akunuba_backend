@@ -40,16 +40,18 @@ class PlaidClient:
         
         if cls._instance is None:
             try:
-                # Map environment string to Plaid host
+                # Map environment string to the full Plaid API base URL.
+                # The Plaid SDK uses `host` directly as the base path, so it
+                # must be a full URL, not the bare environment name.
                 plaid_host_map = {
-                    "sandbox": "sandbox",
-                    "development": "development",
-                    "production": "production",
+                    "sandbox": "https://sandbox.plaid.com",
+                    "development": "https://development.plaid.com",
+                    "production": "https://production.plaid.com",
                 }
-                
+
                 plaid_host = plaid_host_map.get(
-                    settings.PLAID_ENV.lower(), 
-                    "sandbox"  # Default to sandbox
+                    settings.PLAID_ENV.lower(),
+                    "https://sandbox.plaid.com"  # Default to sandbox
                 )
                 
                 configuration = Configuration(

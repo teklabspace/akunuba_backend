@@ -66,7 +66,10 @@ async def mark_as_read(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
-    
+
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+
     result = await db.execute(
         select(Notification).where(
             and_(
@@ -76,10 +79,10 @@ async def mark_as_read(
         )
     )
     notification = result.scalar_one_or_none()
-    
+
     if not notification:
         raise NotFoundException("Notification", str(notification_id))
-    
+
     notification.is_read = True
     notification.read_at = datetime.utcnow()
     
@@ -98,7 +101,10 @@ async def mark_all_as_read(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
-    
+
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+
     result = await db.execute(
         select(Notification).where(
             and_(
@@ -108,7 +114,7 @@ async def mark_all_as_read(
         )
     )
     notifications = result.scalars().all()
-    
+
     for notification in notifications:
         notification.is_read = True
         notification.read_at = datetime.utcnow()
@@ -292,11 +298,16 @@ async def delete_notification(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
-    
+
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+
     result = await db.execute(
         select(Notification).where(
-            Notification.id == notification_id,
-            Notification.account_id == account.id
+            and_(
+                Notification.id == notification_id,
+                Notification.account_id == account.id
+            )
         )
     )
     notification = result.scalar_one_or_none()
@@ -322,7 +333,10 @@ async def delete_all_notifications(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
-    
+
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+
     query = select(Notification).where(Notification.account_id == account.id)
     if read_only:
         query = query.where(Notification.is_read == True)

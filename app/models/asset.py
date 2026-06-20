@@ -36,6 +36,15 @@ class AppraisalType(str, Enum):
     EXPEDITED = "Expedited"
     INSURANCE = "Insurance"
 
+    @classmethod
+    def _missing_(cls, value):
+        """Accept client values regardless of casing (e.g. 'comprehensive')."""
+        if isinstance(value, str):
+            for member in cls:
+                if member.value.lower() == value.lower():
+                    return member
+        return None
+
 
 class AppraisalStatus(str, Enum):
     PENDING = "pending"

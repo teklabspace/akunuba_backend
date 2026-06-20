@@ -205,6 +205,7 @@ class TicketReplyResponse(BaseModel):
 
 
 @router.post("/tickets/{ticket_id}/replies", response_model=TicketReplyResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/tickets/{ticket_id}/comments", response_model=TicketReplyResponse, status_code=status.HTTP_201_CREATED, include_in_schema=False)
 async def create_ticket_reply(
     ticket_id: UUID,
     reply_data: TicketReplyCreate,
@@ -258,6 +259,7 @@ async def create_ticket_reply(
 
 
 @router.get("/tickets/{ticket_id}/replies", response_model=List[TicketReplyResponse])
+@router.get("/tickets/{ticket_id}/comments", response_model=List[TicketReplyResponse], include_in_schema=False)
 async def get_ticket_replies(
     ticket_id: UUID,
     include_internal: bool = Query(False),

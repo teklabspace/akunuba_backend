@@ -2136,11 +2136,19 @@ async def request_asset_sale(
         preferred_sale_date=sale_data.preferred_sale_date,
         status=SaleRequestStatus.PENDING
     )
-    
-    db.add(sale_request)
-    await db.commit()
-    await db.refresh(sale_request)
-    
+
+    try:
+        db.add(sale_request)
+        await db.commit()
+        await db.refresh(sale_request)
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Failed to create sale request for asset {asset_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create sale request"
+        )
+
     logger.info(f"Sale request created for asset {asset_id}: {sale_request.id}")
     return {"data": SaleRequestResponse.model_validate(sale_request)}
 
@@ -2514,10 +2522,13 @@ async def share_asset_details(
     if not asset:
         raise NotFoundException("Asset", str(asset_id))
     
-    # Generate share link
+    # Generate share link as an absolute, reachable URL (relative paths can't be
+    # opened directly from the clipboard). Points to the frontend share page,
+    # which resolves the data via GET /api/v1/assets/{asset_id}/shared.
     access_code = secrets.token_urlsafe(16)
-    share_link = f"/assets/{asset_id}/shared?code={access_code}"
-    
+    base_url = settings.FRONTEND_BASE_URL.rstrip("/")
+    share_link = f"{base_url}/assets/{asset_id}/shared?code={access_code}"
+
     expires_at = None
     if share_data.expires_in:
         expires_at = datetime.now(timezone.utc) + timedelta(days=share_data.expires_in)
@@ -2542,6 +2553,49 @@ async def share_asset_details(
             expires_at=expires_at,
             access_code=access_code
         )
+    }
+
+
+@router.get("/{asset_id}/shared", response_model=Dict[str, Any])
+async def get_shared_asset(
+    asset_id: UUID,
+    code: str = Query(..., description="Share access code from the share link"),
+    db: AsyncSession = Depends(get_db)
+):
+    """Resolve a time-limited share link and return the shared asset details.
+
+    Public endpoint (no auth) — access is gated by the per-share access code.
+    """
+    share_result = await db.execute(
+        select(AssetShare).where(
+            and_(
+                AssetShare.asset_id == asset_id,
+                AssetShare.access_code == code,
+                AssetShare.is_active == True
+            )
+        )
+    )
+    share = share_result.scalar_one_or_none()
+    if not share:
+        raise NotFoundException("Shared asset", str(asset_id))
+
+    # Enforce expiry
+    if share.expires_at is not None and share.expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail="This share link has expired")
+
+    asset_result = await db.execute(
+        select(Asset).where(Asset.id == asset_id)
+    )
+    asset = asset_result.scalar_one_or_none()
+    if not asset:
+        raise NotFoundException("Asset", str(asset_id))
+
+    return {
+        "data": {
+            "asset": AssetResponse.model_validate(asset),
+            "permissions": share.permissions or ["view"],
+            "expires_at": share.expires_at,
+        }
     }
 
 

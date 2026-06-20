@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c \"import app.models.compliance as c; from app.models.asset import EnumValueType; print\\('compliance import OK'\\); print\\('audit status col type:', type\\(c.ComplianceAudit.__table__.c.status.type\\).__name__\\); print\\('bind PENDING ->', c.ComplianceAudit.__table__.c.status.type.process_bind_param\\(c.AuditStatus.PENDING, None\\)\\)\")"
+      "Bash(python -c \"import app.models.compliance as c; from app.models.asset import EnumValueType; print\\('compliance import OK'\\); print\\('audit status col type:', type\\(c.ComplianceAudit.__table__.c.status.type\\).__name__\\); print\\('bind PENDING ->', c.ComplianceAudit.__table__.c.status.type.process_bind_param\\(c.AuditStatus.PENDING, None\\)\\)\")",
+      "Bash(cd /d/Fiver/Fullego_Backend && find . -type f -name \"*.py\" | grep -E \"\\(assets|appraisal\\)\" | head -20)",
+      "Read(//d/d/Fiver/**)"
     ]
   }
 }
