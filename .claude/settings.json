@@ -5,5 +5,20 @@
       "Bash(cd /d/Fiver/Fullego_Backend && find . -type f -name \"*.py\" | grep -E \"\\(assets|appraisal\\)\" | head -20)",
       "Read(//d/d/Fiver/**)"
     ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "bash",
+            "command": "python \"$CLAUDE_PROJECT_DIR/.claude/hooks/block-git-branch-push.py\"",
+            "statusMessage": "Checking git command policy"
+          }
+        ]
+      }
+    ]
   }
 }

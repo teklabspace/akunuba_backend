@@ -76,14 +76,17 @@ app = FastAPI(
 )
 
 # Rate limiting (slowapi) - 60/min default; auth routes use 5/min
+from app.core.rate_limit import limiter  # imported unconditionally so @limiter.exempt works
 if getattr(settings, "RATE_LIMIT_ENABLED", True):
     from slowapi import _rate_limit_exceeded_handler
     from slowapi.errors import RateLimitExceeded
-    from app.core.rate_limit import limiter
+    from slowapi.middleware import SlowAPIMiddleware
     app.state.limiter = limiter
-    # slowapi integrates via app.state.limiter + exception handler.
-    # Some slowapi versions don't expose limiter.init(app).
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    # SlowAPIMiddleware enforces the default 60/min on all otherwise-undecorated
+    # routes. Without it, only the explicitly @limiter.limit-decorated auth routes
+    # are throttled. Webhooks and health checks are exempted below.
+    app.add_middleware(SlowAPIMiddleware)
 
 
 class RequestTimingMiddleware(BaseHTTPMiddleware):
@@ -129,20 +132,10 @@ else:
     else:
         origins = [settings.CORS_ORIGINS] if settings.CORS_ORIGINS else []
     
-    # Always add localhost origins for development/testing even in production
-    localhost_origins = [
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://localhost:3001",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:3001",
-    ]
-    # Add localhost origins if not already present
-    for localhost_origin in localhost_origins:
-        if localhost_origin not in origins:
-            origins.append(localhost_origin)
-    
+    # Note: localhost origins are intentionally NOT added in production.
+    # Combined with allow_credentials=True they are a needless CORS surface;
+    # the development branch above already allows localhost for local work.
+
     # Add production frontend origins
     production_origins = [
         "https://akunuba.vercel.app",
@@ -310,6 +303,7 @@ async def general_exception_handler(request: Request, exc: Exception):
 
 
 @app.options("/{full_path:path}")
+@limiter.exempt
 async def options_handler(full_path: str, request: Request):
     """Handle CORS preflight requests (OPTIONS method)
     
@@ -351,6 +345,7 @@ async def options_handler(full_path: str, request: Request):
 
 
 @app.get("/")
+@limiter.exempt
 async def root():
     return {
         "message": "Fullego Backend API",
@@ -360,6 +355,7 @@ async def root():
 
 
 @app.get("/health")
+@limiter.exempt
 async def health_check():
     """Production health: status, version, DB/Redis checks, and metrics."""
     from app.core.metrics import get_metrics

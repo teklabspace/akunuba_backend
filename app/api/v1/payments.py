@@ -14,6 +14,7 @@ from app.integrations.stripe_client import StripeClient
 from app.core.exceptions import NotFoundException, BadRequestException
 from app.utils.logger import logger
 from app.utils.helpers import generate_reference_id
+from app.core.rate_limit import limiter
 from uuid import UUID
 from pydantic import BaseModel
 
@@ -111,6 +112,7 @@ async def create_payment_intent(
 
 
 @router.post("/webhook")
+@limiter.exempt
 async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     """Handle Stripe webhook events for payment status updates, subscription changes, and payment method updates"""
     payload = await request.body()

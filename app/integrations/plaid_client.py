@@ -70,6 +70,27 @@ class PlaidClient:
         return cls._instance
 
     @classmethod
+    def get_webhook_verification_key(cls, key_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch the JWK used to verify a Plaid webhook's Plaid-Verification JWT.
+
+        Returns the JWK dict (kty/crv/x/y/kid/...) or None if it can't be retrieved.
+        """
+        try:
+            from plaid.model.webhook_verification_key_get_request import (
+                WebhookVerificationKeyGetRequest,
+            )
+            client = cls.get_client()
+            if client is None:
+                return None
+            request = WebhookVerificationKeyGetRequest(key_id=key_id)
+            response = client.webhook_verification_key_get(request)
+            key = response.to_dict().get("key")
+            return dict(key) if key else None
+        except Exception as e:
+            logger.error(f"Failed to fetch Plaid webhook verification key {key_id}: {e}")
+            return None
+
+    @classmethod
     def create_link_token(cls, user_id: str, account_id: str) -> str:
         """
         Create a Plaid Link token for account linking.

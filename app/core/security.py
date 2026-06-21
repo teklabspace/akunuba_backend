@@ -4,7 +4,6 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from app.config import settings
 import secrets
-import random
 import bcrypt
 import logging
 
@@ -128,7 +127,8 @@ def decode_refresh_token(token: str) -> Optional[dict]:
 
 
 def generate_otp() -> str:
-    return f"{random.randint(100000, 999999)}"
+    # Use the cryptographically secure RNG (not `random`) for auth codes.
+    return f"{secrets.randbelow(900000) + 100000}"
 
 
 def generate_verification_token() -> str:

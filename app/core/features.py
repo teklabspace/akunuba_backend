@@ -116,6 +116,19 @@ FEATURE_LIMITS: Dict[SubscriptionPlan, Dict[str, Optional[int]]] = {
 }
 
 
+# Per-plan document storage limit in bytes. Adjust values to match product/billing.
+STORAGE_LIMITS: Dict[SubscriptionPlan, Optional[int]] = {
+    SubscriptionPlan.FREE: 100 * 1024 * 1024,        # 100 MB
+    SubscriptionPlan.MONTHLY: 1 * 1024 * 1024 * 1024,  # 1 GB
+    SubscriptionPlan.ANNUAL: 10 * 1024 * 1024 * 1024,  # 10 GB
+}
+
+
+def get_storage_limit(plan: SubscriptionPlan) -> Optional[int]:
+    """Document storage limit (bytes) for a plan. None means unlimited."""
+    return STORAGE_LIMITS.get(plan, STORAGE_LIMITS[SubscriptionPlan.FREE])
+
+
 def get_plan_features(plan: SubscriptionPlan) -> list:
     return PLAN_FEATURES.get(plan, [])
 

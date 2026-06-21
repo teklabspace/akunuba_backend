@@ -5,7 +5,9 @@ from sqlalchemy import select, or_, func
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
 from app.database import get_db
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, get_user_subscription_plan
+from app.core.features import get_storage_limit
+from app.models.payment import SubscriptionPlan
 from app.models.user import User
 from app.models.account import Account
 from app.models.document import Document, DocumentType
@@ -116,8 +118,47 @@ async def list_documents(
     
     result = await db.execute(query.order_by(Document.created_at.desc()))
     documents = result.scalars().all()
-    
+
     return documents
+
+
+# IMPORTANT: declare this static route BEFORE the dynamic "/{document_id}" route.
+# FastAPI matches in declaration order; otherwise "statistics" is captured by
+# /{document_id} and 422s trying to parse it as a UUID.
+@router.get("/statistics")
+async def get_document_statistics(
+    plan: SubscriptionPlan = Depends(get_user_subscription_plan),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Document statistics for the current user's account.
+
+    Returns snake_case fields the frontend expects:
+    { total_documents, storage_used, storage_limit, last_uploaded }
+    """
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+
+    stats_result = await db.execute(
+        select(
+            func.count(Document.id),
+            func.coalesce(func.sum(Document.file_size), 0),
+            func.max(Document.created_at),
+        ).where(Document.account_id == account.id)
+    )
+    total_documents, storage_used, last_uploaded = stats_result.one()
+
+    return {
+        "total_documents": total_documents or 0,
+        "storage_used": int(storage_used or 0),
+        "storage_limit": get_storage_limit(plan),
+        "last_uploaded": last_uploaded,
+    }
 
 
 @router.get("/{document_id}/download")

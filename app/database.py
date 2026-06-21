@@ -62,7 +62,8 @@ if "supabase" in clean_url.lower() or "pooler" in clean_url.lower():
     # Use SSL context with certificate verification disabled
     # Supabase pooler sometimes has certificate chain issues
     connect_args["ssl"] = ssl_context  # Use SSL context with CERT_NONE
-    logger.info(f"SSL enabled (no cert verification) for database connection to: {parsed.netloc}")
+    # Log host only — parsed.netloc contains the user:password credentials.
+    logger.info(f"SSL enabled (no cert verification) for database connection to: {parsed.hostname}")
     logger.info(f"Prepared statements disabled for pgbouncer transaction mode")
 
 # Use NullPool for pgbouncer transaction mode to avoid connection pooling issues
