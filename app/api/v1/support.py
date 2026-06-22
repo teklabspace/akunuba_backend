@@ -75,8 +75,23 @@ async def create_ticket(
     db.add(ticket)
     await db.commit()
     await db.refresh(ticket)
-    
+
     logger.info(f"Support ticket created: {ticket.id}")
+
+    # Notify admins of the new ticket
+    try:
+        from app.services.notification_service import NotificationService
+        from app.models.notification import NotificationType
+        await NotificationService.notify_admins(
+            db=db,
+            notification_type=NotificationType.GENERAL,
+            title="New Support Ticket",
+            message=f"New ticket: {ticket.subject}",
+            metadata=f'{{"ticket_id": "{ticket.id}", "event": "ticket_created"}}',
+        )
+    except Exception as e:
+        logger.error(f"Failed to notify admins of new ticket {ticket.id}: {e}")
+
     return ticket
 
 
@@ -139,21 +154,33 @@ async def get_ticket(
     return ticket
 
 
+class TicketUpdateRequest(BaseModel):
+    status: Optional[TicketStatus] = None
+    priority: Optional[TicketPriority] = None
+    assigned_to: Optional[UUID] = None
+
+
 @router.put("/tickets/{ticket_id}")
 async def update_ticket(
     ticket_id: UUID,
-    status: Optional[TicketStatus] = None,
-    priority: Optional[TicketPriority] = None,
-    assigned_to: Optional[UUID] = None,
+    update_data: TicketUpdateRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Update a support ticket"""
+    """Update a support ticket.
+
+    Accepts a JSON body, e.g. ``{"priority": "high"}`` to escalate,
+    ``{"status": "resolved"}`` to close out, or ``{"assigned_to": "<uuid>"}``.
+    """
+    status = update_data.status
+    priority = update_data.priority
+    assigned_to = update_data.assigned_to
+
     result = await db.execute(
         select(SupportTicket).where(SupportTicket.id == ticket_id)
     )
     ticket = result.scalar_one_or_none()
-    
+
     if not ticket:
         raise NotFoundException("Ticket", str(ticket_id))
     

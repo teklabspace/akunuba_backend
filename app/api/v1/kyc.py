@@ -383,7 +383,21 @@ async def submit_kyc(
         kyc.status = KYCStatus.PENDING_REVIEW
         kyc.persona_response = persona_response
         await db.commit()
-        
+
+        # Notify admins that a KYC submission is awaiting review
+        try:
+            from app.services.notification_service import NotificationService
+            from app.models.notification import NotificationType
+            await NotificationService.notify_admins(
+                db=db,
+                notification_type=NotificationType.GENERAL,
+                title="New KYC Submission",
+                message=f"A KYC verification was submitted for review by {current_user.email}.",
+                metadata=f'{{"account_id": "{account.id}", "event": "kyc_submitted"}}',
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify admins of KYC submission for account {account.id}: {e}")
+
         return {"message": "KYC submitted successfully", "status": "pending_review"}
     except httpx.HTTPStatusError as e:
         error_msg = str(e)

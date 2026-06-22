@@ -42,6 +42,61 @@ class NotificationService:
         return notification
     
     @staticmethod
+    async def notify_admins(
+        db: AsyncSession,
+        notification_type: NotificationType,
+        title: str,
+        message: str,
+        metadata: str = None,
+        send_email: bool = False,
+    ) -> int:
+        """Create a notification for every admin user's account.
+
+        Used for platform events that admins need to act on (new support
+        tickets, disputes, KYC submissions, etc.). Notifications are scoped by
+        ``account_id``, so this fans the event out to each admin's account.
+
+        Returns the number of notifications created. Admins without an Account
+        record are skipped (they cannot view notifications anyway).
+        """
+        from app.core.permissions import Role
+
+        result = await db.execute(
+            select(Account)
+            .join(User, Account.user_id == User.id)
+            .where(User.role == Role.ADMIN)
+        )
+        accounts = result.scalars().all()
+
+        created = []
+        for account in accounts:
+            notification = Notification(
+                account_id=account.id,
+                notification_type=notification_type,
+                title=title,
+                message=message,
+                meta_data=metadata,
+            )
+            db.add(notification)
+            created.append(notification)
+
+        if not created:
+            logger.warning(f"notify_admins: no admin accounts found for '{title}'")
+            return 0
+
+        await db.commit()
+        for notification in created:
+            await db.refresh(notification)
+
+        logger.info(f"notify_admins: created {len(created)} admin notification(s) for '{title}'")
+
+        if send_email:
+            for notification in created:
+                await NotificationService._send_notification_email(db, notification)
+
+        return len(created)
+
+    @staticmethod
     async def _send_notification_email(db: AsyncSession, notification: Notification):
         """Send email for a notification"""
         try:

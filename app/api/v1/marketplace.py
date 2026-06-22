@@ -963,8 +963,23 @@ async def create_dispute(
     escrow.status = EscrowStatus.DISPUTED
     # Store dispute reason in metadata if available
     await db.commit()
-    
+
     logger.info(f"Escrow dispute created: {escrow_id}")
+
+    # Notify admins of the new dispute
+    try:
+        from app.services.notification_service import NotificationService
+        from app.models.notification import NotificationType
+        await NotificationService.notify_admins(
+            db=db,
+            notification_type=NotificationType.GENERAL,
+            title="New Dispute Filed",
+            message=f"A dispute was filed on escrow {escrow_id}." + (f" Reason: {reason}" if reason else ""),
+            metadata=f'{{"escrow_id": "{escrow_id}", "event": "dispute_created"}}',
+        )
+    except Exception as e:
+        logger.error(f"Failed to notify admins of dispute {escrow_id}: {e}")
+
     return {"message": "Dispute created successfully", "reason": reason}
 
 
