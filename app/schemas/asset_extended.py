@@ -5,7 +5,7 @@ from uuid import UUID
 from decimal import Decimal
 from app.models.asset import (
     CategoryGroup, AppraisalType, AppraisalStatus, SaleRequestStatus,
-    TransferStatus, TransferType, ReportType
+    TransferStatus, TransferType, ReportType, AIReviewStatus
 )
 
 
@@ -91,6 +91,44 @@ class AppraisalResponse(BaseModel):
 
 class AppraisalListResponse(BaseModel):
     data: List[AppraisalResponse]
+
+
+# AI Appraisal & Review Schemas
+class AutomatedAppraisalResult(BaseModel):
+    estimated_value: Decimal
+    value_range_low: Decimal
+    value_range_high: Decimal
+    currency: str
+    confidence: str
+    reasoning: str
+    disclaimer: str
+    model: str
+
+
+class AIReviewResponse(BaseModel):
+    id: UUID
+    asset_id: UUID
+    decision: AIReviewStatus
+    reason: Optional[str] = None
+    flags: Optional[List[str]] = None
+    model: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AIUsageItem(BaseModel):
+    limit: Optional[int] = None  # None = unlimited
+    used: int
+    remaining: Optional[int] = None  # None = unlimited
+
+
+class AIUsageResponse(BaseModel):
+    plan: str
+    period: str  # e.g. "2026-06"
+    ai_appraisals: AIUsageItem
+    ai_reviews: AIUsageItem
 
 
 # Sale Request Schemas

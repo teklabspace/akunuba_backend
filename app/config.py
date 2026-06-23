@@ -125,6 +125,13 @@ class Settings(BaseSettings):
     
     # Rate limiting (optional overrides)
     RATE_LIMIT_ENABLED: bool = True
+
+    # Anthropic (Claude) AI configuration — powers automated appraisals and AI asset review
+    ANTHROPIC_API_KEY: str = ""
+    AI_MODEL: str = "claude-opus-4-8"
+    # Master switch. When false (or no API key configured) the AI endpoints return a
+    # clean 503 instead of attempting a call.
+    AI_FEATURES_ENABLED: bool = True
     
     class Config:
         env_file = ".env"

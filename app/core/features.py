@@ -96,6 +96,9 @@ FEATURE_LIMITS: Dict[SubscriptionPlan, Dict[str, Optional[int]]] = {
         "offers": 3,
         "trades": 0,
         "support_tickets": 1,
+        # AI usage caps (per calendar month). None = unlimited.
+        "ai_appraisals_per_month": 3,
+        "ai_reviews_per_month": 3,
     },
     SubscriptionPlan.MONTHLY: {
         "assets": 20,
@@ -104,6 +107,8 @@ FEATURE_LIMITS: Dict[SubscriptionPlan, Dict[str, Optional[int]]] = {
         "offers": 20,
         "trades": 0,
         "support_tickets": None,
+        "ai_appraisals_per_month": 25,
+        "ai_reviews_per_month": 25,
     },
     SubscriptionPlan.ANNUAL: {
         "assets": 100,
@@ -112,6 +117,8 @@ FEATURE_LIMITS: Dict[SubscriptionPlan, Dict[str, Optional[int]]] = {
         "offers": None,
         "trades": None,
         "support_tickets": None,
+        "ai_appraisals_per_month": None,
+        "ai_reviews_per_month": None,
     },
 }
 

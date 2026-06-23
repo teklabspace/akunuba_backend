@@ -11,8 +11,8 @@ from app.models.user import User
 from app.models.account import Account
 from app.models.asset import (
     Asset, AssetType, AssetValuation, AssetOwnership, AssetCategory, AssetPhoto,
-    AssetDocument, AssetAppraisal, AssetSaleRequest, AssetTransfer, AssetShare,
-    AssetReport, CategoryGroup, AppraisalType, AppraisalStatus, SaleRequestStatus,
+    AssetDocument, AssetAppraisal, AssetAIReview, AssetSaleRequest, AssetTransfer, AssetShare,
+    AssetReport, CategoryGroup, AppraisalType, AppraisalStatus, AIReviewStatus, SaleRequestStatus,
     TransferStatus, TransferType, ReportType, AssetStatus, OwnershipType, Condition, ValuationType
 )
 from app.schemas.asset import AssetCreate, AssetUpdate, AssetResponse
@@ -22,12 +22,14 @@ from app.schemas.asset_extended import (
     AppraisalListResponse, SaleRequestCreate, SaleRequestResponse, SaleRequestListResponse,
     TransferRequest, TransferResponse, ShareRequest, ShareResponse, ReportRequest,
     ReportResponse, ValueHistoryResponse, ValueHistoryItem, AssetsSummaryResponse,
-    ValueTrendsResponse, ValueTrendItem, ValuationUpdate
+    ValueTrendsResponse, ValueTrendItem, ValuationUpdate,
+    AutomatedAppraisalResult, AIReviewResponse, AIUsageItem, AIUsageResponse
 )
 from app.schemas.common import PaginatedResponse
 from app.core.exceptions import NotFoundException, BadRequestException, ForbiddenException
 from app.api.deps import get_account, get_user_subscription_plan
 from app.core.features import get_limit, check_usage_limit
+from app.services import ai_appraisal_service
 from app.utils.logger import logger
 from app.integrations.supabase_client import SupabaseClient
 from app.config import settings
@@ -1968,16 +1970,80 @@ async def get_asset_value_history(
 
 # ==================== APPRAISALS ====================
 
-@router.post("/{asset_id}/appraisals", response_model=Dict[str, AppraisalResponse], status_code=status.HTTP_201_CREATED)
+def _current_month_period() -> str:
+    """Current calendar month as 'YYYY-MM' (UTC)."""
+    now = datetime.now(timezone.utc)
+    return f"{now.year:04d}-{now.month:02d}"
+
+
+def _current_month_start() -> datetime:
+    """First instant of the current calendar month (UTC)."""
+    now = datetime.now(timezone.utc)
+    return datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+
+
+async def _count_ai_appraisals_this_month(db: AsyncSession, account_id) -> int:
+    """Number of automated (AI) appraisals this account has run this month."""
+    result = await db.execute(
+        select(func.count(AssetAppraisal.id))
+        .join(Asset, AssetAppraisal.asset_id == Asset.id)
+        .where(
+            Asset.account_id == account_id,
+            AssetAppraisal.appraisal_type == AppraisalType.API,
+            AssetAppraisal.requested_at >= _current_month_start(),
+        )
+    )
+    return result.scalar() or 0
+
+
+async def _count_ai_reviews_this_month(db: AsyncSession, account_id) -> int:
+    """Number of AI asset reviews this account has run this month."""
+    result = await db.execute(
+        select(func.count(AssetAIReview.id))
+        .join(Asset, AssetAIReview.asset_id == Asset.id)
+        .where(
+            Asset.account_id == account_id,
+            AssetAIReview.created_at >= _current_month_start(),
+        )
+    )
+    return result.scalar() or 0
+
+
+def _build_asset_context(asset: Asset) -> Dict[str, Any]:
+    """Flatten an asset's valuation-relevant fields for an AI prompt."""
+    return {
+        "name": asset.name,
+        "asset_type": asset.asset_type.value if asset.asset_type else None,
+        "category_group": asset.category_group.value if asset.category_group else None,
+        "description": asset.description,
+        "location": asset.location,
+        "current_value": float(asset.current_value) if asset.current_value is not None else None,
+        "estimated_value": float(asset.estimated_value) if asset.estimated_value is not None else None,
+        "currency": asset.currency,
+        "condition": asset.condition.value if asset.condition else None,
+        "purchase_price": float(asset.purchase_price) if asset.purchase_price is not None else None,
+        "acquisition_date": asset.acquisition_date.isoformat() if asset.acquisition_date else None,
+        "specifications": asset.specifications,
+    }
+
+
+@router.post("/{asset_id}/appraisals", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
 async def request_asset_appraisal(
     asset_id: UUID,
     appraisal_data: AppraisalRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Request an appraisal for an asset"""
+    """
+    Request an appraisal for an asset.
+
+    - appraisal_type == "API" (Automated Appraisal): an instant AI-generated value
+      estimate. Completes immediately and returns an `ai_result` with a disclaimer.
+    - any other type (e.g. "Concierge"): a human appraisal request, created as
+      PENDING for the concierge workflow (unchanged behaviour).
+    """
     account = await get_account(current_user=current_user, db=db)
-    
+
     # Verify asset belongs to account
     asset_result = await db.execute(
         select(Asset).where(and_(Asset.id == asset_id, Asset.account_id == account.id))
@@ -1985,8 +2051,60 @@ async def request_asset_appraisal(
     asset = asset_result.scalar_one_or_none()
     if not asset:
         raise NotFoundException("Asset", str(asset_id))
-    
-    # Create appraisal request
+
+    # ---- Automated (AI) appraisal: instant estimate, no human in the loop ----
+    if appraisal_data.appraisal_type == AppraisalType.API:
+        # Enforce per-plan monthly AI usage limit (admins exempt)
+        if current_user.role.value != "admin":
+            plan = await get_user_subscription_plan(account=account, db=db)
+            used = await _count_ai_appraisals_this_month(db, account.id)
+            if not check_usage_limit(plan, "ai_appraisals_per_month", used):
+                limit = get_limit(plan, "ai_appraisals_per_month")
+                raise ForbiddenException(
+                    f"Automated appraisal limit reached ({limit}/month for your plan). Upgrade for more."
+                )
+
+        ai_result = await ai_appraisal_service.generate_automated_appraisal(
+            _build_asset_context(asset)
+        )
+
+        estimated_value = Decimal(str(ai_result["estimated_value"]))
+        now = datetime.now(timezone.utc)
+
+        appraisal = AssetAppraisal(
+            asset_id=asset.id,
+            appraisal_type=AppraisalType.API,
+            status=AppraisalStatus.COMPLETED,
+            notes=ai_result["reasoning"],
+            estimated_value=estimated_value,
+            completed_at=now,
+        )
+        db.add(appraisal)
+
+        # Record a valuation entry and update the asset's estimate
+        valuation = AssetValuation(
+            asset_id=asset.id,
+            value=estimated_value,
+            currency=ai_result.get("currency") or asset.currency,
+            valuation_method=ValuationType.AUTOMATED.value,
+            notes=ai_result["reasoning"],
+        )
+        db.add(valuation)
+
+        asset.estimated_value = estimated_value
+        asset.valuation_type = ValuationType.AUTOMATED
+        asset.last_appraisal_date = now
+
+        await db.commit()
+        await db.refresh(appraisal)
+
+        logger.info(f"Automated appraisal generated for asset {asset_id}: {appraisal.id}")
+        return {
+            "data": AppraisalResponse.model_validate(appraisal),
+            "ai_result": AutomatedAppraisalResult(**ai_result),
+        }
+
+    # ---- Concierge / other types: human appraisal request (PENDING) ----
     appraisal = AssetAppraisal(
         asset_id=asset.id,
         appraisal_type=appraisal_data.appraisal_type,
@@ -1994,11 +2112,11 @@ async def request_asset_appraisal(
         notes=appraisal_data.notes,
         estimated_completion_date=appraisal_data.preferred_date
     )
-    
+
     db.add(appraisal)
     await db.commit()
     await db.refresh(appraisal)
-    
+
     logger.info(f"Appraisal requested for asset {asset_id}: {appraisal.id}")
     return {"data": AppraisalResponse.model_validate(appraisal)}
 
@@ -2056,8 +2174,134 @@ async def get_appraisal_status(
     appraisal = appraisal_result.scalar_one_or_none()
     if not appraisal:
         raise NotFoundException("Appraisal", str(appraisal_id))
-    
+
     return {"data": AppraisalResponse.model_validate(appraisal)}
+
+
+# ==================== AI ASSET REVIEW ====================
+
+@router.post("/{asset_id}/ai-review", response_model=Dict[str, AIReviewResponse], status_code=status.HTTP_201_CREATED)
+async def run_ai_asset_review(
+    asset_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Run an AI review of an asset and its supporting documents.
+
+    Returns an advisory accept/reject decision (approved / rejected / needs_review).
+    The decision is recorded on the asset but is advisory only — it does not hide
+    or block the asset by itself.
+    """
+    account = await get_account(current_user=current_user, db=db)
+
+    # Verify asset belongs to account
+    asset_result = await db.execute(
+        select(Asset).where(and_(Asset.id == asset_id, Asset.account_id == account.id))
+    )
+    asset = asset_result.scalar_one_or_none()
+    if not asset:
+        raise NotFoundException("Asset", str(asset_id))
+
+    # Enforce per-plan monthly AI usage limit (admins exempt)
+    if current_user.role.value != "admin":
+        plan = await get_user_subscription_plan(account=account, db=db)
+        used = await _count_ai_reviews_this_month(db, account.id)
+        if not check_usage_limit(plan, "ai_reviews_per_month", used):
+            limit = get_limit(plan, "ai_reviews_per_month")
+            raise ForbiddenException(
+                f"AI review limit reached ({limit}/month for your plan). Upgrade for more."
+            )
+
+    # Gather supporting documents for context
+    docs_result = await db.execute(
+        select(AssetDocument).where(AssetDocument.asset_id == asset_id)
+    )
+    documents = [
+        {"name": d.name, "document_type": d.document_type, "file_name": d.file_name}
+        for d in docs_result.scalars().all()
+    ]
+
+    ai_result = await ai_appraisal_service.review_asset(_build_asset_context(asset), documents)
+
+    decision = AIReviewStatus(ai_result["decision"])
+    review = AssetAIReview(
+        asset_id=asset.id,
+        decision=decision,
+        reason=ai_result.get("reason"),
+        flags=ai_result.get("flags") or [],
+        model=ai_result.get("model"),
+    )
+    db.add(review)
+
+    # Update the asset's current advisory verdict
+    asset.ai_review_status = decision
+    asset.ai_reviewed_at = datetime.now(timezone.utc)
+
+    await db.commit()
+    await db.refresh(review)
+
+    logger.info(f"AI review for asset {asset_id}: {decision.value} ({review.id})")
+    return {"data": AIReviewResponse.model_validate(review)}
+
+
+@router.get("/{asset_id}/ai-review", response_model=Dict[str, Optional[AIReviewResponse]])
+async def get_latest_ai_review(
+    asset_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get the latest AI review for an asset (null if none has been run)."""
+    account = await get_account(current_user=current_user, db=db)
+
+    # Verify asset belongs to account
+    asset_result = await db.execute(
+        select(Asset).where(and_(Asset.id == asset_id, Asset.account_id == account.id))
+    )
+    asset = asset_result.scalar_one_or_none()
+    if not asset:
+        raise NotFoundException("Asset", str(asset_id))
+
+    review_result = await db.execute(
+        select(AssetAIReview)
+        .where(AssetAIReview.asset_id == asset_id)
+        .order_by(desc(AssetAIReview.created_at))
+        .limit(1)
+    )
+    review = review_result.scalar_one_or_none()
+    return {"data": AIReviewResponse.model_validate(review) if review else None}
+
+
+@router.get("/ai/usage", response_model=AIUsageResponse)
+async def get_ai_usage(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Show the caller's AI usage and remaining quota for the current month."""
+    account = await get_account(current_user=current_user, db=db)
+    plan = await get_user_subscription_plan(account=account, db=db)
+
+    appraisals_used = await _count_ai_appraisals_this_month(db, account.id)
+    reviews_used = await _count_ai_reviews_this_month(db, account.id)
+
+    appraisals_limit = get_limit(plan, "ai_appraisals_per_month")
+    reviews_limit = get_limit(plan, "ai_reviews_per_month")
+
+    def _remaining(limit: Optional[int], used: int) -> Optional[int]:
+        if limit is None:
+            return None  # unlimited
+        return max(0, limit - used)
+
+    return AIUsageResponse(
+        plan=plan.value,
+        period=_current_month_period(),
+        ai_appraisals=AIUsageItem(
+            limit=appraisals_limit, used=appraisals_used, remaining=_remaining(appraisals_limit, appraisals_used)
+        ),
+        ai_reviews=AIUsageItem(
+            limit=reviews_limit, used=reviews_used, remaining=_remaining(reviews_limit, reviews_used)
+        ),
+    )
 
 
 @router.patch("/{asset_id}/valuation", response_model=AssetResponse)

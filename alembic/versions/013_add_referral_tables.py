@@ -21,7 +21,7 @@ def upgrade() -> None:
         "completed",
         "cancelled",
         name="referralstatus",
-        create_type=True,
+        create_type=False,  # created explicitly below; prevents create_table from re-creating it
     )
     referral_status.create(op.get_bind(), checkfirst=True)
 

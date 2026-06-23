@@ -53,3 +53,11 @@ class BadRequestException(FullegoException):
             detail=detail
         )
 
+
+class ServiceUnavailableException(FullegoException):
+    def __init__(self, detail: str = "Service temporarily unavailable"):
+        super().__init__(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=detail
+        )
+

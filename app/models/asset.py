@@ -105,6 +105,23 @@ class Condition(str, Enum):
 class ValuationType(str, Enum):
     MANUAL = "manual"
     APPRAISAL = "appraisal"
+    AUTOMATED = "automated"  # AI-generated estimate (not a certified appraisal)
+
+
+class AIReviewStatus(str, Enum):
+    NOT_REVIEWED = "not_reviewed"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    NEEDS_REVIEW = "needs_review"
+
+    @classmethod
+    def _missing_(cls, value):
+        """Accept values regardless of casing."""
+        if isinstance(value, str):
+            for member in cls:
+                if member.value.lower() == value.lower():
+                    return member
+        return None
 
 
 # Custom TypeDecorator to ensure enum values (not names) are stored in database
@@ -260,7 +277,11 @@ class Asset(Base):
     
     # Valuation
     valuation_type = Column(EnumValueType(ValuationType, length=50), default=ValuationType.MANUAL)
-    
+
+    # AI review (advisory) — current verdict from the latest AssetAIReview row
+    ai_review_status = Column(EnumValueType(AIReviewStatus, length=50), default=AIReviewStatus.NOT_REVIEWED, nullable=False)
+    ai_reviewed_at = Column(DateTime(timezone=True))
+
     # Additional metadata
     meta_data = Column("metadata", JSONB)
     
@@ -279,6 +300,7 @@ class Asset(Base):
     transfers = relationship("AssetTransfer", back_populates="asset", cascade="all, delete-orphan")
     shares = relationship("AssetShare", back_populates="asset", cascade="all, delete-orphan")
     reports = relationship("AssetReport", back_populates="asset", cascade="all, delete-orphan")
+    ai_reviews = relationship("AssetAIReview", back_populates="asset", cascade="all, delete-orphan", order_by="desc(AssetAIReview.created_at)")
 
 
 class AssetValuation(Base):
@@ -379,6 +401,20 @@ class AssetAppraisal(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     asset = relationship("Asset", back_populates="appraisals")
+
+
+class AssetAIReview(Base):
+    __tablename__ = "asset_ai_reviews"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    asset_id = Column(UUID(as_uuid=True), ForeignKey("assets.id"), nullable=False)
+    decision = Column(EnumValueType(AIReviewStatus, length=50), nullable=False)
+    reason = Column(Text)
+    flags = Column(JSONB)  # Array of issue/observation strings from the AI
+    model = Column(String(100))  # AI model used, e.g. "claude-opus-4-8"
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    asset = relationship("Asset", back_populates="ai_reviews")
 
 
 class AssetSaleRequest(Base):
