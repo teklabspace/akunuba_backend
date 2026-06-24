@@ -19,12 +19,14 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+*.whl
 
 # Virtual Environment
 venv/
 env/
 ENV/
 .venv
+.tmp_pip/
 
 # IDE
 .vscode/
@@ -32,13 +34,11 @@ ENV/
 *.swp
 *.swo
 *~
-.DS_Store
 
 # Environment variables
 .env
 .env.local
 .env.*.local
-.env.example
 
 # Database
 *.db
@@ -47,10 +47,6 @@ ENV/
 # Logs
 *.log
 logs/
-
-# Docs / scripts
-*.md
-*.bat
 
 # Testing
 .pytest_cache/
@@ -63,4 +59,28 @@ alembic/versions/*.pyc
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# Binary / document files
+*.docx
+*.xlsx
+*.pdf
+*.pptx
+
+# Stray files
+2.0.30
+python
+
+# Local dev / one-time utility scripts (keep on disk, never commit)
+test_supabase.py
+test_db_connection.py
+test_storage_connection.py
+setup_db.py
+add_kyb_columns_direct.py
+verify_2fa_installation.py
+INSTALL_2FA.sh
+INSTALL_2FA.bat
+reset_supabase_db_auto.py
+reset_supabase_db.ps1
+server_status.py
 

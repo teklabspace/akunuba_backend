@@ -51,6 +51,10 @@ class AppraisalStatus(str, Enum):
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
+    AI_APPRAISED = "ai_appraised"
+    NEEDS_MORE_INFORMATION = "needs_more_information"
+    PROFESSIONAL_APPRAISAL_RECOMMENDED = "professional_appraisal_recommended"
+    APPRAISAL_FAILED = "appraisal_failed"
 
 
 class SaleRequestStatus(str, Enum):
@@ -397,6 +401,7 @@ class AssetAppraisal(Base):
     report_url = Column(String(500))
     estimated_value = Column(Numeric(20, 2))
     notes = Column(Text)
+    ai_data = Column(JSONB)  # Extended AI appraisal result (all 9 Section 10 fields)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

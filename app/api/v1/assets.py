@@ -2013,6 +2013,7 @@ def _build_asset_context(asset: Asset) -> Dict[str, Any]:
     """Flatten an asset's valuation-relevant fields for an AI prompt."""
     return {
         "name": asset.name,
+        "category_name": asset.category.name if asset.category else None,
         "asset_type": asset.asset_type.value if asset.asset_type else None,
         "category_group": asset.category_group.value if asset.category_group else None,
         "description": asset.description,
@@ -2044,9 +2045,11 @@ async def request_asset_appraisal(
     """
     account = await get_account(current_user=current_user, db=db)
 
-    # Verify asset belongs to account
+    # Verify asset belongs to account, eagerly loading category for type-specific AI prompts
     asset_result = await db.execute(
-        select(Asset).where(and_(Asset.id == asset_id, Asset.account_id == account.id))
+        select(Asset)
+        .options(selectinload(Asset.category))
+        .where(and_(Asset.id == asset_id, Asset.account_id == account.id))
     )
     asset = asset_result.scalar_one_or_none()
     if not asset:
@@ -2064,30 +2067,74 @@ async def request_asset_appraisal(
                     f"Automated appraisal limit reached ({limit}/month for your plan). Upgrade for more."
                 )
 
-        ai_result = await ai_appraisal_service.generate_automated_appraisal(
-            _build_asset_context(asset)
-        )
+        now = datetime.now(timezone.utc)
+        appraisal_status = AppraisalStatus.APPRAISAL_FAILED
+        ai_result = None
+
+        try:
+            ai_result = await ai_appraisal_service.generate_automated_appraisal(
+                _build_asset_context(asset)
+            )
+
+            # Determine status based on AI analysis (Option A: always return estimate)
+            if ai_result.get("professional_appraisal_needed"):
+                appraisal_status = AppraisalStatus.PROFESSIONAL_APPRAISAL_RECOMMENDED
+            elif ai_result.get("missing_information"):
+                appraisal_status = AppraisalStatus.NEEDS_MORE_INFORMATION
+            else:
+                appraisal_status = AppraisalStatus.AI_APPRAISED
+
+        except Exception as exc:
+            logger.error(f"AI appraisal failed for asset {asset_id}: {exc}")
+            appraisal = AssetAppraisal(
+                asset_id=asset.id,
+                appraisal_type=AppraisalType.API,
+                status=AppraisalStatus.APPRAISAL_FAILED,
+                notes=str(exc),
+                completed_at=now,
+            )
+            db.add(appraisal)
+            await db.commit()
+            await db.refresh(appraisal)
+            raise
 
         estimated_value = Decimal(str(ai_result["estimated_value"]))
-        now = datetime.now(timezone.utc)
+
+        # Build serialisable ai_data dict (exclude non-JSON-safe keys already stored elsewhere)
+        ai_data_store = {
+            "confidence": ai_result.get("confidence"),
+            "appraisal_summary": ai_result.get("appraisal_summary"),
+            "key_value_drivers": ai_result.get("key_value_drivers", []),
+            "risk_factors": ai_result.get("risk_factors", []),
+            "missing_information": ai_result.get("missing_information", []),
+            "recommended_documents": ai_result.get("recommended_documents", []),
+            "suggested_next_step": ai_result.get("suggested_next_step"),
+            "professional_appraisal_needed": ai_result.get("professional_appraisal_needed", False),
+            "value_range_low": float(ai_result.get("value_range_low", 0)),
+            "value_range_high": float(ai_result.get("value_range_high", 0)),
+            "currency": ai_result.get("currency"),
+            "model": ai_result.get("model"),
+            "disclaimer": ai_result.get("disclaimer"),
+        }
 
         appraisal = AssetAppraisal(
             asset_id=asset.id,
             appraisal_type=AppraisalType.API,
-            status=AppraisalStatus.COMPLETED,
-            notes=ai_result["reasoning"],
+            status=appraisal_status,
+            notes=ai_result.get("appraisal_summary"),
             estimated_value=estimated_value,
             completed_at=now,
+            ai_data=ai_data_store,
         )
         db.add(appraisal)
 
-        # Record a valuation entry and update the asset's estimate
+        # Record valuation history and update asset estimate
         valuation = AssetValuation(
             asset_id=asset.id,
             value=estimated_value,
             currency=ai_result.get("currency") or asset.currency,
             valuation_method=ValuationType.AUTOMATED.value,
-            notes=ai_result["reasoning"],
+            notes=ai_result.get("appraisal_summary"),
         )
         db.add(valuation)
 
@@ -2098,7 +2145,10 @@ async def request_asset_appraisal(
         await db.commit()
         await db.refresh(appraisal)
 
-        logger.info(f"Automated appraisal generated for asset {asset_id}: {appraisal.id}")
+        logger.info(
+            f"AI appraisal generated for asset {asset_id}: {appraisal.id} "
+            f"status={appraisal_status.value} confidence={ai_result.get('confidence')}"
+        )
         return {
             "data": AppraisalResponse.model_validate(appraisal),
             "ai_result": AutomatedAppraisalResult(**ai_result),

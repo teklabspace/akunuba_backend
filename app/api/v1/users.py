@@ -344,6 +344,7 @@ async def get_user_stats(
 
 # ==================== NOTIFICATION PREFERENCES ====================
 
+@router.get("/me/notifications", response_model=NotificationPreferencesResponse, include_in_schema=False)
 @router.get("/notifications", response_model=NotificationPreferencesResponse)
 async def get_notification_preferences(
     current_user: User = Depends(get_current_user),
@@ -376,6 +377,7 @@ async def get_notification_preferences(
     )
 
 
+@router.put("/me/notifications", response_model=NotificationPreferencesResponse, include_in_schema=False)
 @router.put("/notifications", response_model=NotificationPreferencesResponse)
 async def update_notification_preferences(
     preferences_data: NotificationPreferencesUpdate,
@@ -416,6 +418,7 @@ async def update_notification_preferences(
 
 # ==================== PRIVACY PREFERENCES ====================
 
+@router.get("/me/privacy", response_model=PrivacyPreferencesResponse, include_in_schema=False)
 @router.get("/privacy", response_model=PrivacyPreferencesResponse)
 async def get_privacy_preferences(
     current_user: User = Depends(get_current_user),
@@ -446,6 +449,7 @@ async def get_privacy_preferences(
     )
 
 
+@router.put("/me/privacy", response_model=PrivacyPreferencesResponse, include_in_schema=False)
 @router.put("/privacy", response_model=PrivacyPreferencesResponse)
 async def update_privacy_preferences(
     preferences_data: PrivacyPreferencesUpdate,
@@ -483,6 +487,7 @@ async def update_privacy_preferences(
 
 # ==================== TWO-FACTOR AUTHENTICATION ====================
 
+@router.get("/me/two-factor-auth/status", response_model=TwoFactorAuthStatusResponse, include_in_schema=False)
 @router.get("/two-factor-auth/status", response_model=TwoFactorAuthStatusResponse)
 async def get_2fa_status(
     current_user: User = Depends(get_current_user),
@@ -496,6 +501,7 @@ async def get_2fa_status(
     )
 
 
+@router.post("/me/two-factor-auth/setup", response_model=TwoFactorAuthSetupResponse, include_in_schema=False)
 @router.post("/two-factor-auth/setup", response_model=TwoFactorAuthSetupResponse)
 async def setup_2fa(
     current_user: User = Depends(get_current_user),
@@ -551,6 +557,7 @@ async def setup_2fa(
     )
 
 
+@router.post("/me/two-factor-auth/verify", response_model=Dict[str, Any], include_in_schema=False)
 @router.post("/two-factor-auth/verify", response_model=Dict[str, Any])
 async def verify_2fa(
     verify_data: TwoFactorAuthVerify,
@@ -602,6 +609,7 @@ async def verify_2fa(
     }
 
 
+@router.put("/me/two-factor-auth", response_model=Dict[str, Any], include_in_schema=False)
 @router.put("/two-factor-auth", response_model=Dict[str, Any])
 async def toggle_2fa(
     toggle_data: TwoFactorAuthToggle,
@@ -631,6 +639,7 @@ async def toggle_2fa(
 
 # ==================== CHANGE PASSWORD ====================
 
+@router.put("/me/change-password", response_model=Dict[str, Any], include_in_schema=False)
 @router.put("/change-password", response_model=Dict[str, Any])
 async def change_password(
     password_data: ChangePasswordRequest,
@@ -667,6 +676,7 @@ async def change_password(
 
 # ==================== DEACTIVATE ACCOUNT ====================
 
+@router.post("/me/deactivate", response_model=Dict[str, Any], include_in_schema=False)
 @router.post("/deactivate", response_model=Dict[str, Any])
 async def deactivate_account(
     deactivate_data: DeactivateAccountRequest,
@@ -694,6 +704,7 @@ async def deactivate_account(
 
 # ==================== DELETE ACCOUNT ====================
 
+@router.post("/me/delete", response_model=Dict[str, Any], include_in_schema=False)
 @router.post("/delete", response_model=Dict[str, Any])
 async def delete_account(
     delete_data: DeleteAccountRequest,

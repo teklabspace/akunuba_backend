@@ -84,6 +84,7 @@ class AppraisalResponse(BaseModel):
     report_url: Optional[str] = None
     estimated_value: Optional[Decimal] = None
     notes: Optional[str] = None
+    ai_data: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True
@@ -100,7 +101,13 @@ class AutomatedAppraisalResult(BaseModel):
     value_range_high: Decimal
     currency: str
     confidence: str
-    reasoning: str
+    appraisal_summary: str
+    key_value_drivers: List[str]
+    risk_factors: List[str]
+    missing_information: List[str]
+    recommended_documents: List[str]
+    suggested_next_step: str
+    professional_appraisal_needed: bool
     disclaimer: str
     model: str
 
