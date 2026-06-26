@@ -2,7 +2,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from app.database import get_db
 from app.core.security import decode_access_token
 from app.models.user import User
@@ -13,6 +13,20 @@ from app.core.features import Feature, get_permissions, get_plan_limits, has_fea
 from sqlalchemy import select
 
 security = HTTPBearer()
+
+
+def _as_aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Normalize a datetime to timezone-aware UTC.
+
+    Values read from ``DateTime(timezone=True)`` columns are timezone-aware, but
+    some rows may have been written with a naive ``datetime.utcnow()``. Comparing
+    an aware value against a naive ``datetime.utcnow()`` raises
+    ``TypeError: can't compare offset-naive and offset-aware datetimes`` and
+    surfaces as a 500. Treat naive values as UTC so comparisons are always safe.
+    """
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 async def get_current_user(
@@ -70,12 +84,13 @@ async def get_active_subscription(
     
     if not subscription:
         return None
-    
-    if subscription.current_period_end and subscription.current_period_end < datetime.utcnow():
+
+    period_end = _as_aware_utc(subscription.current_period_end)
+    if period_end and period_end < datetime.now(timezone.utc):
         subscription.status = SubscriptionStatus.EXPIRED
         await db.commit()
         return None
-    
+
     return subscription
 
 
@@ -91,9 +106,10 @@ async def get_user_subscription_plan(
     )
     subscription = result.scalar_one_or_none()
     
-    if subscription and subscription.current_period_end and subscription.current_period_end >= datetime.utcnow():
+    period_end = _as_aware_utc(subscription.current_period_end) if subscription else None
+    if subscription and period_end and period_end >= datetime.now(timezone.utc):
         return subscription.plan
-    
+
     return SubscriptionPlan.FREE
 
 

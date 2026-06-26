@@ -2,12 +2,12 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from typing import List, Optional, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from app.database import get_db
 from app.api.deps import get_current_user
 from app.models.user import User, Role
 from app.models.account import Account, AccountType
-from app.models.payment import Subscription, SubscriptionStatus
+from app.models.payment import Subscription, SubscriptionStatus, SubscriptionPlan
 from app.models.kyc import KYCVerification, KYCStatus
 from app.models.kyb import KYBVerification, KYBStatus
 from app.models.marketplace import MarketplaceListing, ListingStatus, EscrowTransaction, EscrowStatus
@@ -562,8 +562,51 @@ async def activate_user(
 # ==================== SUBSCRIPTIONS MANAGEMENT ====================
 
 class PlanUpdateRequest(BaseModel):
-    plan: str  # "free" | "monthly" | "annual"
+    """Admin plan-change request.
+
+    Mirrors the user-facing ``PUT /subscriptions/upgrade`` contract:
+      - ``plan_id``: the product tier — "starter" | "pro" | "premium" | "concierge"
+      - ``billing_cycle``: "monthly" | "annual" (optional; inferred if omitted)
+
+    For backward compatibility with the existing admin UI, a single ``plan``
+    value is still accepted and resolved the same way. It may be a product tier
+    (starter/pro/premium/concierge) OR a legacy internal value
+    (free/monthly/annual). When ``plan`` is "monthly"/"annual" it is also treated
+    as the billing cycle if ``billing_cycle`` is not given.
+    """
+    plan_id: Optional[str] = None
+    billing_cycle: Optional[str] = None
+    plan: Optional[str] = None  # legacy single-value field
     reason: Optional[str] = None
+
+
+# Legacy single-value "plan" inputs (billing-cycle-style) → a representative
+# product plan_id, so old payloads keep resolving to a valid tier.
+_LEGACY_PLAN_TO_PLAN_ID = {
+    "free": "starter",
+    "monthly": "pro",
+    "annual": "premium",
+}
+
+
+def resolve_admin_plan_id(raw: Optional[str]) -> Optional[str]:
+    """Resolve any accepted plan identifier to a canonical product ``plan_id``
+    ("starter" | "pro" | "premium" | "concierge"), or None if unrecognized.
+
+    Accepts product IDs (optionally "plan_"-prefixed) and legacy internal enum
+    values (free/monthly/annual). All resolution reuses the canonical maps in
+    ``subscriptions.py`` so the admin and user-facing endpoints never drift.
+    """
+    # Local import avoids any import-order coupling between the two routers.
+    from app.api.v1.subscriptions import PLANS_CONFIG, normalize_plan_id
+
+    if not raw:
+        return None
+    key = raw.strip().lower()
+    normalized = normalize_plan_id(key)
+    if normalized in PLANS_CONFIG:
+        return normalized
+    return _LEGACY_PLAN_TO_PLAN_ID.get(key)
 
 
 @router.get("/subscriptions", response_model=Dict[str, Any])
@@ -690,11 +733,35 @@ async def admin_change_subscription_plan(
     db: AsyncSession = Depends(get_db),
 ):
     """Change a user's subscription plan — admin only.
-    Accepts plan: 'free' | 'monthly' | 'annual'
+
+    Request body (aligned with the user-facing ``PUT /subscriptions/upgrade``):
+        { "plan_id": "pro", "billing_cycle": "monthly", "reason": "..." }
+
+    ``plan_id`` ∈ starter | pro | premium | concierge.
+    ``billing_cycle`` ∈ monthly | annual (optional — inferred from the current
+    period, or defaults to monthly).
+
+    Backward compatible: a single ``plan`` value (a product tier OR a legacy
+    free/monthly/annual value) is still accepted. Unknown values return 400,
+    never 500.
     """
-    valid_plans = ["free", "monthly", "annual"]
-    if body.plan not in valid_plans:
-        raise BadRequestException(f"Invalid plan. Must be one of: {', '.join(valid_plans)}")
+    from app.api.v1.subscriptions import (
+        PLAN_ID_TO_ENUM, PLAN_ENUM_TO_ID, PLAN_PRICES,
+    )
+
+    # 1) Resolve the target product plan_id from either field.
+    raw_plan = body.plan_id or body.plan
+    plan_id = resolve_admin_plan_id(raw_plan)
+    if plan_id is None:
+        raise BadRequestException(
+            "Invalid plan. Provide plan_id one of: starter, pro, premium, concierge "
+            "(legacy plan values free/monthly/annual are also accepted)."
+        )
+
+    # 2) Resolve the billing cycle: explicit > legacy cycle-style 'plan' > existing > monthly.
+    billing_cycle = (body.billing_cycle or "").strip().lower() or None
+    if billing_cycle is None and body.plan and body.plan.strip().lower() in ("monthly", "annual"):
+        billing_cycle = body.plan.strip().lower()
 
     result = await db.execute(
         select(Subscription).where(Subscription.id == subscription_id)
@@ -703,8 +770,27 @@ async def admin_change_subscription_plan(
     if not sub:
         raise NotFoundException("Subscription", str(subscription_id))
 
-    old_plan = sub.plan.value
-    sub.plan = body.plan
+    if billing_cycle is None:
+        if sub.current_period_start and sub.current_period_end:
+            days = (sub.current_period_end - sub.current_period_start).days
+            billing_cycle = "annual" if days > 60 else "monthly"
+        else:
+            billing_cycle = "monthly"
+    if billing_cycle not in ("monthly", "annual"):
+        raise BadRequestException("billing_cycle must be 'monthly' or 'annual'")
+
+    old_plan_id = PLAN_ENUM_TO_ID.get(sub.plan, sub.plan.value if sub.plan else None)
+    internal_plan = PLAN_ID_TO_ENUM.get(plan_id, SubscriptionPlan.FREE)
+
+    # 3) Apply plan + price + a fresh billing period coherently.
+    sub.plan = internal_plan
+    price = PLAN_PRICES.get(plan_id, {}).get(billing_cycle)
+    if price is not None:  # concierge has custom (None) pricing — leave amount as-is
+        sub.amount = price
+    now = datetime.now(timezone.utc)
+    sub.current_period_start = now
+    sub.current_period_end = now + (timedelta(days=365) if billing_cycle == "annual" else timedelta(days=30))
+
     # Reactivate if it was expired/cancelled
     if sub.status in (SubscriptionStatus.CANCELLED, SubscriptionStatus.EXPIRED):
         sub.status = SubscriptionStatus.ACTIVE
@@ -713,16 +799,23 @@ async def admin_change_subscription_plan(
     await db.commit()
 
     logger.info(
-        f"Admin {current_user.id} changed subscription {subscription_id} plan: {old_plan} → {body.plan}. Reason: {body.reason}"
+        f"Admin {current_user.id} changed subscription {subscription_id} plan: "
+        f"{old_plan_id} → {plan_id} ({billing_cycle}). Reason: {body.reason}"
     )
     return {
         "message": "Subscription plan updated",
         "data": {
             "id": str(sub.id),
             "account_id": str(sub.account_id),
-            "old_plan": old_plan,
-            "new_plan": sub.plan.value,
+            "old_plan": old_plan_id,
+            "new_plan": plan_id,
+            "plan_id": plan_id,
+            "billing_cycle": billing_cycle,
+            "internal_plan": sub.plan.value,
+            "amount": float(sub.amount) if sub.amount is not None else None,
+            "currency": sub.currency,
             "status": sub.status.value,
+            "current_period_end": sub.current_period_end.isoformat(),
         },
     }
 

@@ -616,7 +616,7 @@ class RefundCreateResponse(BaseModel):
     message: str
 
 
-@router.post("/payments/payments/{payment_id}/refund", response_model=RefundCreateResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/{payment_id}/refund", response_model=RefundCreateResponse, status_code=status.HTTP_201_CREATED)
 async def create_refund(
     payment_id: UUID,
     refund_data: RefundCreate,
@@ -707,7 +707,7 @@ class RefundsListResponse(BaseModel):
     total_refunded: Decimal
 
 
-@router.get("/payments/payments/{payment_id}/refunds", response_model=RefundsListResponse)
+@router.get("/{payment_id}/refunds", response_model=RefundsListResponse)
 async def get_refunds(
     payment_id: UUID,
     current_user: User = Depends(get_current_user),

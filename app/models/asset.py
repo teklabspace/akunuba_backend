@@ -6,7 +6,7 @@ from sqlalchemy.sql import func
 from app.database import Base
 import uuid
 from enum import Enum
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class AssetType(str, Enum):
@@ -315,7 +315,15 @@ class AssetValuation(Base):
     value = Column(Numeric(20, 2), nullable=False)
     currency = Column(String(3), default="USD")
     valuation_method = Column(String(50))
-    valuation_date = Column(DateTime(timezone=True), server_default=func.now())
+    # Python-side default guarantees a concrete value on every insert path
+    # (server_default alone did not populate via asyncpg/pgbouncer, producing
+    # NULL rows that crashed datetime sorts on read).
+    valuation_date = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        server_default=func.now(),
+        nullable=False,
+    )
     notes = Column(Text)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -406,6 +414,80 @@ class AssetAppraisal(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     asset = relationship("Asset", back_populates="appraisals")
+    comments = relationship(
+        "AppraisalComment",
+        back_populates="appraisal",
+        cascade="all, delete-orphan",
+        order_by="AppraisalComment.created_at",
+    )
+    appraisal_documents = relationship(
+        "AppraisalDocument",
+        back_populates="appraisal",
+        cascade="all, delete-orphan",
+        order_by="desc(AppraisalDocument.created_at)",
+    )
+
+
+class CommentType(str, Enum):
+    MESSAGE = "message"
+    DOCUMENT_REQUEST = "document_request"
+    SYSTEM = "system"
+
+
+class AppraisalComment(Base):
+    """Structured comment thread on an appraisal (replaces parsing notes text).
+
+    Visibility: investors only ever see rows where is_internal is False.
+    A row with comment_type == 'document_request' represents a staff request
+    for the client to upload a document; it is fulfilled when an
+    AppraisalDocument links back to it via fulfills_comment_id.
+    """
+    __tablename__ = "appraisal_comments"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    appraisal_id = Column(UUID(as_uuid=True), ForeignKey("asset_appraisals.id", ondelete="CASCADE"), nullable=False)
+    author_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    author_role = Column(String(20), nullable=False)  # admin | advisor | investor
+    body = Column(Text, nullable=False)
+    comment_type = Column(String(20), nullable=False, default=CommentType.MESSAGE.value)
+    is_internal = Column(Boolean, nullable=False, default=False, server_default="false")
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), server_default=func.now(), nullable=False)
+
+    appraisal = relationship("AssetAppraisal", back_populates="comments")
+    fulfillments = relationship(
+        "AppraisalDocument",
+        back_populates="fulfilled_request",
+        foreign_keys="AppraisalDocument.fulfills_comment_id",
+    )
+
+
+class AppraisalDocument(Base):
+    """A document attached to an appraisal, by staff or by the asset owner.
+
+    Visibility: investors only ever see rows where is_client_visible is True.
+    fulfills_comment_id optionally links an owner upload to the staff
+    document_request comment it satisfies.
+    """
+    __tablename__ = "appraisal_documents"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    appraisal_id = Column(UUID(as_uuid=True), ForeignKey("asset_appraisals.id", ondelete="CASCADE"), nullable=False)
+    uploaded_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    uploaded_by_role = Column(String(20), nullable=False)  # admin | advisor | investor
+    file_name = Column(String(255), nullable=False)
+    mime_type = Column(String(100))
+    file_size = Column(Integer)
+    storage_path = Column(String(500), nullable=False)
+    is_client_visible = Column(Boolean, nullable=False, default=True, server_default="true")
+    fulfills_comment_id = Column(UUID(as_uuid=True), ForeignKey("appraisal_comments.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), server_default=func.now(), nullable=False)
+
+    appraisal = relationship("AssetAppraisal", back_populates="appraisal_documents")
+    fulfilled_request = relationship(
+        "AppraisalComment",
+        back_populates="fulfillments",
+        foreign_keys=[fulfills_comment_id],
+    )
 
 
 class AssetAIReview(Base):

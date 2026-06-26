@@ -62,10 +62,19 @@ async def get_crm_users(
     for user in users:
         # Only return users with CRM permissions (admin, advisor)
         if has_permission(user.role, Permission.MANAGE_SUPPORT):
+            # User has no `full_name` column — compose a display name from
+            # first/last name, falling back to the email so the assignment
+            # dropdown always has something to render.
+            full_name = " ".join(
+                part for part in [user.first_name, user.last_name] if part
+            ).strip() or None
             user_list.append({
                 "id": str(user.id),
                 "email": user.email,
-                "full_name": user.full_name if hasattr(user, 'full_name') else None,
+                "name": full_name or user.email,
+                "full_name": full_name,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
                 "role": user.role.value if user.role else None,
                 "created_at": user.created_at.isoformat() if user.created_at else None
             })

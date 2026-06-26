@@ -13,7 +13,8 @@ from app.models.asset import (
     Asset, AssetType, AssetValuation, AssetOwnership, AssetCategory, AssetPhoto,
     AssetDocument, AssetAppraisal, AssetAIReview, AssetSaleRequest, AssetTransfer, AssetShare,
     AssetReport, CategoryGroup, AppraisalType, AppraisalStatus, AIReviewStatus, SaleRequestStatus,
-    TransferStatus, TransferType, ReportType, AssetStatus, OwnershipType, Condition, ValuationType
+    TransferStatus, TransferType, ReportType, AssetStatus, OwnershipType, Condition, ValuationType,
+    AppraisalComment, AppraisalDocument, CommentType
 )
 from app.schemas.asset import AssetCreate, AssetUpdate, AssetResponse
 from app.schemas.asset_extended import (
@@ -30,6 +31,7 @@ from app.core.exceptions import NotFoundException, BadRequestException, Forbidde
 from app.api.deps import get_account, get_user_subscription_plan
 from app.core.features import get_limit, check_usage_limit
 from app.services import ai_appraisal_service
+from app.services import appraisal_thread
 from app.utils.logger import logger
 from app.integrations.supabase_client import SupabaseClient
 from app.config import settings
@@ -999,7 +1001,12 @@ async def get_asset(
     # Add value history for charts
     value_history = []
     if include_valuations and asset.valuations:
-        for val in sorted(asset.valuations, key=lambda x: x.valuation_date):
+        # valuation_date can legitimately be NULL on legacy rows; sort those
+        # last and skip them in the serialized history rather than 500.
+        _epoch = datetime.min.replace(tzinfo=timezone.utc)
+        for val in sorted(asset.valuations, key=lambda x: x.valuation_date or _epoch):
+            if val.valuation_date is None:
+                continue
             value_history.append({
                 "date": val.valuation_date.isoformat(),
                 "value": float(val.value),
@@ -1954,6 +1961,8 @@ async def get_asset_value_history(
     # Build history items
     history_items = []
     for val in valuations:
+        if val.valuation_date is None:
+            continue  # legacy rows without a date can't be placed on the timeline
         # Find related appraisal if any
         appraisal = next((a for a in appraisals if a.completed_at and abs((a.completed_at - val.valuation_date).total_seconds()) < 86400), None)
         
@@ -2134,6 +2143,7 @@ async def request_asset_appraisal(
             value=estimated_value,
             currency=ai_result.get("currency") or asset.currency,
             valuation_method=ValuationType.AUTOMATED.value,
+            valuation_date=now,
             notes=ai_result.get("appraisal_summary"),
         )
         db.add(valuation)
@@ -2226,6 +2236,199 @@ async def get_appraisal_status(
         raise NotFoundException("Appraisal", str(appraisal_id))
 
     return {"data": AppraisalResponse.model_validate(appraisal)}
+
+
+# ==================== APPRAISAL THREAD (investor-facing) ====================
+# Client-visible comments & documents for an appraisal the investor owns.
+# Visibility is enforced here: only is_internal=False comments and
+# is_client_visible=True documents are ever returned, and investor posts are
+# always non-internal. Staff-side equivalents live in concierge.py.
+
+
+class InvestorCommentCreate(BaseModel):
+    body: str
+
+
+async def _owned_appraisal_or_404(asset_id: UUID, appraisal_id: UUID, current_user: User, db: AsyncSession) -> AssetAppraisal:
+    """Verify the appraisal belongs to an asset owned by the current user."""
+    account = await get_account(current_user=current_user, db=db)
+    asset = (await db.execute(
+        select(Asset).where(and_(Asset.id == asset_id, Asset.account_id == account.id))
+    )).scalar_one_or_none()
+    if not asset:
+        raise NotFoundException("Asset", str(asset_id))
+    appraisal = (await db.execute(
+        select(AssetAppraisal).where(
+            and_(AssetAppraisal.id == appraisal_id, AssetAppraisal.asset_id == asset_id)
+        )
+    )).scalar_one_or_none()
+    if not appraisal:
+        raise NotFoundException("Appraisal", str(appraisal_id))
+    return appraisal
+
+
+@router.get("/{asset_id}/appraisals/{appraisal_id}/comments", response_model=Dict[str, Any])
+async def get_my_appraisal_comments(
+    asset_id: UUID,
+    appraisal_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Owner: list client-visible comments on your appraisal (no internal notes)."""
+    await _owned_appraisal_or_404(asset_id, appraisal_id, current_user, db)
+
+    comments = (await db.execute(
+        select(AppraisalComment)
+        .where(and_(
+            AppraisalComment.appraisal_id == appraisal_id,
+            AppraisalComment.is_internal.is_(False),
+        ))
+        .order_by(AppraisalComment.created_at)
+    )).scalars().all()
+
+    authors = await appraisal_thread.author_map(db, comments)
+    return {
+        "data": [
+            appraisal_thread.serialize_comment(c, authors.get(c.author_user_id), for_investor=True)
+            for c in comments
+        ],
+        "count": len(comments),
+    }
+
+
+@router.post("/{asset_id}/appraisals/{appraisal_id}/comments", response_model=Dict[str, Any])
+async def post_my_appraisal_comment(
+    asset_id: UUID,
+    appraisal_id: UUID,
+    comment_data: InvestorCommentCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Owner: post a message on your appraisal (always client-visible)."""
+    await _owned_appraisal_or_404(asset_id, appraisal_id, current_user, db)
+
+    comment = AppraisalComment(
+        appraisal_id=appraisal_id,
+        author_user_id=current_user.id,
+        author_role=current_user.role.value,
+        body=comment_data.body,
+        comment_type=CommentType.MESSAGE.value,
+        is_internal=False,
+    )
+    db.add(comment)
+    await db.commit()
+    await db.refresh(comment)
+
+    logger.info(f"Investor comment added to appraisal {appraisal_id}")
+    return {"data": appraisal_thread.serialize_comment(comment, current_user, for_investor=True)}
+
+
+@router.get("/{asset_id}/appraisals/{appraisal_id}/documents", response_model=Dict[str, Any])
+async def get_my_appraisal_documents(
+    asset_id: UUID,
+    appraisal_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Owner: list client-visible documents on your appraisal."""
+    await _owned_appraisal_or_404(asset_id, appraisal_id, current_user, db)
+
+    documents = (await db.execute(
+        select(AppraisalDocument)
+        .where(and_(
+            AppraisalDocument.appraisal_id == appraisal_id,
+            AppraisalDocument.is_client_visible.is_(True),
+        ))
+        .order_by(desc(AppraisalDocument.created_at))
+    )).scalars().all()
+
+    authors = await appraisal_thread.author_map(db, documents)
+    return {
+        "data": [
+            appraisal_thread.serialize_document(d, authors.get(d.uploaded_by_user_id), for_investor=True)
+            for d in documents
+        ],
+        "count": len(documents),
+    }
+
+
+@router.post("/{asset_id}/appraisals/{appraisal_id}/documents", response_model=Dict[str, Any])
+async def upload_my_appraisal_document(
+    asset_id: UUID,
+    appraisal_id: UUID,
+    files: List[UploadFile] = File(...),
+    fulfills_comment_id: Optional[UUID] = Query(None, description="Optional document_request comment id this upload fulfills"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Owner: upload one or more documents to your appraisal (always client-visible).
+
+    Pass fulfills_comment_id to satisfy a staff document request.
+    """
+    await _owned_appraisal_or_404(asset_id, appraisal_id, current_user, db)
+
+    # If fulfilling a request, validate it is a document_request on this appraisal
+    if fulfills_comment_id is not None:
+        req = (await db.execute(
+            select(AppraisalComment).where(and_(
+                AppraisalComment.id == fulfills_comment_id,
+                AppraisalComment.appraisal_id == appraisal_id,
+                AppraisalComment.comment_type == CommentType.DOCUMENT_REQUEST.value,
+            ))
+        )).scalar_one_or_none()
+        if not req:
+            raise BadRequestException("fulfills_comment_id is not a document request on this appraisal")
+
+    created = []
+    for file in files:
+        doc = await appraisal_thread.create_appraisal_document(
+            db, appraisal_id, file,
+            user_id=current_user.id,
+            role=current_user.role.value,
+            is_client_visible=True,
+            fulfills_comment_id=fulfills_comment_id,
+        )
+        if doc is not None:
+            created.append(doc)
+
+    await db.commit()
+    for doc in created:
+        await db.refresh(doc)
+
+    logger.info(f"Investor uploaded {len(created)} document(s) to appraisal {appraisal_id}")
+    return {
+        "data": [appraisal_thread.serialize_document(d, current_user, for_investor=True) for d in created],
+        "count": len(created),
+    }
+
+
+@router.get("/{asset_id}/appraisals/{appraisal_id}/document-requests", response_model=Dict[str, Any])
+async def get_my_appraisal_document_requests(
+    asset_id: UUID,
+    appraisal_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Owner: list document requests on your appraisal with fulfillment state."""
+    await _owned_appraisal_or_404(asset_id, appraisal_id, current_user, db)
+
+    comments = (await db.execute(
+        select(AppraisalComment)
+        .where(and_(
+            AppraisalComment.appraisal_id == appraisal_id,
+            AppraisalComment.is_internal.is_(False),
+        ))
+        .order_by(AppraisalComment.created_at)
+    )).scalars().all()
+    documents = (await db.execute(
+        select(AppraisalDocument).where(and_(
+            AppraisalDocument.appraisal_id == appraisal_id,
+            AppraisalDocument.is_client_visible.is_(True),
+        ))
+    )).scalars().all()
+
+    requests = appraisal_thread.build_document_requests(comments, documents)
+    return {"data": requests, "count": len(requests)}
 
 
 # ==================== AI ASSET REVIEW ====================

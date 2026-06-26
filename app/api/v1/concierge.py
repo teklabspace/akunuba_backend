@@ -9,11 +9,17 @@ from app.database import get_db
 from app.api.deps import get_current_user
 from app.models.user import User
 from app.models.account import Account
-from app.models.asset import Asset, AssetAppraisal, AppraisalStatus, AppraisalType
+from app.models.asset import (
+    Asset, AssetAppraisal, AppraisalStatus, AppraisalType,
+    AppraisalComment, AppraisalDocument, CommentType,
+)
 from app.models.document import Document, DocumentType
 from app.core.exceptions import NotFoundException, BadRequestException
 from app.core.permissions import Permission, has_permission
 from app.utils.logger import logger
+from app.services import appraisal_thread
+from app.integrations.supabase_client import SupabaseClient
+from app.config import settings
 from uuid import UUID
 from pydantic import BaseModel
 
@@ -35,6 +41,16 @@ class AppraisalAssignRequest(BaseModel):
 class AppraisalCommentCreate(BaseModel):
     comment: str
     from_field: Optional[str] = None  # "from" is a Python keyword, using from_field
+
+
+class StaffCommentCreate(BaseModel):
+    body: str
+    comment_type: CommentType = CommentType.MESSAGE
+    is_internal: bool = False
+
+
+class DocumentRequestCreate(BaseModel):
+    description: str
 
 
 class AppraisalCommentResponse(BaseModel):
@@ -86,19 +102,23 @@ async def list_appraisals(
     if not has_permission(current_user.role, Permission.MANAGE_SUPPORT):
         raise HTTPException(status_code=403, detail="Access denied")
     
+    # Concierge queue is human appraisals only; API (instant AI) appraisals
+    # complete immediately and must never appear in the staff queue.
     query = select(AssetAppraisal).options(
         selectinload(AssetAppraisal.asset)
-    )
-    
+    ).where(AssetAppraisal.appraisal_type != AppraisalType.API)
+
     if status_filter:
         query = query.where(AssetAppraisal.status == status_filter)
-    
+
     # Filter by category if provided (via asset category)
     if category:
         query = query.join(Asset).where(Asset.category_group == category)
-    
+
     # Get total count
-    count_query = select(func.count(AssetAppraisal.id))
+    count_query = select(func.count(AssetAppraisal.id)).where(
+        AssetAppraisal.appraisal_type != AppraisalType.API
+    )
     if status_filter:
         count_query = count_query.where(AssetAppraisal.status == status_filter)
     if category:
@@ -295,89 +315,42 @@ async def assign_appraisal(
 async def upload_appraisal_documents(
     appraisal_id: UUID,
     files: List[UploadFile] = File(...),
+    is_client_visible: bool = Query(True, description="If false, the document is staff-internal and hidden from the investor"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Upload documents related to an appraisal request"""
-    # Check permissions
+    """Staff: upload one or more documents to an appraisal.
+
+    is_client_visible=false keeps a document staff-internal.
+    """
     if not has_permission(current_user.role, Permission.MANAGE_SUPPORT):
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    result = await db.execute(
+
+    appraisal = (await db.execute(
         select(AssetAppraisal).where(AssetAppraisal.id == appraisal_id)
-    )
-    appraisal = result.scalar_one_or_none()
-    
+    )).scalar_one_or_none()
     if not appraisal:
         raise NotFoundException("Appraisal", str(appraisal_id))
-    
-    # Get account
-    account_result = await db.execute(
-        select(Account).where(Account.user_id == current_user.id)
-    )
-    account = account_result.scalar_one_or_none()
-    
-    if not account:
-        raise NotFoundException("Account", str(current_user.id))
-    
-    uploaded_documents = []
-    from app.integrations.supabase_client import SupabaseClient
-    from app.config import settings
-    
+
+    created = []
     for file in files:
-        # Validate file type
-        file_extension = file.filename.split(".")[-1].lower() if "." in file.filename else ""
-        if file_extension not in settings.ALLOWED_FILE_TYPES:
-            continue  # Skip invalid files
-        
-        # Read file
-        file_data = await file.read()
-        file_size = len(file_data)
-        
-        # Check file size
-        if file_size > settings.MAX_UPLOAD_SIZE:
-            continue  # Skip oversized files
-        
-        # Upload to Supabase Storage
-        try:
-            file_path = f"appraisals/{appraisal_id}/{file.filename}"
-            SupabaseClient.upload_file(
-                bucket="documents",
-                file_path=file_path,
-                file_data=file_data,
-                content_type=file.content_type or "application/octet-stream"
-            )
-        except Exception as e:
-            logger.error(f"Failed to upload document: {e}")
-            continue
-        
-        # Create document record linked to appraisal
-        document = Document(
-            account_id=account.id,
-            document_type=DocumentType.OTHER,
-            file_name=file.filename,
-            file_path=file_path,
-            file_size=file_size,
-            mime_type=file.content_type,
-            supabase_storage_path=file_path,
-            description=f"Appraisal document for appraisal {appraisal_id}",
-            meta_data=f'{{"appraisal_id": "{appraisal_id}"}}'
+        doc = await appraisal_thread.create_appraisal_document(
+            db, appraisal_id, file,
+            user_id=current_user.id,
+            role=current_user.role.value,
+            is_client_visible=is_client_visible,
         )
-        
-        db.add(document)
-        uploaded_documents.append({
-            "id": str(document.id),
-            "file_name": file.filename,
-            "file_size": file_size
-        })
-    
+        if doc is not None:
+            created.append(doc)
+
     await db.commit()
-    
-    logger.info(f"Documents uploaded for appraisal {appraisal_id}: {len(uploaded_documents)} files")
-    
+    for doc in created:
+        await db.refresh(doc)
+
+    logger.info(f"Staff uploaded {len(created)} document(s) to appraisal {appraisal_id}")
     return {
-        "message": f"Uploaded {len(uploaded_documents)} document(s)",
-        "documents": uploaded_documents
+        "data": [appraisal_thread.serialize_document(d, current_user, for_investor=False) for d in created],
+        "count": len(created),
     }
 
 
@@ -387,81 +360,111 @@ async def get_appraisal_documents(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get all documents associated with an appraisal"""
-    # Check permissions
+    """Staff: list all documents on an appraisal (including staff-internal)."""
     if not has_permission(current_user.role, Permission.MANAGE_SUPPORT):
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    result = await db.execute(
+
+    appraisal = (await db.execute(
         select(AssetAppraisal).where(AssetAppraisal.id == appraisal_id)
-    )
-    appraisal = result.scalar_one_or_none()
-    
+    )).scalar_one_or_none()
     if not appraisal:
         raise NotFoundException("Appraisal", str(appraisal_id))
-    
-    # Find documents linked to this appraisal via metadata
-    documents_result = await db.execute(
-        select(Document).where(
-            Document.meta_data.contains(f'"appraisal_id": "{appraisal_id}"')
-        )
-    )
-    documents = documents_result.scalars().all()
-    
-    document_list = []
-    for doc in documents:
-        document_list.append({
-            "id": str(doc.id),
-            "file_name": doc.file_name,
-            "file_size": doc.file_size,
-            "mime_type": doc.mime_type,
-            "created_at": doc.created_at.isoformat() if doc.created_at else None
-        })
-    
+
+    documents = (await db.execute(
+        select(AppraisalDocument)
+        .where(AppraisalDocument.appraisal_id == appraisal_id)
+        .order_by(desc(AppraisalDocument.created_at))
+    )).scalars().all()
+
+    authors = await appraisal_thread.author_map(db, documents)
     return {
-        "data": document_list,
-        "count": len(document_list)
+        "data": [
+            appraisal_thread.serialize_document(d, authors.get(d.uploaded_by_user_id), for_investor=False)
+            for d in documents
+        ],
+        "count": len(documents),
     }
 
 
-# Note: Comments system for appraisals would require a new model
-# For now, we'll use the notes field in AssetAppraisal
+async def _load_appraisal_or_404(db: AsyncSession, appraisal_id: UUID) -> AssetAppraisal:
+    appraisal = (await db.execute(
+        select(AssetAppraisal).where(AssetAppraisal.id == appraisal_id)
+    )).scalar_one_or_none()
+    if not appraisal:
+        raise NotFoundException("Appraisal", str(appraisal_id))
+    return appraisal
+
+
 @router.post("/appraisals/{appraisal_id}/comments", response_model=Dict[str, Any])
 async def add_appraisal_comment(
     appraisal_id: UUID,
-    comment_data: AppraisalCommentCreate,
+    comment_data: StaffCommentCreate,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Add a comment or note to an appraisal"""
-    # Check permissions
+    """Staff: post a comment on an appraisal.
+
+    is_internal=true keeps it staff-only (never shown to the investor).
+    comment_type can be 'message' or 'system'; use the dedicated
+    /document-requests endpoint for document requests.
+    """
     if not has_permission(current_user.role, Permission.MANAGE_SUPPORT):
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    result = await db.execute(
-        select(AssetAppraisal).where(AssetAppraisal.id == appraisal_id)
+    await _load_appraisal_or_404(db, appraisal_id)
+
+    comment = AppraisalComment(
+        appraisal_id=appraisal_id,
+        author_user_id=current_user.id,
+        author_role=current_user.role.value,
+        body=comment_data.body,
+        comment_type=comment_data.comment_type.value,
+        is_internal=comment_data.is_internal,
     )
-    appraisal = result.scalar_one_or_none()
-    
-    if not appraisal:
-        raise NotFoundException("Appraisal", str(appraisal_id))
-    
-    # Add comment to notes
-    from_field = comment_data.from_field or current_user.email
-    comment_text = f"[{from_field}] {comment_data.comment}"
-    existing_notes = appraisal.notes or ""
-    appraisal.notes = f"{existing_notes}\n[{datetime.now(timezone.utc).isoformat()}] {comment_text}".strip()
-    
+    db.add(comment)
     await db.commit()
-    await db.refresh(appraisal)
-    
-    logger.info(f"Comment added to appraisal {appraisal_id}")
-    
+    await db.refresh(comment)
+
+    logger.info(f"Staff comment added to appraisal {appraisal_id} (internal={comment_data.is_internal})")
+    return {"data": appraisal_thread.serialize_comment(comment, current_user, for_investor=False)}
+
+
+@router.post("/appraisals/{appraisal_id}/document-requests", response_model=Dict[str, Any])
+async def request_appraisal_document(
+    appraisal_id: UUID,
+    request_data: DocumentRequestCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Staff: ask the asset owner to upload a document.
+
+    Stored as a client-visible comment of type document_request; the investor
+    fulfils it by uploading a document that links back via fulfills_comment_id.
+    """
+    if not has_permission(current_user.role, Permission.MANAGE_SUPPORT):
+        raise HTTPException(status_code=403, detail="Access denied")
+    await _load_appraisal_or_404(db, appraisal_id)
+
+    comment = AppraisalComment(
+        appraisal_id=appraisal_id,
+        author_user_id=current_user.id,
+        author_role=current_user.role.value,
+        body=request_data.description,
+        comment_type=CommentType.DOCUMENT_REQUEST.value,
+        is_internal=False,  # a document request must be visible to the client
+    )
+    db.add(comment)
+    await db.commit()
+    await db.refresh(comment)
+
+    logger.info(f"Document requested on appraisal {appraisal_id}")
     return {
-        "message": "Comment added successfully",
-        "comment": comment_data.comment,
-        "from": from_field,
-        "created_at": datetime.now(timezone.utc).isoformat()
+        "data": {
+            "id": str(comment.id),
+            "body": comment.body,
+            "status": "open",
+            "fulfilled_by_document_id": None,
+            "created_at": comment.created_at.isoformat() if comment.created_at else None,
+        }
     }
 
 
@@ -471,49 +474,55 @@ async def get_appraisal_comments(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get all comments and notes for an appraisal"""
-    # Check permissions
+    """Staff: list all comments on an appraisal (including staff-internal).
+
+    Legacy free-text from asset_appraisals.notes is returned separately under
+    `legacy_notes` so historical appraisals can still be shown read-only.
+    """
     if not has_permission(current_user.role, Permission.MANAGE_SUPPORT):
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    result = await db.execute(
-        select(AssetAppraisal).where(AssetAppraisal.id == appraisal_id)
-    )
-    appraisal = result.scalar_one_or_none()
-    
-    if not appraisal:
-        raise NotFoundException("Appraisal", str(appraisal_id))
-    
-    # Parse notes into comments (simple implementation)
-    # In a real system, you'd have a separate comments table
-    comments = []
-    if appraisal.notes:
-        # Split by lines that start with timestamp
-        import re
-        lines = appraisal.notes.split('\n')
-        current_comment = None
-        
-        for line in lines:
-            # Check if line starts with timestamp pattern [YYYY-MM-DD...]
-            timestamp_match = re.match(r'\[(\d{4}-\d{2}-\d{2}[^\]]+)\]\s*(.+)', line)
-            if timestamp_match:
-                if current_comment:
-                    comments.append(current_comment)
-                current_comment = {
-                    "comment": timestamp_match.group(2),
-                    "created_at": timestamp_match.group(1),
-                    "from": None  # Would need to parse from comment text
-                }
-            elif current_comment:
-                current_comment["comment"] += "\n" + line
-        
-        if current_comment:
-            comments.append(current_comment)
-    
+
+    appraisal = await _load_appraisal_or_404(db, appraisal_id)
+
+    comments = (await db.execute(
+        select(AppraisalComment)
+        .where(AppraisalComment.appraisal_id == appraisal_id)
+        .order_by(AppraisalComment.created_at)
+    )).scalars().all()
+
+    authors = await appraisal_thread.author_map(db, comments)
     return {
-        "data": comments,
-        "count": len(comments)
+        "data": [
+            appraisal_thread.serialize_comment(c, authors.get(c.author_user_id), for_investor=False)
+            for c in comments
+        ],
+        "count": len(comments),
+        "legacy_notes": appraisal.notes,
     }
+
+
+@router.get("/appraisals/{appraisal_id}/document-requests", response_model=Dict[str, Any])
+async def list_appraisal_document_requests(
+    appraisal_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Staff: list document requests on an appraisal with fulfillment state."""
+    if not has_permission(current_user.role, Permission.MANAGE_SUPPORT):
+        raise HTTPException(status_code=403, detail="Access denied")
+    await _load_appraisal_or_404(db, appraisal_id)
+
+    comments = (await db.execute(
+        select(AppraisalComment)
+        .where(AppraisalComment.appraisal_id == appraisal_id)
+        .order_by(AppraisalComment.created_at)
+    )).scalars().all()
+    documents = (await db.execute(
+        select(AppraisalDocument).where(AppraisalDocument.appraisal_id == appraisal_id)
+    )).scalars().all()
+
+    requests = appraisal_thread.build_document_requests(comments, documents)
+    return {"data": requests, "count": len(requests)}
 
 
 @router.put("/appraisals/{appraisal_id}/valuation", response_model=Dict[str, AppraisalResponse])

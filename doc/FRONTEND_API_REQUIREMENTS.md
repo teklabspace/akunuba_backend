@@ -39,11 +39,11 @@ Headers: {
 {
   "plans": [
     {
-      "id": "plan_starter",
+      "id": "starter",
       "name": "Starter",
       "description": "Perfect for new or casual investors",
-      "monthly_price": 0.00,
-      "annual_price": 0.00,
+      "monthly_price": 49.00,
+      "annual_price": 470.00,
       "currency": "USD",
       "features": [...],
       "limits": {
@@ -53,20 +53,20 @@ Headers: {
       "popular": false
     },
     {
-      "id": "plan_pro",
+      "id": "pro",
       "name": "Pro",
-      "monthly_price": 199.00,
-      "annual_price": 1999.00,
+      "monthly_price": 299.00,
+      "annual_price": 2870.00,
       "popular": true
     },
     {
-      "id": "plan_premium",
+      "id": "premium",
       "name": "Premium",
-      "monthly_price": 699.00,
-      "annual_price": 6999.00
+      "monthly_price": 899.00,
+      "annual_price": 8630.00
     },
     {
-      "id": "plan_concierge",
+      "id": "concierge",
       "name": "Concierge",
       "monthly_price": null,
       "annual_price": null,
@@ -101,10 +101,10 @@ Headers: {
 ```json
 {
   "id": "uuid",
-  "plan_id": "plan_pro",
+  "plan_id": "pro",
   "plan_name": "Pro",
   "status": "active",
-  "amount": 199.00,
+  "amount": 299.00,
   "currency": "USD",
   "billing_cycle": "monthly",
   "current_period_start": "2024-01-01T00:00:00Z",
@@ -153,7 +153,7 @@ Headers: {
   "Content-Type": "application/json"
 }
 Body: {
-  "plan_id": "plan_pro",
+  "plan_id": "pro",
   "billing_cycle": "monthly",
   "payment_method_id": "pm_xxx",  // optional
   "coupon_code": "EARLYBIRD"       // optional
@@ -165,10 +165,10 @@ Body: {
 {
   "subscription": {
     "id": "sub_xxx",
-    "plan_id": "plan_pro",
+    "plan_id": "pro",
     "plan_name": "Pro",
     "status": "active",
-    "amount": 199.00,
+    "amount": 299.00,
     "currency": "USD",
     "billing_cycle": "monthly",
     "current_period_start": "2024-01-15T00:00:00Z",
@@ -179,7 +179,7 @@ Body: {
     "id": "pi_xxx",
     "client_secret": "pi_xxx_secret_xxx",
     "status": "requires_payment_method",
-    "amount": 199.00,
+    "amount": 299.00,
     "currency": "USD"
   }
 }
@@ -326,10 +326,10 @@ Headers: {
   "data": [
     {
       "id": "uuid",
-      "plan_id": "plan_pro",
+      "plan_id": "pro",
       "plan_name": "Pro",
       "status": "active",
-      "amount": 199.00,
+      "amount": 299.00,
       "currency": "USD",
       "billing_cycle": "monthly",
       "period_start": "2024-01-01T00:00:00Z",
@@ -364,7 +364,7 @@ Headers: {
   "Content-Type": "application/json"
 }
 Body: {
-  "amount": 199.00,
+  "amount": 299.00,
   "currency": "USD",
   "payment_method": "card",
   "description": "Payment for Pro subscription",
@@ -380,7 +380,7 @@ Body: {
 {
   "payment_intent_id": "pi_xxx",
   "client_secret": "pi_xxx_secret_xxx",
-  "amount": 199.00,
+  "amount": 299.00,
   "currency": "USD",
   "status": "requires_payment_method",
   "created_at": "2024-01-01T00:00:00Z"
@@ -502,7 +502,7 @@ Headers: {
   "data": [
     {
       "id": "uuid",
-      "amount": 199.00,
+      "amount": 299.00,
       "currency": "USD",
       "status": "completed",
       "payment_method": "card",
@@ -538,7 +538,7 @@ Headers: {
 **Response** (200):
 ```json
 {
-  "total_paid": 199.00,
+  "total_paid": 299.00,
   "total_payments": 1,
   "last_payment_date": "2024-01-01T00:00:00Z",
   "payment_methods_count": 1

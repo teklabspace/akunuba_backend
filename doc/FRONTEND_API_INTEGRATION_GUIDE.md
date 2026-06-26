@@ -36,11 +36,11 @@ Authorization: Bearer <token>
 {
   "plans": [
     {
-      "id": "plan_starter",
+      "id": "starter",
       "name": "Starter",
       "description": "Perfect for new or casual investors",
-      "monthly_price": 0.00,
-      "annual_price": 0.00,
+      "monthly_price": 49.00,
+      "annual_price": 470.00,
       "currency": "USD",
       "features": [
         "Basic portfolio dashboard",
@@ -57,11 +57,11 @@ Authorization: Bearer <token>
       "is_custom": false
     },
     {
-      "id": "plan_pro",
+      "id": "pro",
       "name": "Pro",
       "description": "For active investors & small business owners",
-      "monthly_price": 199.00,
-      "annual_price": 1999.00,
+      "monthly_price": 299.00,
+      "annual_price": 2870.00,
       "currency": "USD",
       "features": [
         "Full portfolio management",
@@ -79,11 +79,11 @@ Authorization: Bearer <token>
       "is_custom": false
     },
     {
-      "id": "plan_premium",
+      "id": "premium",
       "name": "Premium",
       "description": "For advanced investors & entrepreneurs",
-      "monthly_price": 699.00,
-      "annual_price": 6999.00,
+      "monthly_price": 899.00,
+      "annual_price": 8630.00,
       "currency": "USD",
       "features": [
         "Everything in Pro",
@@ -101,7 +101,7 @@ Authorization: Bearer <token>
       "is_custom": false
     },
     {
-      "id": "plan_concierge",
+      "id": "concierge",
       "name": "Concierge",
       "description": "Custom enterprise solution",
       "monthly_price": null,
@@ -157,10 +157,10 @@ Authorization: Bearer <token>
 ```json
 {
   "id": "uuid",
-  "plan_id": "plan_pro",
+  "plan_id": "pro",
   "plan_name": "Pro",
   "status": "active",
-  "amount": 199.00,
+  "amount": 299.00,
   "currency": "USD",
   "billing_cycle": "monthly",
   "current_period_start": "2024-01-01T00:00:00Z",
@@ -222,7 +222,7 @@ Content-Type: application/json
 **Request Body**:
 ```json
 {
-  "plan_id": "plan_pro",
+  "plan_id": "pro",
   "billing_cycle": "monthly",
   "payment_method_id": "pm_xxx",
   "coupon_code": "EARLYBIRD"
@@ -234,10 +234,10 @@ Content-Type: application/json
 {
   "subscription": {
     "id": "uuid",
-    "plan_id": "plan_pro",
+    "plan_id": "pro",
     "plan_name": "Pro",
     "status": "active",
-    "amount": 199.00,
+    "amount": 299.00,
     "currency": "USD",
     "billing_cycle": "monthly",
     "current_period_start": "2024-01-01T00:00:00Z",
@@ -251,7 +251,7 @@ Content-Type: application/json
   "payment_intent": {
     "id": "pi_xxx",
     "client_secret": "pi_xxx_secret_xxx",
-    "amount": 199.00,
+    "amount": 299.00,
     "currency": "USD",
     "status": "requires_payment_method",
     "created_at": "2024-01-01T00:00:00Z"
@@ -289,7 +289,7 @@ const response = await fetch('/api/v1/subscriptions', {
     'Content-Type': 'application/json'
   },
   body: JSON.stringify({
-    plan_id: 'plan_pro',
+    plan_id: 'pro',
     billing_cycle: 'monthly',
     coupon_code: 'EARLYBIRD'
   })
@@ -430,10 +430,10 @@ const { limits, usage, percentages } = await response.json();
   "data": [
     {
       "id": "uuid",
-      "plan_id": "plan_pro",
+      "plan_id": "pro",
       "plan_name": "Pro",
       "status": "active",
-      "amount": 199.00,
+      "amount": 299.00,
       "currency": "USD",
       "billing_cycle": "monthly",
       "period_start": "2024-01-01T00:00:00Z",
@@ -550,10 +550,10 @@ Authorization: Bearer <token>
 {
   "subscription": {
     "id": "uuid",
-    "plan_id": "plan_pro",
+    "plan_id": "pro",
     "plan_name": "Pro",
     "status": "active",
-    "amount": 199.00,
+    "amount": 299.00,
     "currency": "USD",
     "billing_cycle": "monthly",
     "current_period_start": "2024-01-15T00:00:00Z",
@@ -620,7 +620,7 @@ Content-Type: application/json
 **Request Body**:
 ```json
 {
-  "plan_id": "plan_premium",
+  "plan_id": "premium",
   "billing_cycle": "annual"
 }
 ```
@@ -630,10 +630,10 @@ Content-Type: application/json
 {
   "subscription": {
     "id": "uuid",
-    "plan_id": "plan_premium",
+    "plan_id": "premium",
     "plan_name": "Premium",
     "status": "active",
-    "amount": 6999.00,
+    "amount": 8630.00,
     "currency": "USD",
     "billing_cycle": "annual",
     "current_period_start": "2024-01-15T00:00:00Z",
@@ -680,7 +680,7 @@ const response = await fetch('/api/v1/subscriptions/upgrade', {
     'Content-Type': 'application/json'
   },
   body: JSON.stringify({
-    plan_id: 'plan_premium',
+    plan_id: 'premium',
     billing_cycle: 'annual'
   })
 });
@@ -712,7 +712,7 @@ Content-Type: application/json
 **Request Body**:
 ```json
 {
-  "amount": 199.00,
+  "amount": 299.00,
   "currency": "USD",
   "payment_method": "card",
   "description": "Payment for Pro subscription",
@@ -728,7 +728,7 @@ Content-Type: application/json
 {
   "payment_intent_id": "pi_xxx",
   "client_secret": "pi_xxx_secret_xxx",
-  "amount": 199.00,
+  "amount": 299.00,
   "currency": "USD",
   "status": "requires_payment_method",
   "created_at": "2024-01-01T00:00:00Z"
@@ -749,7 +749,7 @@ const response = await fetch('/api/v1/payments/create-intent', {
     'Content-Type': 'application/json'
   },
   body: JSON.stringify({
-    amount: 199.00,
+    amount: 299.00,
     currency: 'USD',
     description: 'Payment for Pro subscription'
   })
@@ -939,7 +939,7 @@ if (confirm('Are you sure you want to remove this payment method?')) {
   "data": [
     {
       "id": "uuid",
-      "amount": 199.00,
+      "amount": 299.00,
       "currency": "USD",
       "status": "completed",
       "payment_method": "card",
@@ -992,7 +992,7 @@ data.forEach(payment => {
 **Response** (200):
 ```json
 {
-  "total_paid": 199.00,
+  "total_paid": 299.00,
   "total_payments": 1,
   "last_payment_date": "2024-01-01T00:00:00Z",
   "payment_methods_count": 1
@@ -1010,7 +1010,7 @@ const response = await fetch('/api/v1/payments/stats', {
 });
 const stats = await response.json();
 
-// Display: "Total Paid: $199.00 | 1 payment(s) | Last payment: Jan 1, 2024"
+// Display: "Total Paid: $299.00 | 1 payment(s) | Last payment: Jan 1, 2024"
 ```
 
 ---

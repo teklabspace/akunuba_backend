@@ -47,12 +47,15 @@ class StripeClient:
             raise
 
     @staticmethod
-    def cancel_subscription(subscription_id: str) -> Dict[str, Any]:
+    def cancel_subscription(subscription_id: str, cancel_immediately: bool = False) -> Dict[str, Any]:
         try:
-            subscription = stripe.Subscription.modify(
-                subscription_id,
-                cancel_at_period_end=True
-            )
+            if cancel_immediately:
+                subscription = stripe.Subscription.cancel(subscription_id)
+            else:
+                subscription = stripe.Subscription.modify(
+                    subscription_id,
+                    cancel_at_period_end=True,
+                )
             return subscription
         except Exception as e:
             logger.error(f"Failed to cancel Stripe subscription: {e}")

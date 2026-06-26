@@ -1,17 +1,18 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Body
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 from typing import Optional, List, Dict, Any
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 import json
 from app.database import get_db
 from app.api.deps import get_current_user
-from app.models.user import User
+from app.models.user import User, Role
 from app.models.account import Account
 from app.models.payment import Subscription, SubscriptionPlan, SubscriptionStatus
 from app.integrations.stripe_client import StripeClient
 from app.core.exceptions import NotFoundException, BadRequestException, ConflictException
+from app.core.rate_limit import limiter
 from app.utils.logger import logger
 from uuid import UUID
 from pydantic import BaseModel
@@ -21,12 +22,12 @@ router = APIRouter()
 
 # Plan definitions matching the spec
 PLANS_CONFIG = {
-    "plan_starter": {
-        "id": "plan_starter",
+    "starter": {
+        "id": "starter",
         "name": "Starter",
         "description": "Perfect for new or casual investors",
-        "monthly_price": Decimal("0.00"),
-        "annual_price": Decimal("0.00"),
+        "monthly_price": Decimal("49.00"),
+        "annual_price": Decimal("470.00"),
         "currency": "USD",
         "features": [
             "Basic portfolio dashboard",
@@ -42,12 +43,12 @@ PLANS_CONFIG = {
         "popular": False,
         "is_custom": False
     },
-    "plan_pro": {
-        "id": "plan_pro",
+    "pro": {
+        "id": "pro",
         "name": "Pro",
         "description": "For active investors & small business owners",
-        "monthly_price": Decimal("199.00"),
-        "annual_price": Decimal("1999.00"),
+        "monthly_price": Decimal("299.00"),
+        "annual_price": Decimal("2870.00"),
         "currency": "USD",
         "features": [
             "Full portfolio management",
@@ -64,12 +65,12 @@ PLANS_CONFIG = {
         "popular": True,
         "is_custom": False
     },
-    "plan_premium": {
-        "id": "plan_premium",
+    "premium": {
+        "id": "premium",
         "name": "Premium",
         "description": "For advanced investors & entrepreneurs",
-        "monthly_price": Decimal("699.00"),
-        "annual_price": Decimal("6999.00"),
+        "monthly_price": Decimal("899.00"),
+        "annual_price": Decimal("8630.00"),
         "currency": "USD",
         "features": [
             "Everything in Pro",
@@ -86,8 +87,8 @@ PLANS_CONFIG = {
         "popular": False,
         "is_custom": False
     },
-    "plan_concierge": {
-        "id": "plan_concierge",
+    "concierge": {
+        "id": "concierge",
         "name": "Concierge",
         "description": "Custom enterprise solution",
         "monthly_price": None,
@@ -165,23 +166,47 @@ class PaymentIntentResponse(BaseModel):
 class SubscriptionCreateResponse(BaseModel):
     subscription: SubscriptionResponse
     payment_intent: Optional[PaymentIntentResponse] = None
+    # Surfaced at the top level so the frontend can trigger Stripe 3DS without
+    # digging into the nested payment_intent object.
+    requires_action: bool = False
+    client_secret: Optional[str] = None
 
 
 # Subscription pricing (mapping from plan_id to prices)
 PLAN_PRICES = {
-    "plan_starter": {"monthly": Decimal("0.00"), "annual": Decimal("0.00")},
-    "plan_pro": {"monthly": Decimal("199.00"), "annual": Decimal("1999.00")},
-    "plan_premium": {"monthly": Decimal("699.00"), "annual": Decimal("6999.00")},
-    "plan_concierge": {"monthly": None, "annual": None},
+    "starter": {"monthly": Decimal("49.00"), "annual": Decimal("470.00")},
+    "pro": {"monthly": Decimal("299.00"), "annual": Decimal("2870.00")},
+    "premium": {"monthly": Decimal("899.00"), "annual": Decimal("8630.00")},
+    "concierge": {"monthly": None, "annual": None},
 }
 
 # Map plan_id to internal SubscriptionPlan enum
 PLAN_ID_TO_ENUM = {
-    "plan_starter": SubscriptionPlan.FREE,
-    "plan_pro": SubscriptionPlan.MONTHLY,
-    "plan_premium": SubscriptionPlan.ANNUAL,
-    "plan_concierge": SubscriptionPlan.ANNUAL,  # Map concierge to annual for now
+    "starter": SubscriptionPlan.FREE,
+    "pro": SubscriptionPlan.MONTHLY,
+    "premium": SubscriptionPlan.ANNUAL,
+    "concierge": SubscriptionPlan.ANNUAL,
 }
+
+# Explicit reverse map — avoids dict-inversion collision where concierge
+# would overwrite premium (both map to ANNUAL).
+PLAN_ENUM_TO_ID = {
+    SubscriptionPlan.FREE: "starter",
+    SubscriptionPlan.MONTHLY: "pro",
+    SubscriptionPlan.ANNUAL: "premium",
+}
+
+
+def normalize_plan_id(plan_id: Optional[str]) -> Optional[str]:
+    """Accept both bare IDs (e.g. 'starter') and legacy 'plan_'-prefixed IDs
+    (e.g. 'plan_starter') for backward compatibility during the frontend migration."""
+    if not plan_id:
+        return plan_id
+    if plan_id in PLANS_CONFIG:
+        return plan_id
+    if plan_id.startswith("plan_") and plan_id[len("plan_"):] in PLANS_CONFIG:
+        return plan_id[len("plan_"):]
+    return plan_id
 
 DISCOUNT_CODES = {
     "EARLYBIRD": Decimal("10"),  # 10% off
@@ -206,19 +231,27 @@ async def create_subscription(
     db: AsyncSession = Depends(get_db)
 ):
     """Create/activate a subscription"""
+    # Admin/advisor accounts do not use subscriptions — reject as a safety check.
+    if current_user.role in (Role.ADMIN, Role.ADVISOR):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account does not require a subscription."
+        )
+
     account_result = await db.execute(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
-    
+
     if not account:
         raise NotFoundException("Account", str(current_user.id))
-    
-    # Validate plan_id
-    if subscription_data.plan_id not in PLANS_CONFIG:
+
+    # Validate plan_id (accepts both bare and legacy 'plan_'-prefixed IDs)
+    plan_id = normalize_plan_id(subscription_data.plan_id)
+    if plan_id not in PLANS_CONFIG:
         raise BadRequestException("Invalid plan_id provided")
-    
-    plan_config = PLANS_CONFIG[subscription_data.plan_id]
+
+    plan_config = PLANS_CONFIG[plan_id]
     
     # Validate billing_cycle
     if subscription_data.billing_cycle not in ["monthly", "annual"]:
@@ -249,7 +282,7 @@ async def create_subscription(
     existing = existing_result.scalar_one_or_none()
     
     # Map plan_id to internal enum
-    internal_plan = PLAN_ID_TO_ENUM.get(subscription_data.plan_id, SubscriptionPlan.FREE)
+    internal_plan = PLAN_ID_TO_ENUM.get(plan_id, SubscriptionPlan.FREE)
     
     # Create payment intent via Stripe
     payment_intent = None
@@ -268,7 +301,7 @@ async def create_subscription(
             metadata={
                 "account_id": str(account.id),
                 "user_id": str(current_user.id),
-                "plan_id": subscription_data.plan_id,
+                "plan_id": plan_id,
                 "billing_cycle": subscription_data.billing_cycle
             }
         )
@@ -326,7 +359,7 @@ async def create_subscription(
     # Build response
     subscription_response = SubscriptionResponse(
         id=subscription.id,
-        plan_id=subscription_data.plan_id,
+        plan_id=plan_id,
         plan_name=plan_config["name"],
         status=subscription.status.value,
         amount=subscription.amount,
@@ -340,19 +373,36 @@ async def create_subscription(
         created_at=subscription.created_at
     )
     
+    # A payment intent that has not yet succeeded means the frontend must complete
+    # confirmation/3DS via Stripe.js using the client_secret.
+    requires_action = bool(
+        payment_intent and payment_intent.status not in ("succeeded", "processing")
+    )
+
     logger.info(f"Subscription created: {subscription.id}")
     return SubscriptionCreateResponse(
         subscription=subscription_response,
-        payment_intent=payment_intent
+        payment_intent=payment_intent,
+        requires_action=requires_action,
+        client_secret=payment_intent.client_secret if payment_intent else None,
     )
 
 
-@router.get("", response_model=Optional[SubscriptionResponse])
+@router.get("")
 async def get_subscription(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """Get current subscription status"""
+    # Admin/advisor accounts do not require a subscription — return a graceful
+    # payload (HTTP 200) instead of risking a 404 from the account lookup.
+    if current_user.role in (Role.ADMIN, Role.ADVISOR):
+        return {
+            "subscription": None,
+            "subscription_required": False,
+            "message": "Your account does not require a subscription."
+        }
+
     account_result = await db.execute(
         select(Account).where(Account.user_id == current_user.id)
     )
@@ -382,9 +432,8 @@ async def get_subscription(
                 await db.commit()
     
     # Map internal plan to plan_id
-    plan_id_map = {v: k for k, v in PLAN_ID_TO_ENUM.items()}
-    plan_id = plan_id_map.get(subscription.plan, "plan_starter")
-    plan_config = PLANS_CONFIG.get(plan_id, PLANS_CONFIG["plan_starter"])
+    plan_id = PLAN_ENUM_TO_ID.get(subscription.plan, "starter")
+    plan_config = PLANS_CONFIG.get(plan_id, PLANS_CONFIG["starter"])
     
     # Determine billing cycle from period length
     billing_cycle = "monthly"
@@ -466,9 +515,8 @@ async def cancel_subscription(
     await db.refresh(subscription)
     
     # Map to response format
-    plan_id_map = {v: k for k, v in PLAN_ID_TO_ENUM.items()}
-    plan_id = plan_id_map.get(subscription.plan, "plan_starter")
-    plan_config = PLANS_CONFIG.get(plan_id, PLANS_CONFIG["plan_starter"])
+    plan_id = PLAN_ENUM_TO_ID.get(subscription.plan, "starter")
+    plan_config = PLANS_CONFIG.get(plan_id, PLANS_CONFIG["starter"])
     
     subscription_response = {
         "id": str(subscription.id),
@@ -527,9 +575,8 @@ async def renew_subscription(
         billing_cycle = "monthly"
     
     # Check if payment is required
-    plan_id_map = {v: k for k, v in PLAN_ID_TO_ENUM.items()}
-    plan_id = plan_id_map.get(subscription.plan, "plan_starter")
-    plan_config = PLANS_CONFIG.get(plan_id, PLANS_CONFIG["plan_starter"])
+    plan_id = PLAN_ENUM_TO_ID.get(subscription.plan, "starter")
+    plan_config = PLANS_CONFIG.get(plan_id, PLANS_CONFIG["starter"])
     
     if billing_cycle == "monthly":
         renewal_amount = plan_config["monthly_price"]
@@ -631,12 +678,11 @@ async def upgrade_subscription(
         raise BadRequestException("Subscription must be active to upgrade/downgrade")
     
     # Get current plan info
-    plan_id_map = {v: k for k, v in PLAN_ID_TO_ENUM.items()}
-    current_plan_id = plan_id_map.get(subscription.plan, "plan_starter")
-    current_plan_config = PLANS_CONFIG.get(current_plan_id, PLANS_CONFIG["plan_starter"])
+    current_plan_id = PLAN_ENUM_TO_ID.get(subscription.plan, "starter")
+    current_plan_config = PLANS_CONFIG.get(current_plan_id, PLANS_CONFIG["starter"])
     
-    # Determine new plan_id
-    new_plan_id = upgrade_data.plan_id if upgrade_data.plan_id else current_plan_id
+    # Determine new plan_id (accepts both bare and legacy 'plan_'-prefixed IDs)
+    new_plan_id = normalize_plan_id(upgrade_data.plan_id) if upgrade_data.plan_id else current_plan_id
     if new_plan_id not in PLANS_CONFIG:
         raise BadRequestException("Invalid plan_id provided")
     
@@ -718,6 +764,7 @@ async def upgrade_subscription(
             payment_intent = {
                 "id": stripe_payment_intent["id"],
                 "client_secret": stripe_payment_intent["client_secret"],
+                "status": stripe_payment_intent.get("status"),
                 "amount": float(prorated_amount)
             }
         except Exception as e:
@@ -751,9 +798,16 @@ async def upgrade_subscription(
         created_at=subscription.created_at
     )
     
+    requires_action = bool(
+        payment_intent and payment_intent.get("status") not in ("succeeded", "processing")
+    )
+
     logger.info(f"Subscription upgraded/downgraded: {subscription.id}")
     return {
         "subscription": subscription_response,
+        "payment_intent": payment_intent,
+        "requires_action": requires_action,
+        "client_secret": payment_intent.get("client_secret") if payment_intent else None,
         "message": "Subscription updated successfully"
     }
 
@@ -789,13 +843,10 @@ async def get_subscription_history(
     )
     subscriptions = result.scalars().all()
     
-    # Map internal plan to plan_id
-    plan_id_map = {v: k for k, v in PLAN_ID_TO_ENUM.items()}
-    
     data = []
     for subscription in subscriptions:
-        plan_id = plan_id_map.get(subscription.plan, "plan_starter")
-        plan_config = PLANS_CONFIG.get(plan_id, PLANS_CONFIG["plan_starter"])
+        plan_id = PLAN_ENUM_TO_ID.get(subscription.plan, "starter")
+        plan_config = PLANS_CONFIG.get(plan_id, PLANS_CONFIG["starter"])
         
         # Determine billing cycle
         billing_cycle = "monthly"
@@ -832,17 +883,18 @@ async def get_subscription_history(
 
 
 @router.post("/webhook")
+@limiter.exempt
 async def subscription_webhook(
     request: Request,
     db: AsyncSession = Depends(get_db)
 ):
     """Handle Stripe subscription webhook events"""
     payload = await request.body()
-    signature = request.headers.get("stripe-signature")
-    
+    signature = request.headers.get("Stripe-Signature") or request.headers.get("stripe-signature")
+
     if not signature:
         raise HTTPException(status_code=400, detail="Missing signature")
-    
+
     try:
         event = StripeClient.verify_webhook_signature(payload, signature)
         if not event:
@@ -850,44 +902,50 @@ async def subscription_webhook(
     except Exception as e:
         logger.error(f"Webhook verification failed: {e}")
         raise HTTPException(status_code=400, detail="Webhook verification failed")
-    
+
     event_type = event.get("type")
     data = event.get("data", {}).get("object", {})
-    
+
     if event_type == "customer.subscription.updated":
         subscription_id = data.get("id")
         result = await db.execute(
             select(Subscription).where(Subscription.stripe_subscription_id == subscription_id)
         )
         subscription = result.scalar_one_or_none()
-        
+
         if subscription:
-            status = data.get("status")
-            if status == "active":
+            stripe_status = data.get("status")
+            if stripe_status == "active":
                 subscription.status = SubscriptionStatus.ACTIVE
-            elif status == "canceled":
+            elif stripe_status == "canceled":
                 subscription.status = SubscriptionStatus.CANCELLED
-            elif status == "past_due":
+            elif stripe_status == "past_due":
                 subscription.status = SubscriptionStatus.PAST_DUE
-            
-            subscription.current_period_start = datetime.fromtimestamp(data.get("current_period_start", 0))
-            subscription.current_period_end = datetime.fromtimestamp(data.get("current_period_end", 0))
+
+            if data.get("current_period_start"):
+                subscription.current_period_start = datetime.fromtimestamp(
+                    data["current_period_start"], tz=timezone.utc
+                )
+            if data.get("current_period_end"):
+                subscription.current_period_end = datetime.fromtimestamp(
+                    data["current_period_end"], tz=timezone.utc
+                )
             await db.commit()
             logger.info(f"Subscription updated via webhook: {subscription.id}")
-    
+
     elif event_type == "customer.subscription.deleted":
         subscription_id = data.get("id")
         result = await db.execute(
             select(Subscription).where(Subscription.stripe_subscription_id == subscription_id)
         )
         subscription = result.scalar_one_or_none()
-        
+
         if subscription:
             subscription.status = SubscriptionStatus.CANCELLED
-            subscription.cancelled_at = datetime.utcnow()
+            subscription.cancelled_at = datetime.now(timezone.utc)
             await db.commit()
             logger.info(f"Subscription cancelled via webhook: {subscription.id}")
-    
+
     return {"status": "success"}
 
 

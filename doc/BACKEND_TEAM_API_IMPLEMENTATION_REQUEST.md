@@ -198,7 +198,7 @@ All APIs follow these conventions:
 ```
 1. User views plans → GET /subscriptions/plans
 2. User selects plan → POST /subscriptions
-   - Request: { "plan_id": "plan_pro", "billing_cycle": "monthly" }
+   - Request: { "plan_id": "pro", "billing_cycle": "monthly" }
    - Response: { "subscription": {...}, "payment_intent": {...} }
 3. Backend returns payment_intent with client_secret
 4. Frontend processes payment via Stripe.js
@@ -254,7 +254,7 @@ Authorization: Bearer <token>
 Content-Type: application/json
 
 {
-  "plan_id": "plan_pro",
+  "plan_id": "pro",
   "billing_cycle": "monthly",
   "payment_method_id": "pm_xxx",
   "coupon_code": "EARLYBIRD"
@@ -266,10 +266,10 @@ Content-Type: application/json
 {
   "subscription": {
     "id": "sub_xxx",
-    "plan_id": "plan_pro",
+    "plan_id": "pro",
     "plan_name": "Pro",
     "status": "active",
-    "amount": 199.00,
+    "amount": 299.00,
     "currency": "USD",
     "billing_cycle": "monthly",
     "current_period_start": "2024-01-15T00:00:00Z",
@@ -280,7 +280,7 @@ Content-Type: application/json
     "id": "pi_xxx",
     "client_secret": "pi_xxx_secret_xxx",
     "status": "requires_payment_method",
-    "amount": 199.00,
+    "amount": 299.00,
     "currency": "USD"
   }
 }

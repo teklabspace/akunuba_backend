@@ -31,11 +31,11 @@ These APIs are needed for users to view available plans, select a plan, and acti
 {
   "plans": [
     {
-      "id": "plan_starter",
+      "id": "starter",
       "name": "Starter",
       "description": "Perfect for new or casual investors",
-      "monthly_price": 0.00,
-      "annual_price": 0.00,
+      "monthly_price": 49.00,
+      "annual_price": 470.00,
       "currency": "USD",
       "features": [
         "Basic portfolio dashboard",
@@ -51,11 +51,11 @@ These APIs are needed for users to view available plans, select a plan, and acti
       "popular": false
     },
     {
-      "id": "plan_pro",
+      "id": "pro",
       "name": "Pro",
       "description": "For active investors & small business owners",
-      "monthly_price": 199.00,
-      "annual_price": 1999.00,
+      "monthly_price": 299.00,
+      "annual_price": 2870.00,
       "currency": "USD",
       "features": [
         "Full portfolio management",
@@ -72,11 +72,11 @@ These APIs are needed for users to view available plans, select a plan, and acti
       "popular": true
     },
     {
-      "id": "plan_premium",
+      "id": "premium",
       "name": "Premium",
       "description": "For advanced investors & entrepreneurs",
-      "monthly_price": 699.00,
-      "annual_price": 6999.00,
+      "monthly_price": 899.00,
+      "annual_price": 8630.00,
       "currency": "USD",
       "features": [
         "Everything in Pro",
@@ -93,7 +93,7 @@ These APIs are needed for users to view available plans, select a plan, and acti
       "popular": false
     },
     {
-      "id": "plan_concierge",
+      "id": "concierge",
       "name": "Concierge",
       "description": "Custom enterprise solution",
       "monthly_price": null,
@@ -119,6 +119,13 @@ These APIs are needed for users to view available plans, select a plan, and acti
 
 **Use Case**: Display plans on `/plans` page and in settings/preferences
 
+**Plan IDs**: `starter` | `pro` | `premium` | `concierge`. Legacy `plan_`-prefixed
+IDs (`plan_starter`, etc.) are still accepted on input for backward compatibility,
+but responses always return the bare IDs above.
+
+**Pricing** (~20% annual discount): starter $49 / $470, pro $299 / $2,870,
+premium $899 / $8,630, concierge custom (`monthly_price`/`annual_price` are `null`).
+
 ---
 
 ### 1.2 Get Current Subscription Status
@@ -132,10 +139,10 @@ These APIs are needed for users to view available plans, select a plan, and acti
 ```json
 {
   "id": "uuid",
-  "plan_id": "plan_pro",
+  "plan_id": "pro",
   "plan_name": "Pro",
   "status": "active",
-  "amount": 199.00,
+  "amount": 299.00,
   "currency": "USD",
   "billing_cycle": "monthly",
   "current_period_start": "2024-01-01T00:00:00Z",
@@ -166,6 +173,17 @@ or
 
 **Status Values**: `"active" | "canceled" | "past_due" | "trialing" | "incomplete"`
 
+**Response** (200) - Admin/Advisor (no subscription required):
+```json
+{
+  "subscription": null,
+  "subscription_required": false,
+  "message": "Your account does not require a subscription."
+}
+```
+Admin and advisor accounts are exempt from subscriptions — this endpoint returns
+HTTP 200 (never 404) so the frontend can hide the subscription UI gracefully.
+
 **Use Case**: Check if user has active subscription before allowing dashboard access
 
 ---
@@ -180,7 +198,7 @@ or
 **Request Body**:
 ```json
 {
-  "plan_id": "plan_pro",
+  "plan_id": "pro",
   "billing_cycle": "monthly",
   "payment_method_id": "pm_xxx",
   "coupon_code": "EARLYBIRD"
@@ -188,7 +206,7 @@ or
 ```
 
 **Request Fields**:
-- `plan_id` (string, required): One of `plan_starter`, `plan_pro`, `plan_premium`, `plan_concierge`
+- `plan_id` (string, required): One of `starter`, `pro`, `premium`, `concierge` (legacy `plan_`-prefixed IDs also accepted)
 - `billing_cycle` (string, required): `"monthly"` or `"annual"`
 - `payment_method_id` (string, optional): Stripe payment method ID if user has saved payment methods
 - `coupon_code` (string, optional): Discount coupon code
@@ -198,10 +216,10 @@ or
 {
   "subscription": {
     "id": "sub_xxx",
-    "plan_id": "plan_pro",
+    "plan_id": "pro",
     "plan_name": "Pro",
     "status": "active",
-    "amount": 199.00,
+    "amount": 299.00,
     "currency": "USD",
     "billing_cycle": "monthly",
     "current_period_start": "2024-01-15T00:00:00Z",
@@ -212,11 +230,18 @@ or
     "id": "pi_xxx",
     "client_secret": "pi_xxx_secret_xxx",
     "status": "requires_payment_method",
-    "amount": 199.00,
+    "amount": 299.00,
     "currency": "USD"
-  }
+  },
+  "requires_action": true,
+  "client_secret": "pi_xxx_secret_xxx"
 }
 ```
+
+**3DS / SCA**: `requires_action` and `client_secret` are surfaced at the top level.
+When `requires_action` is `true`, the frontend must complete confirmation (e.g.
+Stripe 3DS) using `client_secret` via Stripe.js. It is `false` only when the
+PaymentIntent already succeeded (or no payment was needed, e.g. a $0 plan).
 
 **Response** (400) - Invalid Plan:
 ```json
@@ -224,6 +249,14 @@ or
   "detail": "Invalid plan_id provided"
 }
 ```
+
+**Response** (403) - Admin/Advisor:
+```json
+{
+  "detail": "Your account does not require a subscription."
+}
+```
+Admin and advisor accounts cannot create subscriptions (safety check).
 
 **Response** (402) - Payment Required:
 ```json
@@ -324,10 +357,10 @@ or
   "data": [
     {
       "id": "uuid",
-      "plan_id": "plan_pro",
+      "plan_id": "pro",
       "plan_name": "Pro",
       "status": "active",
-      "amount": 199.00,
+      "amount": 299.00,
       "currency": "USD",
       "billing_cycle": "monthly",
       "period_start": "2024-01-01T00:00:00Z",
@@ -404,10 +437,10 @@ or
 {
   "subscription": {
     "id": "sub_xxx",
-    "plan_id": "plan_pro",
+    "plan_id": "pro",
     "plan_name": "Pro",
     "status": "active",
-    "amount": 199.00,
+    "amount": 299.00,
     "currency": "USD",
     "billing_cycle": "monthly",
     "current_period_start": "2024-01-15T00:00:00Z",
@@ -450,36 +483,50 @@ or
 **Request Body**:
 ```json
 {
-  "plan_id": "plan_premium",
+  "plan_id": "premium",
   "billing_cycle": "annual"
 }
 ```
 
 **Request Fields**:
-- `plan_id` (string, optional): New plan ID (`plan_starter`, `plan_pro`, `plan_premium`, `plan_concierge`)
+- `plan_id` (string, optional): New plan ID (`starter`, `pro`, `premium`, `concierge`; legacy `plan_`-prefixed IDs also accepted)
 - `billing_cycle` (string, optional): New billing cycle (`"monthly"` or `"annual"`)
 
-**Note**: At least one field (`plan_id` or `billing_cycle`) must be provided.
+**Note**: At least one field (`plan_id` or `billing_cycle`) must be provided. This
+single endpoint handles **both upgrades and downgrades** — there is no separate
+downgrade endpoint.
 
 **Response** (200):
 ```json
 {
   "subscription": {
     "id": "sub_xxx",
-    "plan_id": "plan_premium",
+    "plan_id": "premium",
     "plan_name": "Premium",
     "status": "active",
-    "amount": 699.00,
+    "amount": 8630.00,
     "currency": "USD",
     "billing_cycle": "annual",
     "current_period_start": "2024-01-15T00:00:00Z",
     "current_period_end": "2025-01-15T00:00:00Z",
-    "prorated_amount": 50.00,
     "updated_at": "2024-01-15T00:00:00Z"
   },
+  "payment_intent": {
+    "id": "pi_xxx",
+    "client_secret": "pi_xxx_secret_xxx",
+    "status": "requires_payment_method",
+    "amount": 50.00
+  },
+  "requires_action": true,
+  "client_secret": "pi_xxx_secret_xxx",
   "message": "Subscription updated successfully"
 }
 ```
+
+**3DS / SCA**: As with create, `requires_action` and `client_secret` are surfaced
+at the top level. They are present when the proration results in a charge;
+`payment_intent` is `null` (and `requires_action` is `false`) when no payment is due
+(e.g. a downgrade).
 
 **Response** (400) - Invalid Plan:
 ```json
@@ -501,6 +548,49 @@ or
 ```
 
 **Use Case**: Allow users to change their plan or billing cycle from settings
+
+---
+
+### 1.10 (Admin) Change a User's Subscription Plan
+**PATCH** `/admin/subscriptions/{subscription_id}/plan`
+
+**Description**: Admin-only. Force-changes any subscription's plan. Reactivates the
+subscription if it was expired/cancelled. Distinct from the user-facing
+`PUT /subscriptions/upgrade` — this takes a single `plan` field (no billing cycle,
+no proration, no payment).
+
+**Headers**: `Authorization: Bearer <admin token>`
+
+**Request Body**:
+```json
+{
+  "plan": "pro",
+  "reason": "optional reason string"
+}
+```
+
+**Request Fields**:
+- `plan` (string, required): `starter` | `pro` | `premium` | `concierge` (legacy `free` | `monthly` | `annual` and `plan_`-prefixed IDs also accepted)
+- `reason` (string, optional): Audit reason, written to logs
+
+**Response** (200):
+```json
+{
+  "message": "Subscription plan updated",
+  "data": {
+    "id": "uuid",
+    "account_id": "uuid",
+    "old_plan": "monthly",
+    "new_plan": "annual",
+    "status": "active"
+  }
+}
+```
+**Note**: `old_plan`/`new_plan` reflect the internal enum values
+(`free`/`monthly`/`annual`) the public IDs map to: starter→free, pro→monthly,
+premium→annual, concierge→annual.
+
+**Use Case**: Admin subscription management page.
 
 ---
 
@@ -853,7 +943,7 @@ These APIs are needed to process payments when users activate a subscription pla
 **Request Body**:
 ```json
 {
-  "amount": 199.00,
+  "amount": 299.00,
   "currency": "USD",
   "payment_method": "card",
   "description": "Payment for Pro subscription",
@@ -869,7 +959,7 @@ These APIs are needed to process payments when users activate a subscription pla
 {
   "payment_intent_id": "pi_xxx",
   "client_secret": "pi_xxx_secret_xxx",
-  "amount": 199.00,
+  "amount": 299.00,
   "currency": "USD",
   "status": "requires_payment_method",
   "created_at": "2024-01-01T00:00:00Z"
@@ -993,7 +1083,7 @@ These APIs are needed to process payments when users activate a subscription pla
   "data": [
     {
       "id": "uuid",
-      "amount": 199.00,
+      "amount": 299.00,
       "currency": "USD",
       "status": "completed",
       "payment_method": "card",
@@ -1019,7 +1109,7 @@ These APIs are needed to process payments when users activate a subscription pla
 **Response** (200):
 ```json
 {
-  "total_paid": 199.00,
+  "total_paid": 299.00,
   "total_payments": 1,
   "last_payment_date": "2024-01-01T00:00:00Z",
   "payment_methods_count": 1
@@ -1048,7 +1138,7 @@ These APIs are needed to process payments when users activate a subscription pla
     "object": {
       "id": "pi_xxx",
       "status": "succeeded",
-      "amount": 19900,
+      "amount": 29900,
       "currency": "usd",
       "metadata": {
         "subscription_id": "sub_xxx",
