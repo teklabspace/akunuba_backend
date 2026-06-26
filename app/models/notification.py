@@ -16,6 +16,7 @@ class NotificationType(str, Enum):
     PAYMENT_RECEIVED = "payment_received"
     KYC_APPROVED = "kyc_approved"
     SUPPORT_REPLY = "support_reply"
+    APPRAISAL_MESSAGE = "appraisal_message"
     GENERAL = "general"
 
 
@@ -23,7 +24,10 @@ class Notification(Base):
     __tablename__ = "notifications"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    account_id = Column(UUID(as_uuid=True), ForeignKey("accounts.id"), nullable=False)
+    # User-addressable: every recipient is a user. account_id is kept (nullable)
+    # for backward compatibility and email lookup, but staff may have no account.
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True)
+    account_id = Column(UUID(as_uuid=True), ForeignKey("accounts.id"), nullable=True)
     notification_type = Column(SQLEnum(NotificationType), nullable=False)
     title = Column(String(255), nullable=False)
     message = Column(Text, nullable=False)
@@ -35,4 +39,5 @@ class Notification(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     account = relationship("Account")
+    user = relationship("User")
 

@@ -79,6 +79,7 @@ class AssetUpdate(BaseModel):
 
 class AssetResponse(BaseModel):
     id: UUID
+    asset_code: Optional[str] = None  # Human-readable code shown to users (e.g. AK-01)
     category: Optional[str] = None  # Category name from relationship
     category_id: Optional[UUID] = None
     category_group: Optional[CategoryGroup] = None

@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query, File, UploadFile, Form, Body
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func as sql_func, func, desc, asc, inspect as sqlalchemy_inspect
 from sqlalchemy.orm import selectinload
@@ -8,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from app.database import get_db
 from app.api.deps import get_current_user
 from app.models.user import User
+from app.core.permissions import Role
 from app.models.account import Account
 from app.models.asset import (
     Asset, AssetType, AssetValuation, AssetOwnership, AssetCategory, AssetPhoto,
@@ -66,6 +68,68 @@ def format_time_ago(dt: datetime) -> str:
         return f"{minutes} minute{'s' if minutes > 1 else ''} ago"
     else:
         return "Just now"
+
+
+async def generate_asset_code(db: AsyncSession) -> str:
+    """Build the next globally-unique human-readable asset code (AK-01, AK-02, ...).
+
+    Draws from the Postgres sequence `asset_code_seq` so concurrent creates never
+    collide. Falls back to a count-based number if the sequence is missing (e.g.
+    the migration has not run yet); the unique constraint still guards collisions.
+    """
+    try:
+        result = await db.execute(select(func.nextval("asset_code_seq")))
+        n = result.scalar()
+    except Exception:
+        result = await db.execute(select(func.count(Asset.id)))
+        n = (result.scalar() or 0) + 1
+    return f"AK-{int(n):02d}"
+
+
+async def resolve_readable_asset(asset_id: UUID, current_user: User, db: AsyncSession) -> Asset:
+    """Resolve an asset for a read-only operation, enforcing visibility rules.
+
+    Investors may only read assets owned by their own account; admins may read
+    any user's asset. Raises NotFoundException when the asset doesn't exist or
+    isn't visible to the caller.
+    """
+    query = select(Asset).where(Asset.id == asset_id)
+    if current_user.role != Role.ADMIN:
+        account = await get_account(current_user=current_user, db=db)
+        query = query.where(Asset.account_id == account.id)
+    asset = (await db.execute(query)).scalar_one_or_none()
+    if not asset:
+        raise NotFoundException("Asset", str(asset_id))
+    return asset
+
+
+def serialize_asset_document(doc: AssetDocument) -> Dict[str, Any]:
+    """Serialize an AssetDocument to the canonical document shape.
+
+    Shared by GET /assets/{id}/documents and the embedded documents array on
+    GET /admin/assets/{code} so both endpoints return identical fields.
+    """
+    doc_url = doc.url if doc.url else None
+    if not doc_url or not doc_url.startswith(('http://', 'https://')):
+        # If URL is relative or missing, resolve a public URL from Supabase.
+        if getattr(doc, 'supabase_storage_path', None):
+            try:
+                doc_url = SupabaseClient.get_file_url("documents", doc.supabase_storage_path)
+            except Exception as e:
+                logger.warning(f"Failed to get public URL for document {doc.id}: {e}")
+                doc_url = doc.url if doc.url else None
+
+    return {
+        "id": str(doc.id),
+        "name": doc.name,
+        "url": doc_url,  # Public download URL
+        "file_name": doc.file_name,
+        "document_type": doc.document_type,
+        "file_size": doc.file_size,
+        "type": doc.mime_type,  # MIME type
+        "date": doc.date.isoformat() if doc.date else None,
+        "created_at": doc.created_at.isoformat() if doc.created_at else None,
+    }
 
 
 def build_asset_response(asset: Asset, db: Optional[AsyncSession] = None) -> Dict[str, Any]:
@@ -182,6 +246,8 @@ def build_asset_response(asset: Asset, db: Optional[AsyncSession] = None) -> Dic
     # Build response with safe access
     response_data = {
         "id": str(asset.id),
+        "asset_code": asset.asset_code,
+        "account_id": str(asset.account_id) if asset.account_id else None,
         "category": category_name,
         "category_id": str(asset.category_id) if asset.category_id else None,
         "category_group": asset.category_group.value if asset.category_group else None,
@@ -439,10 +505,14 @@ async def create_asset(
         if metadata == "null" or metadata is None:
             metadata = {}
         
+        # Generate the human-readable, globally-unique code shown to users (AK-01, ...)
+        asset_code = await generate_asset_code(db)
+
         # EnumValueType will automatically convert enum members to their values
         # So we can pass enum members directly - TypeDecorator handles the conversion
         asset = Asset(
             account_id=account.id,
+            asset_code=asset_code,
             asset_type=asset_type,
             category_id=category_id,
             category_group=category_group_enum,
@@ -635,35 +705,46 @@ async def list_assets(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """List assets with pagination and filtering"""
+    """List assets with pagination and filtering.
+
+    Investors only ever see their own assets. Admins see every asset across all
+    users and can search by the human-readable asset code (e.g. AK-01).
+    """
     try:
-        account_result = await db.execute(
-            select(Account).where(Account.user_id == current_user.id)
-        )
-        account = account_result.scalar_one_or_none()
-        
-        if not account:
-            return {
-                "data": [],
-                "pagination": {
-                    "page": page,
-                    "limit": limit or page_size,
-                    "total": 0,
-                    "total_pages": 0
-                }
-            }
-        
+        is_admin = current_user.role == Role.ADMIN
+
         # Use limit if provided, otherwise page_size
         items_per_page = limit or page_size
-        
+
         # Build query with relationships
         query = select(Asset).options(
             selectinload(Asset.category),
             selectinload(Asset.photos),
             selectinload(Asset.documents)
-        ).where(Asset.account_id == account.id)
-        count_query = select(sql_func.count()).select_from(Asset).where(Asset.account_id == account.id)
-        
+        )
+        count_query = select(sql_func.count()).select_from(Asset)
+
+        if not is_admin:
+            # Scope to the caller's own account; no account => no assets.
+            account_result = await db.execute(
+                select(Account).where(Account.user_id == current_user.id)
+            )
+            account = account_result.scalar_one_or_none()
+
+            if not account:
+                return {
+                    "data": [],
+                    "pagination": {
+                        "page": page,
+                        "limit": items_per_page,
+                        "total": 0,
+                        "total_pages": 0
+                    }
+                }
+
+            query = query.where(Asset.account_id == account.id)
+            count_query = count_query.where(Asset.account_id == account.id)
+
         # Apply filters
         if category_id:
             query = query.where(Asset.category_id == category_id)
@@ -700,7 +781,8 @@ async def list_assets(
             search_filter = or_(
                 Asset.name.ilike(f"%{search}%"),
                 Asset.symbol.ilike(f"%{search}%"),
-                Asset.description.ilike(f"%{search}%")
+                Asset.description.ilike(f"%{search}%"),
+                Asset.asset_code.ilike(f"%{search}%")
             )
             query = query.where(search_filter)
             count_query = count_query.where(search_filter)
@@ -769,6 +851,8 @@ async def list_assets(
                 # Fallback to basic response if relationship loading fails
                 asset_responses.append({
                     "id": str(asset.id),
+                    "asset_code": asset.asset_code,
+                    "account_id": str(asset.account_id) if asset.account_id else None,
                     "name": asset.name,
                     "category": None,
                     "category_id": str(asset.category_id) if asset.category_id else None,
@@ -906,19 +990,14 @@ async def get_asset(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get asset details with all frontend-required fields"""
-    account_result = await db.execute(
-        select(Account).where(Account.user_id == current_user.id)
-    )
-    account = account_result.scalar_one_or_none()
-    
-    if not account:
-        raise NotFoundException("Account", str(current_user.id))
-    
+    """Get asset details with all frontend-required fields.
+
+    Investors can only fetch their own assets; admins can fetch any asset.
+    """
+    is_admin = current_user.role == Role.ADMIN
+
     # Get asset with all relationships
-    query = select(Asset).where(
-        and_(Asset.id == asset_id, Asset.account_id == account.id)
-    ).options(
+    query = select(Asset).where(Asset.id == asset_id).options(
         selectinload(Asset.category),
         selectinload(Asset.photos),
         selectinload(Asset.documents),
@@ -926,6 +1005,17 @@ async def get_asset(
         selectinload(Asset.ownerships),
         selectinload(Asset.appraisals)
     )
+
+    if not is_admin:
+        account_result = await db.execute(
+            select(Account).where(Account.user_id == current_user.id)
+        )
+        account = account_result.scalar_one_or_none()
+
+        if not account:
+            raise NotFoundException("Account", str(current_user.id))
+
+        query = query.where(Asset.account_id == account.id)
     
     result = await db.execute(query)
     asset = result.scalar_one_or_none()
@@ -1828,49 +1918,17 @@ async def get_asset_documents(
     db: AsyncSession = Depends(get_db)
 ):
     """Get all documents for an asset"""
-    account = await get_account(current_user=current_user, db=db)
-    
-    # Verify asset belongs to account
-    asset_result = await db.execute(
-        select(Asset).where(and_(Asset.id == asset_id, Asset.account_id == account.id))
-    )
-    asset = asset_result.scalar_one_or_none()
-    if not asset:
-        raise NotFoundException("Asset", str(asset_id))
-    
+    # Admins may read any user's asset; investors are scoped to their own.
+    asset = await resolve_readable_asset(asset_id, current_user, db)
+
     # Get documents
     result = await db.execute(
         select(AssetDocument).where(AssetDocument.asset_id == asset_id).order_by(desc(AssetDocument.created_at))
     )
     documents = result.scalars().all()
-    
-    # Ensure all document URLs are absolute (CRITICAL for frontend)
-    # Return only URLs, no IDs - URLs are the primary identifier
-    documents_data = []
-    for doc in documents:
-        # Ensure URL is absolute
-        doc_url = doc.url if doc.url else None
-        if not doc_url or not doc_url.startswith(('http://', 'https://')):
-            # If URL is relative or missing, try to get public URL from Supabase
-            if hasattr(doc, 'supabase_storage_path') and doc.supabase_storage_path:
-                try:
-                    doc_url = SupabaseClient.get_file_url("documents", doc.supabase_storage_path)
-                except Exception as e:
-                    logger.warning(f"Failed to get public URL for document {doc.id}: {e}")
-                    doc_url = doc.url if doc.url else None
-        
-        # Return only URL and metadata - NO ID
-        documents_data.append({
-            "name": doc.name,
-            "url": doc_url,  # Public URL - primary identifier
-            "file_name": doc.file_name,
-            "document_type": doc.document_type,
-            "file_size": doc.file_size if hasattr(doc, 'file_size') else None,
-            "type": doc.mime_type if hasattr(doc, 'mime_type') else None,
-            "date": doc.date.isoformat() if hasattr(doc, 'date') and doc.date else None,
-            "created_at": doc.created_at.isoformat() if doc.created_at else None
-        })
-    
+
+    documents_data = [serialize_asset_document(doc) for doc in documents]
+
     return DocumentListResponse(data=documents_data)
 
 
@@ -1923,16 +1981,9 @@ async def get_asset_value_history(
     db: AsyncSession = Depends(get_db)
 ):
     """Get value history for an asset"""
-    account = await get_account(current_user=current_user, db=db)
-    
-    # Verify asset belongs to account
-    asset_result = await db.execute(
-        select(Asset).where(and_(Asset.id == asset_id, Asset.account_id == account.id))
-    )
-    asset = asset_result.scalar_one_or_none()
-    if not asset:
-        raise NotFoundException("Asset", str(asset_id))
-    
+    # Admins may read any user's asset; investors are scoped to their own.
+    asset = await resolve_readable_asset(asset_id, current_user, db)
+
     # Build query
     query = select(AssetValuation).where(AssetValuation.asset_id == asset_id)
     
@@ -2165,6 +2216,38 @@ async def request_asset_appraisal(
         }
 
     # ---- Concierge / other types: human appraisal request (PENDING) ----
+    # Enforce one OPEN human appraisal per asset. Run before any write so a
+    # blocked request never leaves a partial record. AI ("API") is exempt
+    # (handled in the branch above and never reaches here).
+    OPEN_HUMAN_STATUSES = [
+        AppraisalStatus.PENDING,
+        AppraisalStatus.IN_PROGRESS,
+        AppraisalStatus.NEEDS_MORE_INFORMATION,
+        AppraisalStatus.PROFESSIONAL_APPRAISAL_RECOMMENDED,
+    ]
+    existing_open = (await db.execute(
+        select(AssetAppraisal)
+        .where(and_(
+            AssetAppraisal.asset_id == asset.id,
+            AssetAppraisal.appraisal_type != AppraisalType.API,
+            AssetAppraisal.status.in_(OPEN_HUMAN_STATUSES),
+        ))
+        .order_by(desc(AssetAppraisal.requested_at))
+        .limit(1)
+    )).scalar_one_or_none()
+    if existing_open is not None:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": "An appraisal is already in progress for this asset.",
+                "existing_appraisal": {
+                    "id": str(existing_open.id),
+                    "appraisal_type": existing_open.appraisal_type.value if existing_open.appraisal_type else None,
+                    "status": existing_open.status.value if existing_open.status else None,
+                },
+            },
+        )
+
     appraisal = AssetAppraisal(
         asset_id=asset.id,
         appraisal_type=appraisal_data.appraisal_type,
@@ -2177,6 +2260,10 @@ async def request_asset_appraisal(
     await db.commit()
     await db.refresh(appraisal)
 
+    # Notify staff (admins/advisors) that an investor requested a human appraisal.
+    from app.services.appraisal_notifications import dispatch_appraisal_created
+    await dispatch_appraisal_created(db, appraisal, asset, current_user)
+
     logger.info(f"Appraisal requested for asset {asset_id}: {appraisal.id}")
     return {"data": AppraisalResponse.model_validate(appraisal)}
 
@@ -2188,16 +2275,9 @@ async def get_asset_appraisals(
     db: AsyncSession = Depends(get_db)
 ):
     """Get all appraisals for an asset"""
-    account = await get_account(current_user=current_user, db=db)
-    
-    # Verify asset belongs to account
-    asset_result = await db.execute(
-        select(Asset).where(and_(Asset.id == asset_id, Asset.account_id == account.id))
-    )
-    asset = asset_result.scalar_one_or_none()
-    if not asset:
-        raise NotFoundException("Asset", str(asset_id))
-    
+    # Admins may read any user's asset; investors are scoped to their own.
+    asset = await resolve_readable_asset(asset_id, current_user, db)
+
     # Get appraisals
     result = await db.execute(
         select(AssetAppraisal).where(AssetAppraisal.asset_id == asset_id).order_by(desc(AssetAppraisal.requested_at))
@@ -2305,7 +2385,7 @@ async def post_my_appraisal_comment(
     db: AsyncSession = Depends(get_db)
 ):
     """Owner: post a message on your appraisal (always client-visible)."""
-    await _owned_appraisal_or_404(asset_id, appraisal_id, current_user, db)
+    appraisal = await _owned_appraisal_or_404(asset_id, appraisal_id, current_user, db)
 
     comment = AppraisalComment(
         appraisal_id=appraisal_id,
@@ -2318,6 +2398,12 @@ async def post_my_appraisal_comment(
     db.add(comment)
     await db.commit()
     await db.refresh(comment)
+
+    # Notify staff (admins/advisors) of the investor's message.
+    asset = (await db.execute(select(Asset).where(Asset.id == asset_id))).scalar_one_or_none()
+    if asset is not None:
+        from app.services.appraisal_notifications import dispatch_appraisal_message
+        await dispatch_appraisal_message(db, appraisal, asset, comment, current_user)
 
     logger.info(f"Investor comment added to appraisal {appraisal_id}")
     return {"data": appraisal_thread.serialize_comment(comment, current_user, for_investor=True)}
@@ -2387,6 +2473,7 @@ async def upload_my_appraisal_document(
             role=current_user.role.value,
             is_client_visible=True,
             fulfills_comment_id=fulfills_comment_id,
+            asset_id=asset_id,
         )
         if doc is not None:
             created.append(doc)
@@ -2505,15 +2592,8 @@ async def get_latest_ai_review(
     db: AsyncSession = Depends(get_db)
 ):
     """Get the latest AI review for an asset (null if none has been run)."""
-    account = await get_account(current_user=current_user, db=db)
-
-    # Verify asset belongs to account
-    asset_result = await db.execute(
-        select(Asset).where(and_(Asset.id == asset_id, Asset.account_id == account.id))
-    )
-    asset = asset_result.scalar_one_or_none()
-    if not asset:
-        raise NotFoundException("Asset", str(asset_id))
+    # Admins may read any user's asset; investors are scoped to their own.
+    asset = await resolve_readable_asset(asset_id, current_user, db)
 
     review_result = await db.execute(
         select(AssetAIReview)

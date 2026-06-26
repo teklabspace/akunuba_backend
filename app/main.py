@@ -186,6 +186,8 @@ app.include_router(chat_conversations.router, prefix=f"{settings.API_V1_PREFIX}/
 # WebSocket route (registered directly on app, not via router)
 from app.api.v1.websocket_chat import websocket_chat_endpoint
 app.websocket("/ws/chat")(websocket_chat_endpoint)
+from app.api.v1.ws_notifications import websocket_notifications_endpoint
+app.websocket(f"{settings.API_V1_PREFIX}/ws/notifications")(websocket_notifications_endpoint)
 app.include_router(analytics.router, prefix=f"{settings.API_V1_PREFIX}/analytics", tags=["Analytics"])
 app.include_router(admin.router, prefix=f"{settings.API_V1_PREFIX}/admin", tags=["Admin"])
 app.include_router(investment.router, prefix=f"{settings.API_V1_PREFIX}/investment", tags=["Investment"])

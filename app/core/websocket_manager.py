@@ -21,6 +21,10 @@ import redis.asyncio as redis
 from contextlib import asynccontextmanager
 
 
+# Redis channel for user-targeted notifications (fan-out across workers/replicas).
+USER_NOTIFICATIONS_CHANNEL = "notifications:user"
+
+
 class ConnectionManager:
     """
     Manages WebSocket connections and Redis pub/sub for real-time messaging.
@@ -60,8 +64,11 @@ class ConnectionManager:
 
             self.redis_client = await asyncio.wait_for(_connect(), timeout=5.0)
             self.redis_pubsub = self.redis_client.pubsub()
+            # Always-on subscription so user-targeted notifications fan out across
+            # workers/replicas the moment they're published.
+            await self.redis_pubsub.subscribe(USER_NOTIFICATIONS_CHANNEL)
             logger.info("[OK] Redis connected for WebSocket pub/sub")
-            
+
             # Start listening to Redis messages
             self._redis_task = asyncio.create_task(self._listen_redis())
         except asyncio.TimeoutError:
@@ -101,11 +108,19 @@ class ConnectionManager:
             async for message in self.redis_pubsub.listen():
                 if message["type"] == "message":
                     try:
+                        # User-targeted notification fan-out (this worker delivers
+                        # to its own local sockets for the target user).
+                        if message.get("channel") == USER_NOTIFICATIONS_CHANNEL:
+                            envelope = json.loads(message["data"])
+                            target_user_id = UUID(envelope["target_user_id"])
+                            await self._send_to_user_local(target_user_id, envelope["payload"])
+                            continue
+
                         data = json.loads(message["data"])
                         event_type = data.get("type")
                         conversation_id = UUID(data.get("conversation_id"))
                         user_id = UUID(data.get("user_id"))
-                        
+
                         # Broadcast to local connections in this conversation
                         await self._broadcast_to_conversation_local(
                             conversation_id=conversation_id,
@@ -193,6 +208,40 @@ class ConnectionManager:
             await websocket.send_json(message)
         except Exception as e:
             logger.error(f"Error sending personal message: {e}")
+
+    async def send_to_user(self, user_id: UUID, message: dict):
+        """Deliver a message to every active socket of a single user.
+
+        With Redis available, publishes to the user-notifications channel so all
+        workers/replicas deliver to their own local sockets (exactly once each).
+        Without Redis, delivers to this process's local sockets directly.
+        """
+        if self.redis_client:
+            try:
+                await self.redis_client.publish(
+                    USER_NOTIFICATIONS_CHANNEL,
+                    json.dumps({"target_user_id": str(user_id), "payload": message}),
+                )
+                return
+            except Exception as e:
+                logger.error(f"Error publishing user notification to Redis: {e}")
+                # Fall through to local delivery so the sending worker still notifies.
+        await self._send_to_user_local(user_id, message)
+
+    async def _send_to_user_local(self, user_id: UUID, message: dict):
+        """Send a message to a user's sockets on THIS process only."""
+        sockets = self.active_connections.get(user_id)
+        if not sockets:
+            return
+        dead = []
+        for websocket in list(sockets):
+            try:
+                await websocket.send_json(message)
+            except Exception as e:
+                logger.error(f"Error sending to user {user_id}: {e}")
+                dead.append(websocket)
+        for websocket in dead:
+            await self.disconnect(websocket, user_id)
     
     async def broadcast_to_conversation(
         self,

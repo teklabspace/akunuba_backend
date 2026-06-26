@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, AliasChoices, ConfigDict
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 from uuid import UUID
@@ -67,8 +67,14 @@ class DocumentListResponse(BaseModel):
 
 # Appraisal Schemas
 class AppraisalRequest(BaseModel):
+    # Accept either "notes" or the singular "note" from the client.
+    model_config = ConfigDict(populate_by_name=True)
+
     appraisal_type: AppraisalType
-    notes: Optional[str] = None
+    notes: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("notes", "note"),
+    )
     preferred_date: Optional[datetime] = None
 
 

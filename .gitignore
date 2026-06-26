@@ -84,3 +84,37 @@ reset_supabase_db_auto.py
 reset_supabase_db.ps1
 server_status.py
 
+# Markdown docs & generated hand-off messages (keep README)
+*.md
+!README.md
+doc/
+docs/
+
+# Extra caches
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Misc temp / backup files
+*.bak
+*.tmp
+*.orig
+*.rej
+
+# Root one-time / maintenance / destructive utility scripts (keep on disk, never commit)
+/delete_all_*.py
+/reset_*.py
+/reset_*.sql
+/setup_*.py
+/setup_*.sql
+/test_*.py
+/verify_*.py
+
+# Dev convenience launch scripts (build/deploy uses uvicorn directly)
+/*.bat
+/*.sh
+
+# SQL dumps / one-off
+*.dump
+*.sql.gz
+

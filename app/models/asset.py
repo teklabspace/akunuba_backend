@@ -196,7 +196,11 @@ class Asset(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     account_id = Column(UUID(as_uuid=True), ForeignKey("accounts.id"), nullable=False)
-    
+
+    # Human-readable, globally-unique reference shown to users (e.g. "AK-01").
+    # Generated from the Postgres sequence `asset_code_seq` on creation.
+    asset_code = Column(String(20), unique=True, index=True)
+
     # Legacy field - kept for backward compatibility
     # Database expects UPPERCASE: 'STOCK', 'BOND', 'REAL_ESTATE', 'LUXURY_ASSET', 'CRYPTO', 'OTHER'
     # Python enum has lowercase values but uppercase names

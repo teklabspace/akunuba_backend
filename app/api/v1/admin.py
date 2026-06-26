@@ -1114,3 +1114,149 @@ async def reject_kyb(
         },
     }
 
+
+# ==================== ASSETS (admin-wide search) ====================
+
+def _admin_asset_payload(asset: Asset) -> Dict[str, Any]:
+    """Build an asset response and attach owner info for admin views."""
+    from app.api.v1.assets import build_asset_response
+
+    payload = build_asset_response(asset)
+
+    owner = None
+    account = getattr(asset, "account", None)
+    if account is not None:
+        user = getattr(account, "user", None)
+        if user is not None:
+            full_name = " ".join(filter(None, [user.first_name, user.last_name])).strip()
+            owner = {
+                "user_id": str(user.id),
+                # Never null: fall back to email for legacy users without a name.
+                "name": full_name or user.email,
+                "email": user.email,
+            }
+    payload["owner"] = owner
+    return payload
+
+
+@router.get("/assets", response_model=Dict[str, Any])
+async def admin_list_assets(
+    search: Optional[str] = Query(None, description="Search by asset code (e.g. AK-01), name, symbol, or description"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=1000),
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """List and search every asset across all users — admin only.
+
+    Use `search` to find an asset by its human-readable code (AK-01), name,
+    symbol, or description.
+    """
+    from sqlalchemy import or_, desc
+    from sqlalchemy.orm import selectinload
+
+    query = select(Asset).options(
+        selectinload(Asset.category),
+        selectinload(Asset.photos),
+        selectinload(Asset.documents),
+        selectinload(Asset.account).selectinload(Account.user),
+    )
+    count_query = select(func.count(Asset.id))
+
+    if search:
+        filter_expr = or_(
+            Asset.asset_code.ilike(f"%{search}%"),
+            Asset.name.ilike(f"%{search}%"),
+            Asset.symbol.ilike(f"%{search}%"),
+            Asset.description.ilike(f"%{search}%"),
+        )
+        query = query.where(filter_expr)
+        count_query = count_query.where(filter_expr)
+
+    total = (await db.execute(count_query)).scalar() or 0
+
+    offset = (page - 1) * page_size
+    result = await db.execute(
+        query.order_by(desc(Asset.created_at)).offset(offset).limit(page_size)
+    )
+    assets = result.scalars().all()
+
+    return {
+        "data": [_admin_asset_payload(a) for a in assets],
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": (total + page_size - 1) // page_size if total > 0 else 0,
+        },
+    }
+
+
+@router.get("/assets/{asset_code}", response_model=Dict[str, Any])
+async def admin_get_asset_by_code(
+    asset_code: str,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Fetch a single asset by its human-readable code (e.g. AK-01) — admin only.
+
+    Embeds the latest AI review, latest AI appraisal result, documents, and
+    value history inline so the admin detail view needs no follow-up calls.
+    """
+    from sqlalchemy.orm import selectinload
+    from app.schemas.asset_extended import AIReviewResponse
+    from app.api.v1.assets import serialize_asset_document
+
+    result = await db.execute(
+        select(Asset)
+        .options(
+            selectinload(Asset.category),
+            selectinload(Asset.photos),
+            selectinload(Asset.documents),
+            selectinload(Asset.account).selectinload(Account.user),
+            selectinload(Asset.ai_reviews),
+            selectinload(Asset.appraisals),
+            selectinload(Asset.valuations),
+        )
+        .where(func.lower(Asset.asset_code) == asset_code.lower())
+    )
+    asset = result.scalar_one_or_none()
+
+    if not asset:
+        raise NotFoundException("Asset", asset_code)
+
+    payload = _admin_asset_payload(asset)
+
+    # --- AI review (read-only verdict shown to admins) ---
+    payload["ai_review_status"] = asset.ai_review_status.value if asset.ai_review_status else None
+    payload["ai_reviewed_at"] = asset.ai_reviewed_at.isoformat() if asset.ai_reviewed_at else None
+    # ai_reviews is ordered desc(created_at) on the model, so [0] is the latest.
+    latest_review = asset.ai_reviews[0] if asset.ai_reviews else None
+    payload["ai_review"] = (
+        AIReviewResponse.model_validate(latest_review).model_dump() if latest_review else None
+    )
+
+    # --- Latest AI appraisal result ---
+    # appraisals is ordered desc(requested_at); pick the most recent carrying ai_data.
+    latest_ai_appraisal = next((a for a in asset.appraisals if a.ai_data), None)
+    payload["ai_result"] = latest_ai_appraisal.ai_data if latest_ai_appraisal else None
+
+    # --- Value history (oldest -> newest) ---
+    _epoch = datetime.min.replace(tzinfo=timezone.utc)
+    value_history = []
+    for val in sorted(asset.valuations, key=lambda v: v.valuation_date or _epoch):
+        if val.valuation_date is None:
+            continue
+        value_history.append({
+            "date": val.valuation_date.isoformat(),
+            "value": float(val.value),
+            "currency": val.currency,
+        })
+    payload["value_history"] = value_history
+
+    # --- Documents (full parity with GET /assets/{id}/documents) ---
+    # asset.documents is ordered desc(created_at) on the model.
+    payload["documents"] = [serialize_asset_document(doc) for doc in asset.documents]
+
+    return {"data": payload}
+

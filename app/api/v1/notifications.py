@@ -1,8 +1,9 @@
 from fastapi import APIRouter, Depends, Query, Body, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
-from typing import List, Optional
+from sqlalchemy import select, and_, func
+from typing import List, Optional, Dict, Any
 from datetime import datetime
+import json
 from app.database import get_db
 from app.api.deps import get_current_user
 from app.models.user import User
@@ -17,42 +18,51 @@ from pydantic import BaseModel
 router = APIRouter()
 
 
-class NotificationResponse(BaseModel):
-    id: UUID
-    notification_type: str
-    title: str
-    message: str
-    is_read: bool
-    created_at: datetime
+def serialize_notification(n: Notification) -> Dict[str, Any]:
+    """Flatten a Notification (+ its JSON metadata) into the shape the frontend
+    consumes for both the bell and the WS popup."""
+    meta = {}
+    if n.meta_data:
+        try:
+            meta = json.loads(n.meta_data)
+        except Exception:
+            meta = {}
+    return {
+        "id": str(n.id),
+        "notification_id": str(n.id),
+        # Precise event type from metadata (e.g. appraisal_created /
+        # appraisal_message); falls back to the coarse DB enum.
+        "type": meta.get("type") or n.notification_type.value,
+        "notification_type": n.notification_type.value,
+        "title": n.title,
+        "message": n.message,
+        "preview": meta.get("preview", n.message),
+        "appraisal_id": meta.get("appraisal_id"),
+        "asset_id": meta.get("asset_id"),
+        "asset_code": meta.get("asset_code"),
+        "asset_name": meta.get("asset_name"),
+        "appraisal_type": meta.get("appraisal_type"),
+        "author_kind": meta.get("author_kind"),
+        "author_name": meta.get("author_name"),
+        "read": n.is_read,
+        "is_read": n.is_read,
+        "created_at": n.created_at.isoformat() if n.created_at else None,
+    }
 
-    class Config:
-        from_attributes = True
 
-
-@router.get("", response_model=List[NotificationResponse])
+@router.get("", response_model=List[Dict[str, Any]])
 async def get_notifications(
     unread_only: bool = Query(False),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get notifications"""
-    account_result = await db.execute(
-        select(Account).where(Account.user_id == current_user.id)
-    )
-    account = account_result.scalar_one_or_none()
-    
-    if not account:
-        raise NotFoundException("Account", str(current_user.id))
-    
-    query = select(Notification).where(Notification.account_id == account.id)
-    
+    """Get the current user's notifications (newest first)."""
+    query = select(Notification).where(Notification.user_id == current_user.id)
     if unread_only:
         query = query.where(Notification.is_read == False)
-    
+
     result = await db.execute(query.order_by(Notification.created_at.desc()))
-    notifications = result.scalars().all()
-    
-    return notifications
+    return [serialize_notification(n) for n in result.scalars().all()]
 
 
 @router.post("/{notification_id}/read")
@@ -61,33 +71,21 @@ async def mark_as_read(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Mark notification as read"""
-    account_result = await db.execute(
-        select(Account).where(Account.user_id == current_user.id)
-    )
-    account = account_result.scalar_one_or_none()
-
-    if not account:
-        raise NotFoundException("Account", str(current_user.id))
-
+    """Mark a notification as read."""
     result = await db.execute(
-        select(Notification).where(
-            and_(
-                Notification.id == notification_id,
-                Notification.account_id == account.id
-            )
-        )
+        select(Notification).where(and_(
+            Notification.id == notification_id,
+            Notification.user_id == current_user.id,
+        ))
     )
     notification = result.scalar_one_or_none()
-
     if not notification:
         raise NotFoundException("Notification", str(notification_id))
 
     notification.is_read = True
     notification.read_at = datetime.utcnow()
-    
     await db.commit()
-    
+
     return {"message": "Notification marked as read"}
 
 
@@ -96,31 +94,19 @@ async def mark_all_as_read(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Mark all notifications as read"""
-    account_result = await db.execute(
-        select(Account).where(Account.user_id == current_user.id)
-    )
-    account = account_result.scalar_one_or_none()
-
-    if not account:
-        raise NotFoundException("Account", str(current_user.id))
-
+    """Mark all of the user's notifications as read."""
     result = await db.execute(
-        select(Notification).where(
-            and_(
-                Notification.account_id == account.id,
-                Notification.is_read == False
-            )
-        )
+        select(Notification).where(and_(
+            Notification.user_id == current_user.id,
+            Notification.is_read == False,
+        ))
     )
     notifications = result.scalars().all()
-
     for notification in notifications:
         notification.is_read = True
         notification.read_at = datetime.utcnow()
-    
     await db.commit()
-    
+
     return {"message": f"{len(notifications)} notifications marked as read"}
 
 
@@ -129,53 +115,29 @@ async def get_unread_count(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get unread notification count"""
-    account_result = await db.execute(
-        select(Account).where(Account.user_id == current_user.id)
-    )
-    account = account_result.scalar_one_or_none()
-    
-    if not account:
-        return {"count": 0}
-    
-    result = await db.execute(
-        select(Notification).where(
-            and_(
-                Notification.account_id == account.id,
-                Notification.is_read == False
-            )
-        )
-    )
-    count = len(result.scalars().all())
-    
+    """Get the user's unread notification count."""
+    count = (await db.execute(
+        select(func.count(Notification.id)).where(and_(
+            Notification.user_id == current_user.id,
+            Notification.is_read == False,
+        ))
+    )).scalar() or 0
     return {"count": count}
 
 
-@router.get("/unread", response_model=List[NotificationResponse])
+@router.get("/unread", response_model=List[Dict[str, Any]])
 async def get_unread_notifications(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get unread notifications"""
-    account_result = await db.execute(
-        select(Account).where(Account.user_id == current_user.id)
-    )
-    account = account_result.scalar_one_or_none()
-    
-    if not account:
-        raise NotFoundException("Account", str(current_user.id))
-    
+    """Get the user's unread notifications (newest first)."""
     result = await db.execute(
-        select(Notification).where(
-            and_(
-                Notification.account_id == account.id,
-                Notification.is_read == False
-            )
-        ).order_by(Notification.created_at.desc())
+        select(Notification).where(and_(
+            Notification.user_id == current_user.id,
+            Notification.is_read == False,
+        )).order_by(Notification.created_at.desc())
     )
-    notifications = result.scalars().all()
-    
-    return notifications
+    return [serialize_notification(n) for n in result.scalars().all()]
 
 
 class NotificationSettingsResponse(BaseModel):
@@ -253,7 +215,7 @@ class NotificationCreate(BaseModel):
     metadata: Optional[str] = None
 
 
-@router.post("", response_model=NotificationResponse, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
 async def create_notification(
     notification_data: NotificationCreate,
     current_user: User = Depends(get_current_user),
@@ -270,7 +232,13 @@ async def create_notification(
     if not account_result.scalar_one_or_none():
         raise NotFoundException("Account", str(notification_data.account_id))
     
+    # Resolve the owning user so the notification is user-addressable.
+    owner_user_id = (await db.execute(
+        select(Account.user_id).where(Account.id == notification_data.account_id)
+    )).scalar_one_or_none()
+
     notification = Notification(
+        user_id=owner_user_id,
         account_id=notification_data.account_id,
         notification_type=notification_data.notification_type,
         title=notification_data.title,
@@ -278,13 +246,13 @@ async def create_notification(
         meta_data=notification_data.metadata,
         is_read=False
     )
-    
+
     db.add(notification)
     await db.commit()
     await db.refresh(notification)
-    
+
     logger.info(f"Notification created: {notification.id}")
-    return notification
+    return serialize_notification(notification)
 
 
 @router.delete("/{notification_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -294,30 +262,20 @@ async def delete_notification(
     db: AsyncSession = Depends(get_db)
 ):
     """Delete a notification"""
-    account_result = await db.execute(
-        select(Account).where(Account.user_id == current_user.id)
-    )
-    account = account_result.scalar_one_or_none()
-
-    if not account:
-        raise NotFoundException("Account", str(current_user.id))
-
     result = await db.execute(
-        select(Notification).where(
-            and_(
-                Notification.id == notification_id,
-                Notification.account_id == account.id
-            )
-        )
+        select(Notification).where(and_(
+            Notification.id == notification_id,
+            Notification.user_id == current_user.id,
+        ))
     )
     notification = result.scalar_one_or_none()
-    
+
     if not notification:
         raise NotFoundException("Notification", str(notification_id))
-    
+
     await db.delete(notification)
     await db.commit()
-    
+
     logger.info(f"Notification deleted: {notification_id}")
     return None
 
@@ -329,18 +287,10 @@ async def delete_all_notifications(
     db: AsyncSession = Depends(get_db)
 ):
     """Delete all notifications (or only read ones)"""
-    account_result = await db.execute(
-        select(Account).where(Account.user_id == current_user.id)
-    )
-    account = account_result.scalar_one_or_none()
-
-    if not account:
-        raise NotFoundException("Account", str(current_user.id))
-
-    query = select(Notification).where(Notification.account_id == account.id)
+    query = select(Notification).where(Notification.user_id == current_user.id)
     if read_only:
         query = query.where(Notification.is_read == True)
-    
+
     result = await db.execute(query)
     notifications = result.scalars().all()
     

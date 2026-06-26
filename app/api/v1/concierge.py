@@ -88,6 +88,56 @@ class AppraisalResponse(BaseModel):
         from_attributes = True
 
 
+def _asset_images(asset) -> tuple:
+    """Return (primary_image_url, [all_image_urls]) for an asset's photos.
+
+    Resolves relative paths to public Supabase URLs in the images bucket.
+    Requires asset.photos to be eager-loaded.
+    """
+    if asset is None or not getattr(asset, "photos", None):
+        return None, []
+    urls = []
+    primary = None
+    for photo in asset.photos:
+        url = photo.url
+        if url and not url.startswith(("http://", "https://")) and photo.supabase_storage_path:
+            try:
+                url = SupabaseClient.get_file_url("images", photo.supabase_storage_path)
+            except Exception:  # noqa: BLE001
+                continue
+        if not url:
+            continue
+        urls.append(url)
+        if photo.is_primary or primary is None:
+            primary = url
+    return primary, urls
+
+
+async def _appraisals_with_open_document_requests(db: AsyncSession, appraisal_ids: list) -> set:
+    """Return the set of appraisal ids that have at least one unfulfilled
+    document_request comment (used for the documents_requested flag)."""
+    if not appraisal_ids:
+        return set()
+
+    req_rows = (await db.execute(
+        select(AppraisalComment.id, AppraisalComment.appraisal_id).where(and_(
+            AppraisalComment.appraisal_id.in_(appraisal_ids),
+            AppraisalComment.comment_type == CommentType.DOCUMENT_REQUEST.value,
+        ))
+    )).all()
+    if not req_rows:
+        return set()
+
+    req_ids = [r.id for r in req_rows]
+    fulfilled = set((await db.execute(
+        select(AppraisalDocument.fulfills_comment_id).where(
+            AppraisalDocument.fulfills_comment_id.in_(req_ids)
+        )
+    )).scalars().all())
+
+    return {r.appraisal_id for r in req_rows if r.id not in fulfilled}
+
+
 @router.get("/appraisals", response_model=Dict[str, Any])
 async def list_appraisals(
     status_filter: Optional[AppraisalStatus] = Query(None),
@@ -97,33 +147,53 @@ async def list_appraisals(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get a list of all appraisal requests"""
-    # Check permissions - only admins and advisors can see all appraisals
-    if not has_permission(current_user.role, Permission.MANAGE_SUPPORT):
-        raise HTTPException(status_code=403, detail="Access denied")
-    
+    """Get a list of appraisal requests.
+
+    Staff (admins/advisors) see every request; an investor sees only the
+    requests on assets they own.
+    """
+    is_staff = has_permission(current_user.role, Permission.MANAGE_SUPPORT)
+
+    # An investor is scoped to their own account; no account => no requests.
+    owner_account_id = None
+    if not is_staff:
+        account = (await db.execute(
+            select(Account).where(Account.user_id == current_user.id)
+        )).scalar_one_or_none()
+        if not account:
+            return {
+                "data": [],
+                "pagination": {"page": page, "limit": limit, "total": 0, "pages": 0},
+            }
+        owner_account_id = account.id
+
     # Concierge queue is human appraisals only; API (instant AI) appraisals
-    # complete immediately and must never appear in the staff queue.
+    # complete immediately and must never appear here.
     query = select(AssetAppraisal).options(
-        selectinload(AssetAppraisal.asset)
+        selectinload(AssetAppraisal.asset).options(
+            selectinload(Asset.photos),
+            selectinload(Asset.category),
+        )
     ).where(AssetAppraisal.appraisal_type != AppraisalType.API)
-
-    if status_filter:
-        query = query.where(AssetAppraisal.status == status_filter)
-
-    # Filter by category if provided (via asset category)
-    if category:
-        query = query.join(Asset).where(Asset.category_group == category)
-
-    # Get total count
     count_query = select(func.count(AssetAppraisal.id)).where(
         AssetAppraisal.appraisal_type != AppraisalType.API
     )
-    if status_filter:
-        count_query = count_query.where(AssetAppraisal.status == status_filter)
+
+    # A single Asset join covers both investor scoping and category filtering.
+    if owner_account_id is not None or category:
+        query = query.join(Asset, Asset.id == AssetAppraisal.asset_id)
+        count_query = count_query.join(Asset, Asset.id == AssetAppraisal.asset_id)
+    if owner_account_id is not None:
+        query = query.where(Asset.account_id == owner_account_id)
+        count_query = count_query.where(Asset.account_id == owner_account_id)
     if category:
-        count_query = count_query.join(Asset).where(Asset.category_group == category)
-    
+        query = query.where(Asset.category_group == category)
+        count_query = count_query.where(Asset.category_group == category)
+
+    if status_filter:
+        query = query.where(AssetAppraisal.status == status_filter)
+        count_query = count_query.where(AssetAppraisal.status == status_filter)
+
     total_result = await db.execute(count_query)
     total = total_result.scalar() or 0
     
@@ -133,18 +203,34 @@ async def list_appraisals(
     
     result = await db.execute(query)
     appraisals = result.scalars().all()
-    
+
+    # Bulk-compute which appraisals have an OPEN document request (point 4).
+    documents_requested_ids = await _appraisals_with_open_document_requests(
+        db, [a.id for a in appraisals]
+    )
+
     # Build response
     appraisal_list = []
     for appraisal in appraisals:
-        asset_name = None
-        if appraisal.asset:
-            asset_name = appraisal.asset.name
-        
+        asset = appraisal.asset
+        asset_name = asset.name if asset else None
+        asset_code = asset.asset_code if asset else None
+        category = asset.category.name if asset and asset.category else None
+        category_group = (
+            asset.category_group.value if asset and asset.category_group else None
+        )
+        primary_image, images = _asset_images(asset)
+
         appraisal_data = {
             "id": appraisal.id,
             "asset_id": appraisal.asset_id,
+            "asset_code": asset_code,
             "asset_name": asset_name,
+            "asset_image": primary_image,   # single URL for the card
+            "image": primary_image,         # alias
+            "images": images,               # all image URLs
+            "category": category,
+            "category_group": category_group,
             "appraisal_type": appraisal.appraisal_type.value if appraisal.appraisal_type else None,
             "status": appraisal.status.value if appraisal.status else None,
             "estimated_value": float(appraisal.estimated_value) if appraisal.estimated_value else None,
@@ -152,9 +238,10 @@ async def list_appraisals(
             "completed_at": appraisal.completed_at.isoformat() if appraisal.completed_at else None,
             "estimated_completion_date": appraisal.estimated_completion_date.isoformat() if appraisal.estimated_completion_date else None,
             "notes": appraisal.notes,
+            "documents_requested": appraisal.id in documents_requested_ids,
         }
         appraisal_list.append(appraisal_data)
-    
+
     return {
         "data": appraisal_list,
         "pagination": {
@@ -315,22 +402,33 @@ async def assign_appraisal(
 async def upload_appraisal_documents(
     appraisal_id: UUID,
     files: List[UploadFile] = File(...),
-    is_client_visible: bool = Query(True, description="If false, the document is staff-internal and hidden from the investor"),
+    is_client_visible: bool = Query(True, description="Staff only: if false, the document is staff-internal and hidden from the investor"),
+    fulfills_comment_id: Optional[UUID] = Query(None, description="Optional document_request comment id this upload fulfills"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Staff: upload one or more documents to an appraisal.
+    """Upload one or more documents to an appraisal.
 
-    is_client_visible=false keeps a document staff-internal.
+    Staff may set is_client_visible=false to keep a document staff-internal.
+    The owning investor may also upload (always client-visible). Client-visible
+    uploads are mirrored onto the asset's document list.
     """
-    if not has_permission(current_user.role, Permission.MANAGE_SUPPORT):
-        raise HTTPException(status_code=403, detail="Access denied")
+    appraisal, is_staff, is_owner = await _appraisal_with_access(db, appraisal_id, current_user)
 
-    appraisal = (await db.execute(
-        select(AssetAppraisal).where(AssetAppraisal.id == appraisal_id)
-    )).scalar_one_or_none()
-    if not appraisal:
-        raise NotFoundException("Appraisal", str(appraisal_id))
+    # Investors can never upload staff-internal documents.
+    effective_visible = is_client_visible if is_staff else True
+
+    # If fulfilling a request, validate it's a document_request on this appraisal.
+    if fulfills_comment_id is not None:
+        req = (await db.execute(
+            select(AppraisalComment).where(and_(
+                AppraisalComment.id == fulfills_comment_id,
+                AppraisalComment.appraisal_id == appraisal_id,
+                AppraisalComment.comment_type == CommentType.DOCUMENT_REQUEST.value,
+            ))
+        )).scalar_one_or_none()
+        if not req:
+            raise BadRequestException("fulfills_comment_id is not a document request on this appraisal")
 
     created = []
     for file in files:
@@ -338,7 +436,9 @@ async def upload_appraisal_documents(
             db, appraisal_id, file,
             user_id=current_user.id,
             role=current_user.role.value,
-            is_client_visible=is_client_visible,
+            is_client_visible=effective_visible,
+            fulfills_comment_id=fulfills_comment_id,
+            asset_id=appraisal.asset_id,
         )
         if doc is not None:
             created.append(doc)
@@ -347,9 +447,9 @@ async def upload_appraisal_documents(
     for doc in created:
         await db.refresh(doc)
 
-    logger.info(f"Staff uploaded {len(created)} document(s) to appraisal {appraisal_id}")
+    logger.info(f"User {current_user.id} uploaded {len(created)} document(s) to appraisal {appraisal_id}")
     return {
-        "data": [appraisal_thread.serialize_document(d, current_user, for_investor=False) for d in created],
+        "data": [appraisal_thread.serialize_document(d, current_user, for_investor=not is_staff) for d in created],
         "count": len(created),
     }
 
@@ -395,6 +495,36 @@ async def _load_appraisal_or_404(db: AsyncSession, appraisal_id: UUID) -> AssetA
     return appraisal
 
 
+async def _appraisal_with_access(db: AsyncSession, appraisal_id: UUID, current_user: User):
+    """Load an appraisal and authorize the caller.
+
+    Staff (MANAGE_SUPPORT) get full access; otherwise the caller must own the
+    asset the appraisal belongs to. Returns (appraisal, is_staff, is_owner).
+    """
+    appraisal = (await db.execute(
+        select(AssetAppraisal)
+        .options(selectinload(AssetAppraisal.asset))
+        .where(AssetAppraisal.id == appraisal_id)
+    )).scalar_one_or_none()
+    if not appraisal:
+        raise NotFoundException("Appraisal", str(appraisal_id))
+
+    is_staff = has_permission(current_user.role, Permission.MANAGE_SUPPORT)
+    is_owner = False
+    if not is_staff and appraisal.asset is not None:
+        owner = (await db.execute(
+            select(Account.id).where(and_(
+                Account.id == appraisal.asset.account_id,
+                Account.user_id == current_user.id,
+            ))
+        )).scalar_one_or_none()
+        is_owner = owner is not None
+
+    if not is_staff and not is_owner:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return appraisal, is_staff, is_owner
+
+
 @router.post("/appraisals/{appraisal_id}/comments", response_model=Dict[str, Any])
 async def add_appraisal_comment(
     appraisal_id: UUID,
@@ -402,30 +532,40 @@ async def add_appraisal_comment(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Staff: post a comment on an appraisal.
+    """Post a comment on an appraisal.
 
-    is_internal=true keeps it staff-only (never shown to the investor).
-    comment_type can be 'message' or 'system'; use the dedicated
-    /document-requests endpoint for document requests.
+    Staff may set is_internal=true (staff-only) and comment_type 'message'/'system'.
+    The owning investor may also reply; their comment is always a client-visible
+    message. Use the dedicated /document-requests endpoint for document requests.
     """
-    if not has_permission(current_user.role, Permission.MANAGE_SUPPORT):
-        raise HTTPException(status_code=403, detail="Access denied")
-    await _load_appraisal_or_404(db, appraisal_id)
+    appraisal, is_staff, is_owner = await _appraisal_with_access(db, appraisal_id, current_user)
+
+    if is_staff:
+        comment_type = comment_data.comment_type.value
+        is_internal = comment_data.is_internal
+    else:
+        # Investors can only post visible messages, never internal/system notes.
+        comment_type = CommentType.MESSAGE.value
+        is_internal = False
 
     comment = AppraisalComment(
         appraisal_id=appraisal_id,
         author_user_id=current_user.id,
         author_role=current_user.role.value,
         body=comment_data.body,
-        comment_type=comment_data.comment_type.value,
-        is_internal=comment_data.is_internal,
+        comment_type=comment_type,
+        is_internal=is_internal,
     )
     db.add(comment)
     await db.commit()
     await db.refresh(comment)
 
-    logger.info(f"Staff comment added to appraisal {appraisal_id} (internal={comment_data.is_internal})")
-    return {"data": appraisal_thread.serialize_comment(comment, current_user, for_investor=False)}
+    if appraisal.asset is not None:
+        from app.services.appraisal_notifications import dispatch_appraisal_message
+        await dispatch_appraisal_message(db, appraisal, appraisal.asset, comment, current_user)
+
+    logger.info(f"Comment added to appraisal {appraisal_id} by {current_user.id} (staff={is_staff}, internal={is_internal})")
+    return {"data": appraisal_thread.serialize_comment(comment, current_user, for_investor=not is_staff)}
 
 
 @router.post("/appraisals/{appraisal_id}/document-requests", response_model=Dict[str, Any])
@@ -442,7 +582,13 @@ async def request_appraisal_document(
     """
     if not has_permission(current_user.role, Permission.MANAGE_SUPPORT):
         raise HTTPException(status_code=403, detail="Access denied")
-    await _load_appraisal_or_404(db, appraisal_id)
+    appraisal = (await db.execute(
+        select(AssetAppraisal)
+        .options(selectinload(AssetAppraisal.asset))
+        .where(AssetAppraisal.id == appraisal_id)
+    )).scalar_one_or_none()
+    if not appraisal:
+        raise NotFoundException("Appraisal", str(appraisal_id))
 
     comment = AppraisalComment(
         appraisal_id=appraisal_id,
@@ -455,6 +601,10 @@ async def request_appraisal_document(
     db.add(comment)
     await db.commit()
     await db.refresh(comment)
+
+    if appraisal.asset is not None:
+        from app.services.appraisal_notifications import dispatch_appraisal_message
+        await dispatch_appraisal_message(db, appraisal, appraisal.asset, comment, current_user)
 
     logger.info(f"Document requested on appraisal {appraisal_id}")
     return {
@@ -474,30 +624,34 @@ async def get_appraisal_comments(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Staff: list all comments on an appraisal (including staff-internal).
+    """List comments on an appraisal.
+
+    Staff see everything (including staff-internal). The owning investor sees
+    only client-visible comments. Each item carries `author_kind`
+    (investor | staff | system) and a matching `from` label for chat alignment.
 
     Legacy free-text from asset_appraisals.notes is returned separately under
     `legacy_notes` so historical appraisals can still be shown read-only.
     """
-    if not has_permission(current_user.role, Permission.MANAGE_SUPPORT):
-        raise HTTPException(status_code=403, detail="Access denied")
+    appraisal, is_staff, is_owner = await _appraisal_with_access(db, appraisal_id, current_user)
 
-    appraisal = await _load_appraisal_or_404(db, appraisal_id)
+    comment_query = select(AppraisalComment).where(AppraisalComment.appraisal_id == appraisal_id)
+    if not is_staff:
+        # Investors never see staff-internal comments.
+        comment_query = comment_query.where(AppraisalComment.is_internal.is_(False))
+    comment_query = comment_query.order_by(AppraisalComment.created_at)
 
-    comments = (await db.execute(
-        select(AppraisalComment)
-        .where(AppraisalComment.appraisal_id == appraisal_id)
-        .order_by(AppraisalComment.created_at)
-    )).scalars().all()
+    comments = (await db.execute(comment_query)).scalars().all()
 
     authors = await appraisal_thread.author_map(db, comments)
     return {
         "data": [
-            appraisal_thread.serialize_comment(c, authors.get(c.author_user_id), for_investor=False)
+            appraisal_thread.serialize_comment(c, authors.get(c.author_user_id), for_investor=not is_staff)
             for c in comments
         ],
         "count": len(comments),
-        "legacy_notes": appraisal.notes,
+        # Legacy notes are staff-internal context; hide from investors.
+        "legacy_notes": appraisal.notes if is_staff else None,
     }
 
 
@@ -641,34 +795,62 @@ async def get_appraisal_statistics(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get statistics for concierge appraisals"""
-    # Check permissions
-    if not has_permission(current_user.role, Permission.MANAGE_SUPPORT):
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    # Total requests
-    total_result = await db.execute(
-        select(func.count(AssetAppraisal.id))
+    """Get statistics for concierge (human) appraisals.
+
+    Staff see totals across all requests; an investor sees only their own.
+    Excludes API (instant AI) appraisals to match the concierge queue.
+    """
+    is_staff = has_permission(current_user.role, Permission.MANAGE_SUPPORT)
+
+    # Base scope: human appraisals only (exclude instant AI).
+    base_filters = [AssetAppraisal.appraisal_type != AppraisalType.API]
+
+    if not is_staff:
+        account = (await db.execute(
+            select(Account).where(Account.user_id == current_user.id)
+        )).scalar_one_or_none()
+        if not account:
+            empty = {
+                "total_requests": 0, "totalRequests": 0,
+                "pending": 0,
+                "in_progress": 0, "inProgress": 0,
+                "completed": 0,
+                "awaiting_info": 0, "awaitingInfo": 0,
+                "by_status": {},
+            }
+            return empty
+        base_filters.append(Asset.account_id == account.id)
+
+    # By status (single grouped query); join Asset only when investor-scoped.
+    status_query = select(
+        AssetAppraisal.status,
+        func.count(AssetAppraisal.id).label("count"),
     )
-    total_requests = total_result.scalar() or 0
-    
-    # By status
-    status_result = await db.execute(
-        select(
-            AssetAppraisal.status,
-            func.count(AssetAppraisal.id).label("count")
-        ).group_by(AssetAppraisal.status)
-    )
+    if not is_staff:
+        status_query = status_query.join(Asset, Asset.id == AssetAppraisal.asset_id)
+    status_query = status_query.where(and_(*base_filters)).group_by(AssetAppraisal.status)
+
     by_status = {
         row.status.value: row.count
-        for row in status_result.all()
+        for row in (await db.execute(status_query)).all()
     }
-    
+
+    total_requests = sum(by_status.values())
+    in_progress = by_status.get(AppraisalStatus.IN_PROGRESS.value, 0)
+    completed = by_status.get(AppraisalStatus.COMPLETED.value, 0)
+    pending = by_status.get(AppraisalStatus.PENDING.value, 0)
+    # "Awaiting Info" maps to the NEEDS_MORE_INFORMATION status.
+    awaiting_info = by_status.get(AppraisalStatus.NEEDS_MORE_INFORMATION.value, 0)
+
     return {
+        # snake_case (existing) + camelCase (frontend) keys, both populated.
         "total_requests": total_requests,
-        "in_progress": by_status.get(AppraisalStatus.IN_PROGRESS.value, 0),
-        "completed": by_status.get(AppraisalStatus.COMPLETED.value, 0),
-        "pending": by_status.get(AppraisalStatus.PENDING.value, 0),
-        "awaiting_info": 0,  # Not a status in current enum, but frontend expects it
-        "by_status": by_status
+        "totalRequests": total_requests,
+        "pending": pending,
+        "in_progress": in_progress,
+        "inProgress": in_progress,
+        "completed": completed,
+        "awaiting_info": awaiting_info,
+        "awaitingInfo": awaiting_info,
+        "by_status": by_status,
     }

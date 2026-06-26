@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.user import User
-from app.models.asset import AppraisalComment, AppraisalDocument, CommentType
+from app.models.asset import AppraisalComment, AppraisalDocument, AssetDocument, CommentType
 from app.integrations.supabase_client import SupabaseClient
 
 STAFF_ROLES = {"admin", "advisor"}
@@ -59,12 +59,28 @@ def document_url(doc: AppraisalDocument) -> str:
     return SupabaseClient.get_file_url(DOCUMENTS_BUCKET, doc.storage_path)
 
 
+def author_kind(role: str, comment_type: str) -> str:
+    """Normalize the comment author into investor | staff | system.
+
+    The frontend uses this to align messages (investor right, staff/system left)
+    without parsing display names.
+    """
+    if comment_type == CommentType.SYSTEM.value:
+        return "system"
+    if role in STAFF_ROLES:
+        return "staff"
+    return "investor"
+
+
 def serialize_comment(c: AppraisalComment, author: Optional[User], *, for_investor: bool) -> dict:
+    kind = author_kind(c.author_role, c.comment_type)
     data = {
         "id": str(c.id),
         "appraisal_id": str(c.appraisal_id),
-        "author_role": c.author_role,
+        "author_role": c.author_role,        # raw role: admin | advisor | investor
+        "author_kind": kind,                  # normalized: investor | staff | system
         "author_name": display_author_name(author, c.author_role, for_investor=for_investor),
+        "from": kind,                         # stable alignment label
         "body": c.body,
         "comment_type": c.comment_type,
         "created_at": c.created_at.isoformat() if c.created_at else None,
@@ -101,11 +117,16 @@ async def create_appraisal_document(
     role: str,
     is_client_visible: bool,
     fulfills_comment_id: Optional[UUID] = None,
+    asset_id: Optional[UUID] = None,
 ) -> Optional[AppraisalDocument]:
     """Validate, upload to Supabase, and persist one appraisal document.
 
     Returns the created (unflushed) AppraisalDocument, or None if the file was
     rejected (bad extension / too large / upload failure). Caller commits.
+
+    When asset_id is provided and the document is client-visible, an
+    AssetDocument is also created so the file appears in the asset's document
+    list (GET /assets/{id}/documents).
     """
     from app.config import settings
 
@@ -144,6 +165,26 @@ async def create_appraisal_document(
         fulfills_comment_id=fulfills_comment_id,
     )
     db.add(doc)
+
+    # Mirror client-visible uploads onto the asset so they show up in the
+    # asset's document list as well as the appraisal thread.
+    if asset_id is not None and is_client_visible:
+        try:
+            public_url = SupabaseClient.get_file_url(DOCUMENTS_BUCKET, storage_path)
+        except Exception:  # noqa: BLE001
+            public_url = storage_path
+        db.add(AssetDocument(
+            asset_id=asset_id,
+            name=filename,
+            document_type="Appraisal Document",
+            file_name=filename,
+            file_path=storage_path,
+            file_size=file_size,
+            mime_type=file.content_type,
+            url=public_url,
+            supabase_storage_path=storage_path,
+        ))
+
     return doc
 
 
