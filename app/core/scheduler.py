@@ -450,6 +450,10 @@ async def process_subscription_retry_and_downgrade():
             for sub in expired_result.scalars().all():
                 if sub.plan != SubscriptionPlan.FREE:
                     sub.plan = SubscriptionPlan.FREE
+                    # Keep the explicit tier/cycle columns consistent with the
+                    # legacy enum so reads (get_plan_tier) don't report a stale tier.
+                    sub.plan_tier = "starter"
+                    sub.billing_cycle = "monthly"
                     await NotificationService.create_notification(
                         db=db,
                         account_id=sub.account_id,

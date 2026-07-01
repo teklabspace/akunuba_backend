@@ -13,11 +13,16 @@ from app.models.kyb import KYBVerification, KYBStatus
 from app.models.marketplace import MarketplaceListing, ListingStatus, EscrowTransaction, EscrowStatus
 from app.models.support import SupportTicket, TicketStatus
 from app.models.asset import Asset
-from app.core.exceptions import NotFoundException, BadRequestException, ForbiddenException
+from app.core.exceptions import NotFoundException, BadRequestException, ForbiddenException, ConflictException
 from app.core.permissions import Permission, has_permission
+from app.core.security import get_password_hash, generate_reset_token
+from app.services.email_service import EmailService
+from app.config import settings
 from app.utils.logger import logger
 from uuid import UUID
-from pydantic import BaseModel
+import secrets
+import json
+from pydantic import BaseModel, EmailStr
 
 router = APIRouter()
 
@@ -346,6 +351,130 @@ class RoleUpdateRequest(BaseModel):
     role: Role
 
 
+class CreateUserRequest(BaseModel):
+    """Admin-created staff user. Only advisors can be created here — new admins are
+    made by promoting an existing user via PATCH /admin/users/{id}/role."""
+    email: EmailStr
+    first_name: str
+    last_name: str
+    phone: Optional[str] = None
+    # Role is assigned by the backend (always "advisor"); the frontend should OMIT
+    # this field. It is accepted only for backward/explicit callers and, if sent,
+    # must equal "advisor" — any other value is rejected with ROLE_NOT_ALLOWED.
+    role: Optional[str] = "advisor"
+    # Password mode (admin's choice):
+    #   - provide `password`        -> admin sets the initial password; advisor can
+    #                                  log in immediately (no invite email sent).
+    #   - omit `password` (default) -> advisor is emailed a set-password invite link.
+    password: Optional[str] = None
+
+
+@router.post("/users", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
+async def create_user(
+    body: CreateUserRequest,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create an advisor account — admin only.
+
+    The advisor is created pre-verified (no OTP). Password handling is the admin's
+    choice: if ``password`` is provided the admin sets it directly and the advisor
+    can log in immediately; otherwise the advisor is emailed a set-password invite
+    link (reuses the password-reset token flow). Investors must self-register;
+    admins are made by role promotion.
+    """
+    # Enforce advisor-only creation.
+    requested_role = (body.role or "advisor").strip().lower()
+    if requested_role != "advisor":
+        raise BadRequestException(
+            "Only advisors can be created here. Promote an existing user to admin "
+            "via PATCH /admin/users/{id}/role.",
+            code="ROLE_NOT_ALLOWED",
+        )
+
+    # Reject duplicate email.
+    existing = await db.execute(select(User).where(User.email == body.email))
+    if existing.scalar_one_or_none():
+        raise ConflictException("A user with this email already exists.")
+
+    now = datetime.now(timezone.utc)
+    chosen_password = (body.password or "").strip()
+    invite_token: Optional[str] = None
+
+    if chosen_password:
+        # Mode A: admin sets the password — advisor can log in right away.
+        if len(chosen_password) < 8:
+            raise BadRequestException(
+                "Password must be at least 8 characters.", code="VALIDATION_ERROR"
+            )
+        hashed_password = get_password_hash(chosen_password)
+        reset_token = None
+        reset_expires = None
+    else:
+        # Mode B: no password — store an unusable random hash and email an invite
+        # link so the advisor sets their own password.
+        hashed_password = get_password_hash(secrets.token_urlsafe(32))
+        invite_token = generate_reset_token()
+        reset_token = invite_token
+        reset_expires = now + timedelta(days=7)
+
+    user = User(
+        email=body.email,
+        hashed_password=hashed_password,
+        first_name=body.first_name,
+        last_name=body.last_name,
+        phone=body.phone,
+        role=Role.ADVISOR,
+        is_active=True,
+        # Pre-verified: advisor skips the OTP/email-verification step entirely.
+        is_verified=True,
+        email_verified_at=now,
+        password_reset_token=reset_token,
+        password_reset_expires_at=reset_expires,
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+
+    email_sent = False
+    if invite_token:
+        invite_name = f"{body.first_name or ''} {body.last_name or ''}".strip() or "there"
+        email_sent = await EmailService.send_advisor_invite_email(
+            to_email=user.email,
+            to_name=invite_name,
+            invite_token=invite_token,
+        )
+        if not email_sent:
+            logger.error(f"Advisor invite email failed to send for {user.email}")
+
+    logger.info(
+        f"Admin {current_user.id} created advisor {user.id} ({user.email}); "
+        f"password_set={bool(chosen_password)}"
+    )
+
+    data = {
+        "id": str(user.id),
+        "email": user.email,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "role": user.role.value,
+        "is_active": user.is_active,
+        "is_verified": user.is_verified,
+        "password_set": bool(chosen_password),
+        "invite_email_sent": email_sent,
+    }
+    # Surface the invite link in development to ease testing (mirrors /auth/register).
+    if settings.APP_ENV == "development" and invite_token:
+        data["invite_token"] = invite_token
+
+    message = (
+        "Advisor created with the password you set. They can log in now."
+        if chosen_password
+        else "Advisor created. An invitation to set their password has been emailed."
+    )
+    return {"message": message, "data": data}
+
+
 @router.get("/users", response_model=Dict[str, Any])
 async def list_users(
     search: Optional[str] = Query(None, description="Search by name or email"),
@@ -436,9 +565,10 @@ async def get_user_detail(
     )
     account = account_result.scalar_one_or_none()
 
-    # Subscription info
+    # Subscription info — report the real product tier, not the legacy enum.
     subscription_plan = None
     if account:
+        from app.api.v1.subscriptions import get_plan_tier
         sub_result = await db.execute(
             select(Subscription).where(
                 Subscription.account_id == account.id,
@@ -446,7 +576,7 @@ async def get_user_detail(
             )
         )
         sub = sub_result.scalar_one_or_none()
-        subscription_plan = sub.plan.value if sub else "free"
+        subscription_plan = get_plan_tier(sub) if sub else None
 
     # KYC status
     kyc_status = None
@@ -512,6 +642,89 @@ async def update_user_role(
             "email": user.email,
             "old_role": old_role,
             "new_role": user.role.value,
+        },
+    }
+
+
+@router.post("/users/{user_id}/kyc/approve", response_model=Dict[str, Any])
+async def approve_user_kyc(
+    user_id: UUID,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Manually approve a user's KYC from user management — admin only.
+
+    Fallback for when a user (e.g. an advisor) can't get verified through Persona
+    self-service. Works whether or not they ever started Persona: the account and a
+    KYC record are created if missing, then marked APPROVED. Admins don't need KYC,
+    so approving an admin is rejected.
+    """
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise NotFoundException("User", str(user_id))
+    if user.role == Role.ADMIN:
+        raise BadRequestException("Admins do not require KYC verification.")
+
+    # Ensure the user has an account (auto-create, mirroring KYC start).
+    account_result = await db.execute(select(Account).where(Account.user_id == user.id))
+    account = account_result.scalar_one_or_none()
+    if not account:
+        account_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or user.email.split("@")[0]
+        account = Account(
+            user_id=user.id,
+            account_type=AccountType.INDIVIDUAL,
+            account_name=account_name,
+            is_joint=False,
+        )
+        db.add(account)
+        await db.commit()
+        await db.refresh(account)
+
+    # Find or create the KYC record, then approve it.
+    kyc_result = await db.execute(
+        select(KYCVerification).where(KYCVerification.account_id == account.id)
+    )
+    kyc = kyc_result.scalar_one_or_none()
+    if kyc and kyc.status == KYCStatus.APPROVED:
+        raise BadRequestException("KYC is already approved")
+
+    if not kyc:
+        kyc = KYCVerification(
+            account_id=account.id,
+            status=KYCStatus.APPROVED,
+            verification_level="manual_admin",
+            verified_at=datetime.utcnow(),
+        )
+        db.add(kyc)
+    else:
+        kyc.status = KYCStatus.APPROVED
+        kyc.verified_at = datetime.utcnow()
+        kyc.rejection_reason = None
+    await db.commit()
+    await db.refresh(kyc)
+
+    # Notify the user.
+    try:
+        from app.services.notification_service import NotificationService, NotificationType
+        await NotificationService.create_notification(
+            db=db,
+            account_id=account.id,
+            notification_type=NotificationType.KYC_APPROVED,
+            title="KYC Verification Approved",
+            message="Your identity verification has been approved by an administrator. You now have full access.",
+        )
+    except Exception as e:
+        logger.warning(f"Failed to send KYC approval notification: {e}")
+
+    logger.info(f"Admin {current_user.id} manually approved KYC for user {user_id}")
+    return {
+        "message": "KYC approved",
+        "data": {
+            "user_id": str(user.id),
+            "account_id": str(account.id),
+            "kyc_id": str(kyc.id),
+            "status": kyc.status.value,
         },
     }
 
@@ -621,22 +834,29 @@ async def list_all_subscriptions(
 ):
     """List all subscriptions across all accounts — admin only"""
     from sqlalchemy import or_
+    from app.api.v1.subscriptions import PLANS_CONFIG, get_plan_tier, get_billing_cycle
 
-    # Join subscriptions → accounts → users for search
+    # Join subscriptions → accounts → users for search. Only investors hold plans,
+    # so admin/advisor accounts are excluded from billing views.
     query = (
         select(Subscription, Account, User)
         .join(Account, Subscription.account_id == Account.id)
         .join(User, Account.user_id == User.id)
+        .where(User.role == Role.INVESTOR)
     )
     count_query = (
         select(func.count(Subscription.id))
         .join(Account, Subscription.account_id == Account.id)
         .join(User, Account.user_id == User.id)
+        .where(User.role == Role.INVESTOR)
     )
 
     if plan:
-        query = query.where(Subscription.plan == plan)
-        count_query = count_query.where(Subscription.plan == plan)
+        # Filter by the product tier (starter/pro/premium). Accepts tier IDs and
+        # legacy free/monthly/annual values; all resolve to a canonical tier.
+        tier = resolve_admin_plan_id(plan) or plan
+        query = query.where(Subscription.plan_tier == tier)
+        count_query = count_query.where(Subscription.plan_tier == tier)
 
     if sub_status:
         query = query.where(Subscription.status == sub_status)
@@ -662,16 +882,24 @@ async def list_all_subscriptions(
 
     data = []
     for sub, acc, usr in rows:
+        plan_id = get_plan_tier(sub)
+        plan_config = PLANS_CONFIG.get(plan_id, PLANS_CONFIG["starter"])
         data.append({
             "id": str(sub.id),
             "account_id": str(sub.account_id),
             "user_id": str(usr.id),
             "user_email": usr.email,
             "user_name": f"{usr.first_name or ''} {usr.last_name or ''}".strip() or None,
+            # Real product tier the customer bought (fixes "$49 shows Free").
+            "plan_id": plan_id,
+            "plan_name": plan_config["name"],
+            "billing_cycle": get_billing_cycle(sub),
+            # Legacy internal enum kept for backward compatibility with old clients.
             "plan": sub.plan.value,
             "status": sub.status.value,
             "amount": float(sub.amount),
             "currency": sub.currency,
+            "cancel_at_period_end": bool(getattr(sub, "cancel_at_period_end", False)),
             "current_period_start": sub.current_period_start.isoformat() if sub.current_period_start else None,
             "current_period_end": sub.current_period_end.isoformat() if sub.current_period_end else None,
             "cancelled_at": sub.cancelled_at.isoformat() if sub.cancelled_at else None,
@@ -784,12 +1012,16 @@ async def admin_change_subscription_plan(
 
     # 3) Apply plan + price + a fresh billing period coherently.
     sub.plan = internal_plan
+    sub.plan_tier = plan_id
+    sub.billing_cycle = billing_cycle
     price = PLAN_PRICES.get(plan_id, {}).get(billing_cycle)
     if price is not None:  # concierge has custom (None) pricing — leave amount as-is
         sub.amount = price
     now = datetime.now(timezone.utc)
     sub.current_period_start = now
     sub.current_period_end = now + (timedelta(days=365) if billing_cycle == "annual" else timedelta(days=30))
+    # An explicit plan change clears any pending end-of-period cancellation.
+    sub.cancel_at_period_end = False
 
     # Reactivate if it was expired/cancelled
     if sub.status in (SubscriptionStatus.CANCELLED, SubscriptionStatus.EXPIRED):
@@ -817,6 +1049,623 @@ async def admin_change_subscription_plan(
             "status": sub.status.value,
             "current_period_end": sub.current_period_end.isoformat(),
         },
+    }
+
+
+# ==================== ADMIN SUPPORT DASHBOARD (read-only) ====================
+# Dedicated admin-scoped, read-only endpoints powering /dashboard/support-dashboard.
+# These are SEPARATE from /support/* and /chat/* — those existing APIs are unchanged.
+
+from sqlalchemy.orm import aliased
+
+
+def _full_name(u) -> Optional[str]:
+    if u is None:
+        return None
+    return f"{u.first_name or ''} {u.last_name or ''}".strip() or u.email
+
+
+def _asset_request_row(req_type: str, req, asset, usr, assignee=None) -> Dict[str, Any]:
+    created = getattr(req, "created_at", None) or getattr(req, "requested_at", None)
+    status_val = req.status.value if hasattr(req.status, "value") else str(req.status)
+    return {
+        "id": str(req.id),
+        "type": req_type,  # "appraisal" | "sale"
+        "status": status_val,
+        "asset": {"id": str(asset.id), "name": asset.name},
+        "requested_by": {"id": str(usr.id), "name": _full_name(usr), "email": usr.email},
+        "assigned_advisor": (
+            {"id": str(assignee.id), "name": _full_name(assignee)} if assignee else None
+        ),
+        "created_at": created.isoformat() if created else None,
+    }
+
+
+@router.get("/support/tickets", response_model=Dict[str, Any])
+async def admin_list_tickets(
+    ticket_status: Optional[TicketStatus] = Query(None, alias="status", description="open | in_progress | resolved | closed"),
+    search: Optional[str] = Query(None, description="Search subject/description or requester name/email"),
+    limit: int = Query(50, ge=1, le=200),
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """All support tickets across all users — admin only, rich shape for the dashboard."""
+    from sqlalchemy import or_
+
+    Requester = aliased(User)
+    Assignee = aliased(User)
+    q = (
+        select(SupportTicket, Requester, Assignee)
+        .join(Account, SupportTicket.account_id == Account.id)
+        .join(Requester, Account.user_id == Requester.id)
+        .outerjoin(Assignee, SupportTicket.assigned_to == Assignee.id)
+    )
+    if ticket_status:
+        q = q.where(SupportTicket.status == ticket_status)
+    if search:
+        like = f"%{search}%"
+        q = q.where(or_(
+            SupportTicket.subject.ilike(like),
+            SupportTicket.description.ilike(like),
+            Requester.email.ilike(like),
+            Requester.first_name.ilike(like),
+            Requester.last_name.ilike(like),
+        ))
+    q = q.order_by(SupportTicket.created_at.desc()).limit(limit)
+    rows = (await db.execute(q)).all()
+
+    data = []
+    for ticket, requester, assignee in rows:
+        data.append({
+            "id": str(ticket.id),
+            "subject": ticket.subject,
+            "description": ticket.description,
+            "status": ticket.status.value,
+            "priority": ticket.priority.value,
+            "category": ticket.category,
+            "user_name": _full_name(requester),
+            "user_email": requester.email if requester else None,
+            "assigned_advisor": (
+                {"id": str(assignee.id), "name": _full_name(assignee)} if assignee else None
+            ),
+            "created_at": ticket.created_at.isoformat() if ticket.created_at else None,
+            "updated_at": ticket.updated_at.isoformat() if ticket.updated_at else None,
+        })
+    return {"data": data, "total": len(data), "limit": limit}
+
+
+@router.get("/asset-requests", response_model=Dict[str, Any])
+async def admin_list_asset_requests(
+    request_type: Optional[str] = Query(None, alias="type", description="appraisal | sale"),
+    req_status: Optional[str] = Query(None, alias="status", description="Filter by status"),
+    search: Optional[str] = Query(None, description="Search by asset name or requester name/email"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Global, admin-scoped feed of asset requests (appraisals + sale requests)."""
+    from sqlalchemy import or_
+    from app.models.asset import AssetAppraisal, AssetSaleRequest, AppraisalStatus, SaleRequestStatus
+
+    want = (request_type or "").strip().lower() or None
+    like = f"%{search}%" if search else None
+    Requester = aliased(User)
+    Assignee = aliased(User)
+
+    def search_clause():
+        return or_(
+            Asset.name.ilike(like),
+            Requester.email.ilike(like),
+            Requester.first_name.ilike(like),
+            Requester.last_name.ilike(like),
+        )
+
+    rows: List[Dict[str, Any]] = []
+
+    # Appraisals
+    if want in (None, "appraisal"):
+        status_enum = None
+        skip = False
+        if req_status:
+            try:
+                status_enum = AppraisalStatus(req_status.strip().lower())
+            except ValueError:
+                skip = True  # status not valid for appraisals -> no appraisal rows
+        if not skip:
+            q = (
+                select(AssetAppraisal, Asset, Requester, Assignee)
+                .join(Asset, AssetAppraisal.asset_id == Asset.id)
+                .join(Account, Asset.account_id == Account.id)
+                .join(Requester, Account.user_id == Requester.id)
+                .outerjoin(Assignee, AssetAppraisal.assigned_to == Assignee.id)
+            )
+            if status_enum is not None:
+                q = q.where(AssetAppraisal.status == status_enum)
+            if like:
+                q = q.where(search_clause())
+            for ap, asset, usr, assignee in (await db.execute(q)).all():
+                rows.append(_asset_request_row("appraisal", ap, asset, usr, assignee))
+
+    # Sale requests
+    if want in (None, "sale"):
+        status_enum = None
+        skip = False
+        if req_status:
+            try:
+                status_enum = SaleRequestStatus(req_status.strip().lower())
+            except ValueError:
+                skip = True
+        if not skip:
+            q = (
+                select(AssetSaleRequest, Asset, Requester, Assignee)
+                .join(Asset, AssetSaleRequest.asset_id == Asset.id)
+                .join(Account, Asset.account_id == Account.id)
+                .join(Requester, Account.user_id == Requester.id)
+                .outerjoin(Assignee, AssetSaleRequest.assigned_to == Assignee.id)
+            )
+            if status_enum is not None:
+                q = q.where(AssetSaleRequest.status == status_enum)
+            if like:
+                q = q.where(search_clause())
+            for sr, asset, usr, assignee in (await db.execute(q)).all():
+                rows.append(_asset_request_row("sale", sr, asset, usr, assignee))
+
+    rows.sort(key=lambda r: r["created_at"] or "", reverse=True)
+    total = len(rows)
+    start = (page - 1) * page_size
+    page_rows = rows[start:start + page_size]
+    return {
+        "data": page_rows,
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": (total + page_size - 1) // page_size if total else 0,
+        },
+    }
+
+
+class AssignAssetRequestBody(BaseModel):
+    advisor_id: UUID
+
+
+@router.post("/asset-requests/{request_type}/{request_id}/assign", response_model=Dict[str, Any])
+async def admin_assign_asset_request(
+    request_type: str,
+    request_id: UUID,
+    body: AssignAssetRequestBody,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Assign an advisor (or admin) to handle an asset request — admin only."""
+    from app.models.asset import AssetAppraisal, AssetSaleRequest
+
+    rt = (request_type or "").strip().lower()
+    Model = {"appraisal": AssetAppraisal, "sale": AssetSaleRequest}.get(rt)
+    if Model is None:
+        raise BadRequestException("request_type must be 'appraisal' or 'sale'.")
+
+    req = (await db.execute(select(Model).where(Model.id == request_id))).scalar_one_or_none()
+    if not req:
+        raise NotFoundException("Asset request", str(request_id))
+
+    advisor = (await db.execute(select(User).where(User.id == body.advisor_id))).scalar_one_or_none()
+    if not advisor:
+        raise NotFoundException("User", str(body.advisor_id))
+    if advisor.role not in (Role.ADVISOR, Role.ADMIN):
+        raise BadRequestException("Assignee must be an advisor or admin.")
+
+    req.assigned_to = advisor.id
+    await db.commit()
+
+    logger.info(f"Admin {current_user.id} assigned {rt} request {request_id} to {advisor.id}")
+    return {
+        "message": "Asset request assigned",
+        "data": {
+            "id": str(req.id),
+            "type": rt,
+            "assigned_advisor": {"id": str(advisor.id), "name": _full_name(advisor)},
+        },
+    }
+
+
+async def _build_conversation_row(db: AsyncSession, conv, viewer_id) -> Dict[str, Any]:
+    from sqlalchemy import and_
+    from app.models.chat import ConversationParticipant, Message, MessageRead
+
+    parts = (await db.execute(
+        select(ConversationParticipant).where(ConversationParticipant.conversation_id == conv.id)
+    )).scalars().all()
+    participants = []
+    for p in parts:
+        u = (await db.execute(select(User).where(User.id == p.user_id))).scalar_one_or_none()
+        if u:
+            participants.append({
+                "user_id": str(u.id),
+                "name": _full_name(u),
+                "role": u.role.value,            # system role: investor | advisor | admin
+                "participant_role": p.role.value,  # conversation role: participant | admin | moderator
+            })
+
+    last = (await db.execute(
+        select(Message).where(Message.conversation_id == conv.id)
+        .order_by(Message.timestamp.desc()).limit(1)
+    )).scalar_one_or_none()
+    last_message = None
+    if last:
+        sender = (await db.execute(select(User).where(User.id == last.sender_id))).scalar_one_or_none()
+        last_message = {
+            "id": str(last.id),
+            "content": (last.content or "")[:200],
+            "sender_id": str(last.sender_id),
+            "sender_name": _full_name(sender),
+            "timestamp": last.timestamp.isoformat() if last.timestamp else None,
+        }
+
+    unread = (await db.execute(
+        select(func.count(Message.id)).select_from(Message).outerjoin(
+            MessageRead,
+            and_(MessageRead.message_id == Message.id, MessageRead.user_id == viewer_id),
+        ).where(and_(
+            Message.conversation_id == conv.id,
+            Message.sender_id != viewer_id,
+            MessageRead.id.is_(None),
+        ))
+    )).scalar() or 0
+
+    ts = conv.updated_at or conv.created_at
+    return {
+        "id": str(conv.id),
+        "subject": conv.subject,
+        "participants": participants,
+        "last_message": last_message,
+        "unread_count": unread,
+        "updated_at": ts.isoformat() if ts else None,
+    }
+
+
+@router.get("/support/conversations", response_model=Dict[str, Any])
+async def admin_list_conversations(
+    conv_status: Optional[str] = Query("all", alias="status", description="active | archived | all"),
+    search: Optional[str] = Query(None, description="Search by participant name/email or subject"),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """All conversations (including advisor<->investor) — admin only, read-only."""
+    from app.models.chat import Conversation, ConversationStatus
+
+    q = select(Conversation)
+    if conv_status == "active":
+        q = q.where(Conversation.status == ConversationStatus.ACTIVE)
+    elif conv_status == "archived":
+        q = q.where(Conversation.status == ConversationStatus.ARCHIVED)
+    q = q.order_by(func.coalesce(Conversation.updated_at, Conversation.created_at).desc())
+
+    if search:
+        # Search needs participant/subject matching -> build rows then filter in-memory.
+        # Bounded to the most recent 500 conversations to cap cost.
+        convs = (await db.execute(q.limit(500))).scalars().all()
+        all_rows = [await _build_conversation_row(db, c, current_user.id) for c in convs]
+        s = search.lower()
+        filtered = [
+            r for r in all_rows
+            if (r["subject"] and s in r["subject"].lower())
+            or any(s in (p["name"] or "").lower() for p in r["participants"])
+        ]
+        total = len(filtered)
+        page_rows = filtered[offset:offset + limit]
+    else:
+        total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar() or 0
+        convs = (await db.execute(q.offset(offset).limit(limit))).scalars().all()
+        page_rows = [await _build_conversation_row(db, c, current_user.id) for c in convs]
+
+    return {"data": page_rows, "total": total, "limit": limit, "offset": offset}
+
+
+@router.get("/support/conversations/{conversation_id}/messages", response_model=Dict[str, Any])
+async def admin_get_conversation_messages(
+    conversation_id: UUID,
+    limit: int = Query(50, ge=1, le=200),
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Read messages for ANY conversation — admin only (no participant requirement)."""
+    from app.models.chat import Conversation, Message
+
+    conv = (await db.execute(
+        select(Conversation).where(Conversation.id == conversation_id)
+    )).scalar_one_or_none()
+    if not conv:
+        raise NotFoundException("Conversation", str(conversation_id))
+
+    msgs = (await db.execute(
+        select(Message).where(Message.conversation_id == conversation_id)
+        .order_by(Message.timestamp.desc()).limit(limit)
+    )).scalars().all()
+
+    data = []
+    for m in reversed(msgs):  # oldest first
+        sender = (await db.execute(select(User).where(User.id == m.sender_id))).scalar_one_or_none()
+        data.append({
+            "id": str(m.id),
+            "conversation_id": str(m.conversation_id),
+            "sender_id": str(m.sender_id),
+            "sender_name": _full_name(sender),
+            "sender_role": sender.role.value if sender else None,
+            "content": m.content,
+            "timestamp": m.timestamp.isoformat() if m.timestamp else None,
+        })
+    return {"data": data, "count": len(data)}
+
+
+@router.get("/support/analytics", response_model=Dict[str, Any])
+async def admin_support_analytics(
+    range: str = Query("30d", description="7d | 30d | 90d"),
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Support analytics for the Reports tab, computed from real data.
+
+    Note: `satisfaction_rate` has no backend source yet (no CSAT/feedback model),
+    so it is returned as null with a note until a feedback mechanism exists.
+    """
+    from sqlalchemy import and_
+    from app.models.chat import Message
+
+    days = {"7d": 7, "30d": 30, "90d": 90}.get((range or "30d").lower(), 30)
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    prev_start = start - timedelta(days=days)
+
+    def pct(cur, prev):
+        if not prev or cur is None:
+            return None
+        return round((cur - prev) / prev * 100, 1)
+
+    # total chats handled = distinct conversations with messages in the window
+    cur_chats = (await db.execute(
+        select(func.count(func.distinct(Message.conversation_id))).where(Message.timestamp >= start)
+    )).scalar() or 0
+    prev_chats = (await db.execute(
+        select(func.count(func.distinct(Message.conversation_id)))
+        .where(and_(Message.timestamp >= prev_start, Message.timestamp < start))
+    )).scalar() or 0
+
+    # avg first-response time (seconds) for tickets first-responded in the window
+    avg_cur = (await db.execute(
+        select(func.avg(func.extract("epoch", SupportTicket.first_response_at - SupportTicket.created_at)))
+        .where(and_(SupportTicket.first_response_at.isnot(None), SupportTicket.created_at >= start))
+    )).scalar()
+    avg_prev = (await db.execute(
+        select(func.avg(func.extract("epoch", SupportTicket.first_response_at - SupportTicket.created_at)))
+        .where(and_(SupportTicket.first_response_at.isnot(None),
+                    SupportTicket.created_at >= prev_start, SupportTicket.created_at < start))
+    )).scalar()
+    avg_cur_s = int(avg_cur) if avg_cur is not None else None
+    avg_prev_s = int(avg_prev) if avg_prev is not None else None
+
+    # unresolved issues = current open + in_progress (snapshot)
+    unresolved = (await db.execute(
+        select(func.count(SupportTicket.id))
+        .where(SupportTicket.status.in_([TicketStatus.OPEN, TicketStatus.IN_PROGRESS]))
+    )).scalar() or 0
+
+    # chats per agent = messages sent by advisor/admin users in the window
+    agent_rows = (await db.execute(
+        select(User.id, User.first_name, User.last_name, User.email, func.count(Message.id))
+        .join(User, Message.sender_id == User.id)
+        .where(and_(Message.timestamp >= start, User.role.in_([Role.ADVISOR, Role.ADMIN])))
+        .group_by(User.id, User.first_name, User.last_name, User.email)
+        .order_by(func.count(Message.id).desc())
+    )).all()
+    chats_per_agent = [
+        {"agent_id": str(r[0]), "agent_name": (f"{r[1] or ''} {r[2] or ''}".strip() or r[3]), "count": r[4]}
+        for r in agent_rows
+    ]
+
+    # common topics = ticket categories in the window
+    topic_rows = (await db.execute(
+        select(SupportTicket.category, func.count(SupportTicket.id))
+        .where(and_(SupportTicket.created_at >= start, SupportTicket.category.isnot(None)))
+        .group_by(SupportTicket.category)
+        .order_by(func.count(SupportTicket.id).desc())
+        .limit(10)
+    )).all()
+    common_topics = [{"topic": t[0], "count": t[1]} for t in topic_rows]
+
+    # satisfaction rate = avg CSAT rating (1-5) -> percentage, over tickets rated
+    # for work created in the window.
+    def rating_pct(avg):
+        return round(float(avg) / 5 * 100, 1) if avg is not None else None
+
+    cur_rating = (await db.execute(
+        select(func.avg(SupportTicket.satisfaction_rating))
+        .where(and_(SupportTicket.satisfaction_rating.isnot(None), SupportTicket.created_at >= start))
+    )).scalar()
+    prev_rating = (await db.execute(
+        select(func.avg(SupportTicket.satisfaction_rating))
+        .where(and_(SupportTicket.satisfaction_rating.isnot(None),
+                    SupportTicket.created_at >= prev_start, SupportTicket.created_at < start))
+    )).scalar()
+    sat_value = rating_pct(cur_rating)
+    prev_sat_value = rating_pct(prev_rating)
+
+    def label(sec):
+        if sec is None:
+            return None
+        sec = int(sec)
+        h, rem = divmod(sec, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}h {m}m"
+        if m:
+            return f"{m}m {s}s"
+        return f"{s}s"
+
+    return {
+        "range": f"{days}d",
+        "summary": {
+            "total_chats_handled": {"value": cur_chats, "change_pct": pct(cur_chats, prev_chats)},
+            "avg_response_time": {
+                "value_seconds": avg_cur_s,
+                "value_label": label(avg_cur_s),
+                "change_pct": pct(avg_cur_s, avg_prev_s),
+            },
+            "unresolved_issues": {"value": unresolved, "change_pct": None},
+            "satisfaction_rate": {
+                "value": sat_value,  # percentage (0-100), or null if no ratings yet
+                "change_pct": pct(sat_value, prev_sat_value),
+                "note": None if sat_value is not None else "No CSAT ratings submitted in this period yet.",
+            },
+        },
+        "chats_per_agent": chats_per_agent,
+        "common_topics": common_topics,
+    }
+
+
+# ==================== ADVISOR <-> CLIENT ASSIGNMENT ====================
+
+
+async def _get_or_create_advisor_chat(db: AsyncSession, advisor, client):
+    """Auto-create the advisor<->investor conversation with both as participants."""
+    from app.models.chat import Conversation, ConversationParticipant, ConversationStatus, ParticipantRole
+    conv = Conversation(subject=f"Advisor — {_full_name(client)}", status=ConversationStatus.ACTIVE)
+    db.add(conv)
+    await db.flush()  # populate conv.id
+    db.add(ConversationParticipant(conversation_id=conv.id, user_id=advisor.id, role=ParticipantRole.PARTICIPANT))
+    db.add(ConversationParticipant(conversation_id=conv.id, user_id=client.id, role=ParticipantRole.PARTICIPANT))
+    return conv
+
+
+class AssignClientBody(BaseModel):
+    investor_id: UUID
+
+
+@router.post("/advisors/{advisor_id}/clients", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
+async def admin_assign_client(
+    advisor_id: UUID,
+    body: AssignClientBody,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Assign an investor to an advisor — admin only.
+
+    Auto-creates the advisor<->investor chat, notifies both parties, and returns
+    the new conversation_id. An investor may have only one advisor at a time.
+    """
+    from app.models.advisor_client import AdvisorClient
+    from app.models.notification import NotificationType
+
+    advisor = (await db.execute(select(User).where(User.id == advisor_id))).scalar_one_or_none()
+    if not advisor:
+        raise NotFoundException("User", str(advisor_id))
+    if advisor.role != Role.ADVISOR:
+        raise BadRequestException("Target user is not an advisor.")
+
+    client = (await db.execute(select(User).where(User.id == body.investor_id))).scalar_one_or_none()
+    if not client:
+        raise NotFoundException("User", str(body.investor_id))
+    if client.role != Role.INVESTOR:
+        raise BadRequestException("Only an investor can be assigned to an advisor.")
+
+    existing = (await db.execute(
+        select(AdvisorClient).where(AdvisorClient.client_id == client.id)
+    )).scalar_one_or_none()
+    if existing:
+        if existing.advisor_id == advisor.id:
+            raise ConflictException("This investor is already assigned to this advisor.")
+        raise ConflictException("This investor already has an advisor. Unassign first.")
+
+    conv = await _get_or_create_advisor_chat(db, advisor, client)
+    assignment = AdvisorClient(
+        advisor_id=advisor.id, client_id=client.id,
+        conversation_id=conv.id, assigned_by=current_user.id,
+    )
+    db.add(assignment)
+    await db.commit()
+    await db.refresh(assignment)
+
+    # Notify both parties (bell + realtime WS) via the shared service.
+    from app.services.notification_service import NotificationService
+    meta = json.dumps({
+        "event": "client_assigned",
+        "conversation_id": str(conv.id),
+        "advisor_id": str(advisor.id),
+        "investor_id": str(client.id),
+    })
+    await NotificationService.notify_user(
+        db, advisor.id, NotificationType.GENERAL, "New client assigned",
+        f"You've been assigned to help {_full_name(client)}.", meta)
+    await NotificationService.notify_user(
+        db, client.id, NotificationType.GENERAL, "Your advisor is ready",
+        f"{_full_name(advisor)} has been assigned as your advisor.", meta)
+
+    logger.info(f"Admin {current_user.id} assigned investor {client.id} to advisor {advisor.id}")
+    return {
+        "message": "Investor assigned to advisor",
+        "data": {
+            "assignment_id": str(assignment.id),
+            "advisor_id": str(advisor.id),
+            "investor_id": str(client.id),
+            "conversation_id": str(conv.id),
+        },
+    }
+
+
+@router.get("/advisors/{advisor_id}/clients", response_model=Dict[str, Any])
+async def admin_list_advisor_clients(
+    advisor_id: UUID,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """List the investors assigned to an advisor — admin only."""
+    from app.models.advisor_client import AdvisorClient
+
+    Client = aliased(User)
+    rows = (await db.execute(
+        select(AdvisorClient, Client)
+        .join(Client, AdvisorClient.client_id == Client.id)
+        .where(AdvisorClient.advisor_id == advisor_id)
+        .order_by(AdvisorClient.created_at.desc())
+    )).all()
+    data = [{
+        "client_id": str(c.id),
+        "name": _full_name(c),
+        "email": c.email,
+        "conversation_id": str(ac.conversation_id) if ac.conversation_id else None,
+        "assigned_at": ac.created_at.isoformat() if ac.created_at else None,
+    } for ac, c in rows]
+    return {"data": data, "total": len(data)}
+
+
+@router.delete("/advisors/{advisor_id}/clients/{investor_id}", response_model=Dict[str, Any])
+async def admin_unassign_client(
+    advisor_id: UUID,
+    investor_id: UUID,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Unassign an investor from an advisor — admin only. The chat history is kept."""
+    from app.models.advisor_client import AdvisorClient
+
+    row = (await db.execute(
+        select(AdvisorClient).where(
+            AdvisorClient.advisor_id == advisor_id,
+            AdvisorClient.client_id == investor_id,
+        )
+    )).scalar_one_or_none()
+    if not row:
+        raise NotFoundException("Advisor assignment", str(investor_id))
+
+    await db.delete(row)
+    await db.commit()
+    logger.info(f"Admin {current_user.id} unassigned investor {investor_id} from advisor {advisor_id}")
+    return {
+        "message": "Client unassigned",
+        "data": {"advisor_id": str(advisor_id), "investor_id": str(investor_id)},
     }
 
 

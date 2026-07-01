@@ -49,6 +49,8 @@ class MarketplaceListing(Base):
     status = Column(SQLEnum(ListingStatus), default=ListingStatus.DRAFT, nullable=False)
     approved_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
     approved_at = Column(DateTime(timezone=True))
+    # Set when a listing is rejected; shown to the owner, admin, and advisor.
+    rejection_reason = Column(Text)
     meta_data = Column("metadata", JSONB)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

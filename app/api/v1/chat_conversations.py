@@ -20,6 +20,9 @@ router = APIRouter()
 class ParticipantInfo(BaseModel):
     userId: UUID
     userName: str
+    firstName: Optional[str] = None
+    lastName: Optional[str] = None
+    email: Optional[str] = None
     userAvatar: Optional[str] = None
     isOnline: bool = False
     lastSeen: Optional[datetime] = None
@@ -27,6 +30,29 @@ class ParticipantInfo(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+def _full_name(user: Optional["User"]) -> str:
+    """NULL-safe display name: 'First Last', falling back to email, then 'Unknown'."""
+    if not user:
+        return "Unknown"
+    name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+    return name or user.email or "Unknown"
+
+
+def _participant_info(user: "User", role: str) -> "ParticipantInfo":
+    """Build a participant entry with a robust display name (NULL-safe) + email."""
+    return ParticipantInfo(
+        userId=user.id,
+        userName=_full_name(user),
+        firstName=user.first_name,
+        lastName=user.last_name,
+        email=user.email,
+        userAvatar=None,  # No avatar field on the user yet (roadmap).
+        isOnline=False,
+        lastSeen=None,
+        role=role,
+    )
 
 
 class LastMessageInfo(BaseModel):
@@ -166,20 +192,14 @@ async def get_conversations(
             user_result = await db.execute(select(User).where(User.id == p.user_id))
             user = user_result.scalar_one_or_none()
             if user:
-                participant_infos.append(ParticipantInfo(
-                    userId=p.user_id,
-                    userName=f"{user.first_name} {user.last_name}".strip() or user.email,
-                    userAvatar=None,  # Add avatar URL if available
-                    isOnline=False,  # Implement online status tracking
-                    lastSeen=None,  # Implement last seen tracking
-                    role=p.role.value
-                ))
-        
-        # Get last message
+                participant_infos.append(_participant_info(user, p.role.value))
+
+        # Get last message for THIS conversation (deterministic tiebreak on id so
+        # ties on identical timestamps never surface a different message).
         last_message_result = await db.execute(
             select(Message)
             .where(Message.conversation_id == conv.id)
-            .order_by(desc(Message.timestamp))
+            .order_by(desc(Message.timestamp), desc(Message.id))
             .limit(1)
         )
         last_message = last_message_result.scalar_one_or_none()
@@ -313,7 +333,7 @@ async def get_conversation_messages(
         # Get sender info
         sender_result = await db.execute(select(User).where(User.id == msg.sender_id))
         sender = sender_result.scalar_one_or_none()
-        sender_name = f"{sender.first_name} {sender.last_name}".strip() if sender else "Unknown"
+        sender_name = _full_name(sender)
         
         # Check if read by current user
         read_result = await db.execute(
@@ -398,8 +418,8 @@ async def send_message(
     await db.commit()
     
     # Get sender info
-    sender_name = f"{current_user.first_name} {current_user.last_name}".strip() or current_user.email
-    
+    sender_name = _full_name(current_user)
+
     # Get attachments
     attachments_result = await db.execute(
         select(MessageAttachment).where(MessageAttachment.message_id == message.id)
@@ -602,15 +622,10 @@ async def get_conversation_participants(
         user_result = await db.execute(select(User).where(User.id == p.user_id))
         user = user_result.scalar_one_or_none()
         if user:
-            participant_infos.append(ParticipantInfo(
-                userId=p.user_id,
-                userName=f"{user.first_name} {user.last_name}".strip() or user.email,
-                userAvatar=None,
-                isOnline=False,
-                lastSeen=p.last_read_at,
-                role=p.role.value
-            ))
-    
+            info = _participant_info(user, p.role.value)
+            info.lastSeen = p.last_read_at
+            participant_infos.append(info)
+
     return {"participants": participant_infos}
 
 
@@ -693,15 +708,8 @@ async def create_conversation(
         user_result = await db.execute(select(User).where(User.id == p.user_id))
         user = user_result.scalar_one_or_none()
         if user:
-            participant_infos.append(ParticipantInfo(
-                userId=p.user_id,
-                userName=f"{user.first_name} {user.last_name}".strip() or user.email,
-                userAvatar=None,
-                isOnline=False,
-                lastSeen=None,
-                role=p.role.value
-            ))
-    
+            participant_infos.append(_participant_info(user, p.role.value))
+
     response = {
         "conversation": {
             "id": conversation.id,

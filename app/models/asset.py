@@ -406,6 +406,8 @@ class AssetAppraisal(Base):
     asset_id = Column(UUID(as_uuid=True), ForeignKey("assets.id"), nullable=False)
     appraisal_type = Column(EnumValueType(AppraisalType, length=50), nullable=False)
     status = Column(EnumValueType(AppraisalStatus, length=50), default=AppraisalStatus.PENDING, nullable=False)
+    # Advisor/admin handling this request (admin support dashboard). Nullable.
+    assigned_to = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
     requested_at = Column(DateTime(timezone=True), server_default=func.now())
     estimated_completion_date = Column(DateTime(timezone=True))
     estimated_cost = Column(Numeric(10, 2))
@@ -517,6 +519,8 @@ class AssetSaleRequest(Base):
     sale_note = Column(Text)
     preferred_sale_date = Column(DateTime(timezone=True))
     status = Column(EnumValueType(SaleRequestStatus, length=50), default=SaleRequestStatus.PENDING, nullable=False)
+    # Advisor/admin handling this request (admin support dashboard). Nullable.
+    assigned_to = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
     requested_at = Column(DateTime(timezone=True), server_default=func.now())
     reviewed_at = Column(DateTime(timezone=True))
     message = Column(Text)

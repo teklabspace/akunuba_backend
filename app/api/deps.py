@@ -7,7 +7,9 @@ from app.database import get_db
 from app.core.security import decode_access_token
 from app.models.user import User
 from app.models.account import Account
+from app.models.kyc import KYCVerification, KYCStatus
 from app.models.payment import Subscription, SubscriptionPlan, SubscriptionStatus
+from app.core.permissions import Role
 from app.core.exceptions import UnauthorizedException, ForbiddenException, NotFoundException
 from app.core.features import Feature, get_permissions, get_plan_limits, has_feature
 from sqlalchemy import select
@@ -70,6 +72,12 @@ async def get_account(
     return account
 
 
+# Statuses that grant product access. ``past_due`` is included so a user whose
+# payment retry is in flight can still reach the dashboard/settings to fix billing
+# instead of being pushed back to re-subscribe (product decision, see contract doc).
+ACCESS_GRANTING_STATUSES = (SubscriptionStatus.ACTIVE, SubscriptionStatus.PAST_DUE)
+
+
 async def get_active_subscription(
     account: Account = Depends(get_account),
     db: AsyncSession = Depends(get_db)
@@ -77,7 +85,7 @@ async def get_active_subscription(
     result = await db.execute(
         select(Subscription).where(
             Subscription.account_id == account.id,
-            Subscription.status == SubscriptionStatus.ACTIVE
+            Subscription.status.in_(ACCESS_GRANTING_STATUSES)
         )
     )
     subscription = result.scalar_one_or_none()
@@ -101,16 +109,55 @@ async def get_user_subscription_plan(
     result = await db.execute(
         select(Subscription).where(
             Subscription.account_id == account.id,
-            Subscription.status == SubscriptionStatus.ACTIVE
+            Subscription.status.in_(ACCESS_GRANTING_STATUSES)
         )
     )
     subscription = result.scalar_one_or_none()
-    
+
     period_end = _as_aware_utc(subscription.current_period_end) if subscription else None
     if subscription and period_end and period_end >= datetime.now(timezone.utc):
         return subscription.plan
 
     return SubscriptionPlan.FREE
+
+
+async def require_kyc_verified(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """Gate that allows the request only when the caller's identity is verified.
+
+    - Admins are exempt (they never do KYC).
+    - Investors and advisors must have a KYC record in ``APPROVED`` status; a
+      missing account or non-approved KYC yields a 403 with code ``KYC_REQUIRED``.
+
+    Applied at the router level (see app/main.py) to the dashboard/data APIs so
+    KYC is enforced server-side, not just by the frontend. Onboarding routes
+    (auth, users, accounts, kyc, kyb, subscriptions, notifications) stay open so
+    a user can actually reach verification.
+    """
+    if current_user.role == Role.ADMIN:
+        return current_user
+
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+
+    approved = False
+    if account:
+        kyc_result = await db.execute(
+            select(KYCVerification).where(KYCVerification.account_id == account.id)
+        )
+        kyc = kyc_result.scalar_one_or_none()
+        approved = bool(kyc and kyc.status == KYCStatus.APPROVED)
+
+    if not approved:
+        raise ForbiddenException(
+            "Identity verification (KYC) must be approved to access this resource.",
+            code="KYC_REQUIRED",
+        )
+    return current_user
 
 
 def require_feature(feature: Feature):

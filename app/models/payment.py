@@ -78,12 +78,22 @@ class Subscription(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     account_id = Column(UUID(as_uuid=True), ForeignKey("accounts.id"), nullable=False, unique=True)
     plan = Column(SQLEnum(SubscriptionPlan), nullable=False)
+    # Product tier the customer actually bought ("starter" | "pro" | "premium").
+    # Stored explicitly because the legacy ``plan`` enum (free/monthly/annual)
+    # conflates tier with billing cycle and cannot represent tier+cycle together.
+    plan_tier = Column(String(20))
+    # "monthly" | "annual" — stored explicitly instead of being inferred from the
+    # period length, which was fragile.
+    billing_cycle = Column(String(20))
     status = Column(SQLEnum(SubscriptionStatus), default=SubscriptionStatus.ACTIVE, nullable=False)
     amount = Column(Numeric(20, 2), nullable=False)
     currency = Column(String(3), default="USD", nullable=False)
     stripe_subscription_id = Column(String(255))
     current_period_start = Column(DateTime(timezone=True))
     current_period_end = Column(DateTime(timezone=True))
+    # True once the user requested cancellation but the plan stays active until
+    # ``current_period_end``. Distinct from an immediate cancel (status=CANCELLED).
+    cancel_at_period_end = Column(Boolean, default=False, nullable=False, server_default="false")
     cancelled_at = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

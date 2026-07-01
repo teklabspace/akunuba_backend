@@ -2,62 +2,80 @@ from fastapi import HTTPException, status
 
 
 class FullegoException(HTTPException):
-    def __init__(self, status_code: int, detail: str):
+    """Base API exception.
+
+    Carries a stable, machine-readable ``code`` (surfaced as ``error.code`` in the
+    response envelope) so the frontend can branch on specific cases without parsing
+    the human-readable ``detail`` message.
+    """
+
+    def __init__(self, status_code: int, detail: str, code: str = "ERROR"):
         super().__init__(status_code=status_code, detail=detail)
+        self.code = code
 
 
 class NotFoundException(FullegoException):
-    def __init__(self, resource: str, identifier: str):
+    def __init__(self, resource: str, identifier: str, code: str = "NOT_FOUND"):
         super().__init__(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"{resource} with id {identifier} not found"
+            detail=f"{resource} with id {identifier} not found",
+            code=code,
         )
 
 
 class UnauthorizedException(FullegoException):
-    def __init__(self, detail: str = "Unauthorized"):
+    def __init__(self, detail: str = "Unauthorized", code: str = "UNAUTHORIZED"):
         super().__init__(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=detail
+            detail=detail,
+            code=code,
         )
 
 
 class ForbiddenException(FullegoException):
-    def __init__(self, detail: str = "Forbidden"):
+    def __init__(self, detail: str = "Forbidden", code: str = "FORBIDDEN"):
         super().__init__(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=detail
+            detail=detail,
+            code=code,
         )
 
 
 class ValidationException(FullegoException):
-    def __init__(self, detail: str):
+    def __init__(self, detail: str, code: str = "VALIDATION_ERROR"):
         super().__init__(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=detail
+            detail=detail,
+            code=code,
         )
 
 
 class ConflictException(FullegoException):
-    def __init__(self, detail: str):
+    def __init__(self, detail: str, code: str = "CONFLICT"):
         super().__init__(
             status_code=status.HTTP_409_CONFLICT,
-            detail=detail
+            detail=detail,
+            code=code,
         )
 
 
 class BadRequestException(FullegoException):
-    def __init__(self, detail: str):
+    def __init__(self, detail: str, code: str = "BAD_REQUEST"):
         super().__init__(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=detail
+            detail=detail,
+            code=code,
         )
 
 
 class ServiceUnavailableException(FullegoException):
-    def __init__(self, detail: str = "Service temporarily unavailable"):
+    def __init__(
+        self,
+        detail: str = "Service temporarily unavailable",
+        code: str = "SERVICE_UNAVAILABLE",
+    ):
         super().__init__(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=detail
+            detail=detail,
+            code=code,
         )
-

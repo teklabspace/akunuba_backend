@@ -7,28 +7,25 @@ from jinja2 import Template
 
 
 class EmailService:
-    _initialized: bool = False
-    
+    RESEND_ENDPOINT = "https://api.resend.com/emails"
+
     @classmethod
-    def _initialize(cls) -> bool:
-        """Initialize Mailpit client settings."""
+    def _provider(cls) -> Optional[str]:
+        """Return the active email provider, or None if disabled/unconfigured.
+
+        Resend is preferred (production); Mailpit is kept as a local-dev fallback.
+        """
         if not settings.EMAIL_ENABLED:
-            return False
-        
-        if not settings.MAILPIT_API_BASE_URL:
-            logger.warning("MAILPIT_API_BASE_URL not configured, email service disabled")
-            return False
-        
-        if not cls._initialized:
-            try:
-                cls._initialized = True
-                logger.info("Mailpit email service initialized")
-                return True
-            except Exception as e:
-                logger.error(f"Failed to initialize Mailpit email service: {e}")
-                return False
-        
-        return True
+            return None
+        if settings.RESEND_API_KEY:
+            return "resend"
+        if settings.MAILPIT_API_BASE_URL:
+            return "mailpit"
+        logger.warning(
+            "No email provider configured (set RESEND_API_KEY or MAILPIT_API_BASE_URL); "
+            "email service disabled"
+        )
+        return None
 
     @classmethod
     def _build_auth_header(cls) -> Dict[str, str]:
@@ -38,7 +35,79 @@ class EmailService:
             return {}
         token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("utf-8")
         return {"Authorization": f"Basic {token}"}
-    
+
+    @classmethod
+    async def _send_via_resend(
+        cls, to_email: str, subject: str, html_content: str,
+        text_content: Optional[str], from_address: str, from_name: str,
+    ) -> bool:
+        # Resend requires a full email address on a verified domain, e.g.
+        # "noreply@akunuba.com" — a bare domain like "akunuba.com" is rejected.
+        if "@" not in from_address:
+            logger.error(
+                "EMAIL_FROM_ADDRESS '%s' is not a valid email address. Resend needs a full "
+                "address on your verified domain, e.g. noreply@%s",
+                from_address, from_address,
+            )
+            return False
+
+        sender = f"{from_name} <{from_address}>" if from_name else from_address
+        payload: Dict[str, Any] = {
+            "from": sender,
+            "to": [to_email],
+            "subject": subject,
+            "html": html_content,
+        }
+        if text_content:
+            payload["text"] = text_content
+
+        headers = {
+            "Authorization": f"Bearer {settings.RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(cls.RESEND_ENDPOINT, json=payload, headers=headers)
+
+        if response.status_code < 400:
+            logger.info("Email sent successfully to %s via Resend", to_email)
+            return True
+
+        logger.error(
+            "Failed to send email to %s via Resend (%s): %s",
+            to_email, response.status_code, response.text[:500],
+        )
+        return False
+
+    @classmethod
+    async def _send_via_mailpit(
+        cls, to_email: str, subject: str, html_content: str,
+        text_content: Optional[str], from_address: str, from_name: str,
+    ) -> bool:
+        payload: Dict[str, Any] = {
+            "From": {"Email": from_address, "Name": from_name},
+            "To": [{"Email": to_email}],
+            "Subject": subject,
+            "HTML": html_content,
+        }
+        if text_content:
+            payload["Text"] = text_content
+
+        headers = {"Content-Type": "application/json", **cls._build_auth_header()}
+        endpoint = f"{settings.MAILPIT_API_BASE_URL.rstrip('/')}/api/v1/send"
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(endpoint, json=payload, headers=headers)
+
+        if response.status_code < 400:
+            logger.info("Email sent successfully to %s via Mailpit", to_email)
+            return True
+
+        logger.error(
+            "Failed to send email to %s via Mailpit (%s): %s",
+            to_email, response.status_code, response.text[:500],
+        )
+        return False
+
     @classmethod
     async def send_email(
         cls,
@@ -49,46 +118,23 @@ class EmailService:
         from_email: Optional[str] = None,
         from_name: Optional[str] = None
     ) -> bool:
-        """Send an email via Mailpit HTTP API."""
-        if not settings.EMAIL_ENABLED:
+        """Send an email via the configured provider (Resend in prod, Mailpit in dev)."""
+        provider = cls._provider()
+        if provider is None:
             logger.debug("Email service disabled, skipping email send")
             return False
-        
-        if not cls._initialize():
-            return False
-        
+
+        from_address = from_email or settings.EMAIL_FROM_ADDRESS
+        from_name_str = from_name or settings.EMAIL_FROM_NAME
+
         try:
-            from_address = from_email or settings.EMAIL_FROM_ADDRESS
-            from_name_str = from_name or settings.EMAIL_FROM_NAME
-            
-            payload: Dict[str, Any] = {
-                "From": {"Email": from_address, "Name": from_name_str},
-                "To": [{"Email": to_email}],
-                "Subject": subject,
-                "HTML": html_content,
-            }
-            
-            if text_content:
-                payload["Text"] = text_content
-
-            headers = {"Content-Type": "application/json", **cls._build_auth_header()}
-            endpoint = f"{settings.MAILPIT_API_BASE_URL.rstrip('/')}/api/v1/send"
-
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                response = await client.post(endpoint, json=payload, headers=headers)
-
-            if response.status_code < 400:
-                logger.info("Email sent successfully to %s via Mailpit", to_email)
-                return True
-
-            logger.error(
-                "Failed to send email to %s via Mailpit (%s): %s",
-                to_email,
-                response.status_code,
-                response.text[:500],
+            if provider == "resend":
+                return await cls._send_via_resend(
+                    to_email, subject, html_content, text_content, from_address, from_name_str
+                )
+            return await cls._send_via_mailpit(
+                to_email, subject, html_content, text_content, from_address, from_name_str
             )
-            return False
-                
         except Exception as e:
             logger.error(f"Error sending email to {to_email}: {e}")
             return False
@@ -290,7 +336,7 @@ class EmailService:
                 name=to_name,
                 reset_url=reset_url
             )
-            
+
             return await cls.send_email(
                 to_email=to_email,
                 subject="Reset Your Password - Fullego",
@@ -299,7 +345,74 @@ class EmailService:
         except Exception as e:
             logger.error(f"Error sending password reset email: {e}")
             return False
-    
+
+    @classmethod
+    async def send_advisor_invite_email(
+        cls,
+        to_email: str,
+        to_name: str,
+        invite_token: str,
+        invite_url: Optional[str] = None,
+    ) -> bool:
+        """Invite an admin-created advisor to set their password.
+
+        The link lands on the frontend set-password page carrying the token; that
+        page completes the flow by calling POST /auth/reset-password with the
+        token + the chosen password (the same token infrastructure as reset).
+        """
+        if not invite_url:
+            base = settings.CORS_ORIGINS[0] if settings.CORS_ORIGINS else "http://localhost:3000"
+            invite_url = f"{base}/set-password?token={invite_token}"
+
+        html_template = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+                .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+                .header { background-color: #4F46E5; color: white; padding: 20px; text-align: center; border-radius: 5px 5px 0 0; }
+                .content { background-color: #f9fafb; padding: 30px; border-radius: 0 0 5px 5px; }
+                .button { display: inline-block; padding: 12px 24px; background-color: #4F46E5; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px; }
+                .footer { text-align: center; margin-top: 20px; color: #6b7280; font-size: 12px; }
+                .warning { background-color: #fef3c7; border-left: 4px solid #f59e0b; padding: 12px; margin: 20px 0; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>Fullego</h1>
+                </div>
+                <div class="content">
+                    <h2>You've been invited as an Advisor</h2>
+                    <p>Hi {{ name }},</p>
+                    <p>An administrator created an advisor account for you on Fullego. Click the button below to set your password and activate your account:</p>
+                    <a href="{{ invite_url }}" class="button">Set Your Password</a>
+                    <p>Or copy and paste this link into your browser:</p>
+                    <p style="word-break: break-all; color: #4F46E5;">{{ invite_url }}</p>
+                    <div class="warning">
+                        <p><strong>Security Notice:</strong> This link will expire soon. If you weren't expecting this invitation, please ignore this email.</p>
+                    </div>
+                </div>
+                <div class="footer">
+                    <p>This is an automated email from Fullego. Please do not reply to this email.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        try:
+            html_content = Template(html_template).render(name=to_name, invite_url=invite_url)
+            return await cls.send_email(
+                to_email=to_email,
+                subject="You're invited to Fullego — set your password",
+                html_content=html_content,
+            )
+        except Exception as e:
+            logger.error(f"Error sending advisor invite email: {e}")
+            return False
+
     @classmethod
     async def send_otp_email(
         cls,

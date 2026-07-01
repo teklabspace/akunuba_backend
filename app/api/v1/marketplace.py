@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Body
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func, case
+from sqlalchemy.orm import aliased
 from typing import List, Optional, Dict, Any
 from decimal import Decimal
 from datetime import datetime, timedelta
@@ -72,6 +73,7 @@ class ListingResponse(BaseModel):
     currency: str
     status: str
     listing_fee: Optional[Decimal] = None
+    rejection_reason: Optional[str] = None
     created_at: datetime
 
     class Config:
@@ -200,33 +202,190 @@ async def list_listings(
     }
 
 
+async def _assert_can_moderate_listing(db: AsyncSession, user: User, listing: MarketplaceListing) -> None:
+    """Admins may moderate any listing; an advisor may moderate only listings owned
+    by an investor assigned to them. Otherwise 403 LISTING_MODERATION_FORBIDDEN."""
+    if has_permission(user.role, Permission.APPROVE_LISTINGS):
+        return
+    if user.role == Role.ADVISOR:
+        from app.models.advisor_client import AdvisorClient
+        owner = (await db.execute(
+            select(Account).where(Account.id == listing.account_id)
+        )).scalar_one_or_none()
+        if owner:
+            link = (await db.execute(
+                select(AdvisorClient).where(
+                    AdvisorClient.advisor_id == user.id,
+                    AdvisorClient.client_id == owner.user_id,
+                )
+            )).scalar_one_or_none()
+            if link:
+                return
+    raise ForbiddenException(
+        "You can only moderate listings for your assigned clients.",
+        code="LISTING_MODERATION_FORBIDDEN",
+    )
+
+
+async def _notify_listing_owner(db, listing, ntype, title, message):
+    from app.services.notification_service import NotificationService
+    try:
+        await NotificationService.create_notification(
+            db=db, account_id=listing.account_id, notification_type=ntype,
+            title=title, message=message, send_email=False,
+        )
+    except Exception as e:
+        logger.error(f"Failed to notify listing owner for {listing.id}: {e}")
+
+
 @router.post("/listings/{listing_id}/approve", response_model=ListingResponse)
 async def approve_listing(
     listing_id: UUID,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Approve a listing (admin only)"""
-    if not has_permission(current_user.role, Permission.APPROVE_LISTINGS):
-        raise UnauthorizedException("Insufficient permissions")
-    
+    """Approve a listing -> it becomes publicly visible in the marketplace.
+
+    Admins can approve any listing; an advisor can approve only listings owned by
+    an assigned client.
+    """
     result = await db.execute(
         select(MarketplaceListing).where(MarketplaceListing.id == listing_id)
     )
     listing = result.scalar_one_or_none()
-    
     if not listing:
         raise NotFoundException("Listing", str(listing_id))
-    
+
+    await _assert_can_moderate_listing(db, current_user, listing)
+
     listing.status = ListingStatus.APPROVED
     listing.approved_by = current_user.id
     listing.approved_at = datetime.utcnow()
-    
+    listing.rejection_reason = None
+
     await db.commit()
     await db.refresh(listing)
-    
+
+    from app.models.notification import NotificationType
+    await _notify_listing_owner(
+        db, listing, NotificationType.LISTING_APPROVED,
+        "Listing approved",
+        f"Your listing '{listing.title}' has been approved and is now live in the marketplace.",
+    )
+
     logger.info(f"Listing approved: {listing_id} by {current_user.id}")
     return listing
+
+
+class RejectListingBody(BaseModel):
+    reason: str
+
+
+@router.post("/listings/{listing_id}/reject", response_model=ListingResponse)
+async def reject_listing(
+    listing_id: UUID,
+    body: RejectListingBody,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Reject a listing with a reason. The reason is persisted on the listing
+    (visible to owner, admin, and advisor) and the owner is notified."""
+    if not body.reason or not body.reason.strip():
+        raise BadRequestException("A rejection reason is required.")
+
+    result = await db.execute(
+        select(MarketplaceListing).where(MarketplaceListing.id == listing_id)
+    )
+    listing = result.scalar_one_or_none()
+    if not listing:
+        raise NotFoundException("Listing", str(listing_id))
+
+    await _assert_can_moderate_listing(db, current_user, listing)
+
+    listing.status = ListingStatus.REJECTED
+    listing.rejection_reason = body.reason.strip()
+
+    await db.commit()
+    await db.refresh(listing)
+
+    from app.models.notification import NotificationType
+    await _notify_listing_owner(
+        db, listing, NotificationType.GENERAL,
+        "Listing rejected",
+        f"Your listing '{listing.title}' was rejected. Reason: {listing.rejection_reason}",
+    )
+
+    logger.info(f"Listing rejected: {listing_id} by {current_user.id}")
+    return listing
+
+
+@router.get("/approval-queue", response_model=Dict[str, Any])
+async def listing_approval_queue(
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Pending-approval listings with reviewer-facing fields. Admins see all;
+    advisors see only their assigned clients' listings."""
+    is_admin = has_permission(current_user.role, Permission.APPROVE_LISTINGS)
+    if not is_admin and current_user.role != Role.ADVISOR:
+        raise ForbiddenException("Not permitted to view the approval queue.")
+
+    from app.models.advisor_client import AdvisorClient
+    Owner = aliased(User)
+    AdvisorUser = aliased(User)
+
+    q = (
+        select(MarketplaceListing, Owner, AdvisorUser)
+        .join(Account, MarketplaceListing.account_id == Account.id)
+        .join(Owner, Account.user_id == Owner.id)
+        .outerjoin(AdvisorClient, AdvisorClient.client_id == Owner.id)
+        .outerjoin(AdvisorUser, AdvisorClient.advisor_id == AdvisorUser.id)
+        .where(MarketplaceListing.status == ListingStatus.PENDING_APPROVAL)
+    )
+    if not is_admin:
+        # advisor: restrict to listings owned by their assigned clients
+        client_ids = (await db.execute(
+            select(AdvisorClient.client_id).where(AdvisorClient.advisor_id == current_user.id)
+        )).scalars().all()
+        if not client_ids:
+            return {"data": [], "pagination": {"page": page, "limit": limit, "total": 0, "total_pages": 0}}
+        q = q.where(Owner.id.in_(client_ids))
+
+    count_q = select(func.count()).select_from(q.subquery())
+    total = (await db.execute(count_q)).scalar() or 0
+
+    offset = (page - 1) * limit
+    rows = (await db.execute(
+        q.order_by(MarketplaceListing.created_at.desc()).offset(offset).limit(limit)
+    )).all()
+
+    data = []
+    for listing, owner, advisor_user in rows:
+        owner_name = f"{owner.first_name or ''} {owner.last_name or ''}".strip() or owner.email
+        data.append({
+            "id": str(listing.id),
+            "title": listing.title,
+            "owner": {"id": str(owner.id), "name": owner_name, "email": owner.email},
+            "asking_price": float(listing.asking_price) if listing.asking_price is not None else None,
+            "currency": listing.currency,
+            "status": listing.status.value,
+            "submitted_at": listing.created_at.isoformat() if listing.created_at else None,
+            "assigned_advisor": (
+                {"id": str(advisor_user.id),
+                 "name": (f"{advisor_user.first_name or ''} {advisor_user.last_name or ''}".strip() or advisor_user.email)}
+                if advisor_user else None
+            ),
+        })
+
+    return {
+        "data": data,
+        "pagination": {
+            "page": page, "limit": limit, "total": total,
+            "total_pages": (total + limit - 1) // limit if total else 0,
+        },
+    }
 
 
 @router.post("/listings/{listing_id}/offers", status_code=status.HTTP_201_CREATED)

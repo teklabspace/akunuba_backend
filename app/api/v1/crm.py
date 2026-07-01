@@ -9,7 +9,7 @@ from app.models.user import User, Role
 from app.models.account import Account
 from app.models.support import SupportTicket, TicketStatus
 from app.models.document import Document
-from app.models.asset import AssetAppraisal, AppraisalStatus
+from app.models.asset import Asset, AssetAppraisal, AppraisalStatus
 from app.core.exceptions import NotFoundException
 from app.core.permissions import Permission, has_permission
 from app.utils.logger import logger

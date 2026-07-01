@@ -39,8 +39,17 @@ from app.api.v1 import (
     chat_conversations,
     websocket_chat,
     webhooks,
+    advisor,
 )
 from app.utils.logger import logger
+from app.core.responses import (
+    success_envelope,
+    error_envelope,
+    error_code_for,
+    flatten_validation_errors,
+)
+import json
+from starlette.responses import Response
 
 # Sentry (optional - set SENTRY_DSN for production)
 if getattr(settings, "SENTRY_DSN", None) and settings.SENTRY_DSN:
@@ -103,9 +112,111 @@ class RequestTimingMiddleware(BaseHTTPMiddleware):
         return response
 
 
+# Paths that must NOT be wrapped in the response envelope: API docs, the OpenAPI
+# spec (Swagger reads it raw), health checks, and the root probe.
+ENVELOPE_EXCLUDED_PATHS = {"/openapi.json", "/health", "/"}
+ENVELOPE_EXCLUDED_PREFIXES = ("/docs", "/redoc")
+
+
+class ResponseEnvelopeMiddleware(BaseHTTPMiddleware):
+    """Wrap every successful JSON response in the standard envelope.
+
+    Produces ``{"success": true, "status_code", "message", "data"}`` uniformly so
+    the frontend uses a single parser. Error responses (>=400) are already
+    enveloped by the exception handlers and are passed through untouched, as are
+    non-JSON responses (file/stream downloads), the docs/spec endpoints, and any
+    payload an endpoint already enveloped itself.
+    """
+
+    def _rebuild(self, original, content: dict, status_code: int) -> JSONResponse:
+        # Drop content-length/content-type: JSONResponse recomputes them. Keep the
+        # rest (e.g. anything set by the route) so nothing is silently lost.
+        headers = {
+            k: v for k, v in original.headers.items()
+            if k.lower() not in ("content-length", "content-type")
+        }
+        return JSONResponse(
+            content=content,
+            status_code=status_code,
+            headers=headers,
+            background=original.background,
+        )
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+
+        path = request.url.path
+        if path in ENVELOPE_EXCLUDED_PATHS or path.startswith(ENVELOPE_EXCLUDED_PREFIXES):
+            return response
+
+        # Errors are already enveloped by the exception handlers.
+        if response.status_code >= 400:
+            return response
+
+        # File/attachment downloads pass through untouched, even when their
+        # media type is JSON (e.g. an exported JSON report).
+        if "attachment" in response.headers.get("content-disposition", "").lower():
+            return response
+
+        content_type = response.headers.get("content-type", "")
+
+        # Normalize an empty-body success (e.g. 204 No Content) into an enveloped 200
+        # so the client never receives a bodyless response.
+        if response.status_code == 204:
+            return self._rebuild(
+                response,
+                success_envelope(data=None, message="Request successful.", status_code=200),
+                status_code=200,
+            )
+
+        # Only JSON bodies get wrapped; file/stream/redirect responses pass through.
+        if "application/json" not in content_type:
+            return response
+
+        body = b""
+        async for chunk in response.body_iterator:
+            body += chunk
+
+        if not body:
+            return self._rebuild(
+                response,
+                success_envelope(data=None, message="Request successful.", status_code=response.status_code),
+                status_code=response.status_code,
+            )
+
+        try:
+            parsed = json.loads(body)
+        except Exception:
+            # Body isn't parseable JSON despite the header; return it verbatim
+            # (the iterator is already consumed, so reconstruct from the bytes).
+            headers = {
+                k: v for k, v in response.headers.items() if k.lower() != "content-length"
+            }
+            return Response(
+                content=body,
+                status_code=response.status_code,
+                headers=headers,
+                media_type=content_type,
+                background=response.background,
+            )
+
+        # Don't double-wrap a payload an endpoint already enveloped.
+        if isinstance(parsed, dict) and "success" in parsed and ("data" in parsed or "error" in parsed):
+            return self._rebuild(response, parsed, status_code=response.status_code)
+
+        return self._rebuild(
+            response,
+            success_envelope(data=parsed, message="Request successful.", status_code=response.status_code),
+            status_code=response.status_code,
+        )
+
+
 # Add path normalization middleware first (before CORS)
 app.add_middleware(NormalizePathMiddleware)
 app.add_middleware(RequestTimingMiddleware)
+# Wrap successful JSON responses in the standard envelope. Added before CORS so the
+# CORS middleware stays outermost and still applies its headers to wrapped responses.
+app.add_middleware(ResponseEnvelopeMiddleware)
 
 # CORS configuration - must be added before other middleware
 # Allows requests from frontend origins and includes proper CORS headers
@@ -164,41 +275,54 @@ app.add_middleware(
     max_age=3600,            # Cache preflight requests for 1 hour
 )
 
+# Server-side KYC enforcement: the dashboard/data APIs below carry this dependency
+# so investors and advisors must have an APPROVED KYC to use them (admins are
+# exempt inside the dependency). Onboarding/auth/profile/billing/notification
+# routers are intentionally left OPEN so a user can reach and complete KYC:
+#   open -> auth, users, accounts, kyc, kyb, subscriptions, notifications, market, admin, webhooks
+from fastapi import Depends as _Depends
+from app.api.deps import require_kyc_verified
+_KYC_GATED = [_Depends(require_kyc_verified)]
+
+# --- Open (onboarding / auth / profile / billing) ---
 app.include_router(auth.router, prefix=f"{settings.API_V1_PREFIX}/auth", tags=["Authentication"])
 app.include_router(users.router, prefix=f"{settings.API_V1_PREFIX}/users", tags=["Users"])
 app.include_router(accounts.router, prefix=f"{settings.API_V1_PREFIX}/accounts", tags=["Accounts"])
 app.include_router(kyc.router, prefix=f"{settings.API_V1_PREFIX}/kyc", tags=["KYC"])
 app.include_router(kyb.router, prefix=f"{settings.API_V1_PREFIX}/kyb", tags=["KYB"])
-app.include_router(assets.router, prefix=f"{settings.API_V1_PREFIX}/assets", tags=["Assets"])
-app.include_router(portfolio.router, prefix=f"{settings.API_V1_PREFIX}/portfolio", tags=["Portfolio"])
-app.include_router(trading.router, prefix=f"{settings.API_V1_PREFIX}/trading", tags=["Trading"])
-app.include_router(marketplace.router, prefix=f"{settings.API_V1_PREFIX}/marketplace", tags=["Marketplace"])
-app.include_router(payments.router, prefix=f"{settings.API_V1_PREFIX}/payments", tags=["Payments"])
 app.include_router(subscriptions.router, prefix=f"{settings.API_V1_PREFIX}/subscriptions", tags=["Subscriptions"])
-app.include_router(banking.router, prefix=f"{settings.API_V1_PREFIX}/banking", tags=["Banking"])
-app.include_router(documents.router, prefix=f"{settings.API_V1_PREFIX}/documents", tags=["Documents"])
-app.include_router(files.router, prefix=f"{settings.API_V1_PREFIX}/files", tags=["Files"])
-app.include_router(support.router, prefix=f"{settings.API_V1_PREFIX}/support", tags=["Support"])
 app.include_router(notifications.router, prefix=f"{settings.API_V1_PREFIX}/notifications", tags=["Notifications"])
-app.include_router(reports.router, prefix=f"{settings.API_V1_PREFIX}/reports", tags=["Reports"])
-app.include_router(chat.router, prefix=f"{settings.API_V1_PREFIX}/chat", tags=["Chat"])
-app.include_router(chat_conversations.router, prefix=f"{settings.API_V1_PREFIX}/chat", tags=["Chat"])
+
+# --- KYC-gated (dashboard / data) ---
+app.include_router(assets.router, prefix=f"{settings.API_V1_PREFIX}/assets", tags=["Assets"], dependencies=_KYC_GATED)
+app.include_router(portfolio.router, prefix=f"{settings.API_V1_PREFIX}/portfolio", tags=["Portfolio"], dependencies=_KYC_GATED)
+app.include_router(trading.router, prefix=f"{settings.API_V1_PREFIX}/trading", tags=["Trading"], dependencies=_KYC_GATED)
+app.include_router(marketplace.router, prefix=f"{settings.API_V1_PREFIX}/marketplace", tags=["Marketplace"], dependencies=_KYC_GATED)
+app.include_router(payments.router, prefix=f"{settings.API_V1_PREFIX}/payments", tags=["Payments"], dependencies=_KYC_GATED)
+app.include_router(banking.router, prefix=f"{settings.API_V1_PREFIX}/banking", tags=["Banking"], dependencies=_KYC_GATED)
+app.include_router(documents.router, prefix=f"{settings.API_V1_PREFIX}/documents", tags=["Documents"], dependencies=_KYC_GATED)
+app.include_router(files.router, prefix=f"{settings.API_V1_PREFIX}/files", tags=["Files"], dependencies=_KYC_GATED)
+app.include_router(support.router, prefix=f"{settings.API_V1_PREFIX}/support", tags=["Support"], dependencies=_KYC_GATED)
+app.include_router(reports.router, prefix=f"{settings.API_V1_PREFIX}/reports", tags=["Reports"], dependencies=_KYC_GATED)
+app.include_router(chat.router, prefix=f"{settings.API_V1_PREFIX}/chat", tags=["Chat"], dependencies=_KYC_GATED)
+app.include_router(chat_conversations.router, prefix=f"{settings.API_V1_PREFIX}/chat", tags=["Chat"], dependencies=_KYC_GATED)
 # WebSocket route (registered directly on app, not via router)
 from app.api.v1.websocket_chat import websocket_chat_endpoint
 app.websocket("/ws/chat")(websocket_chat_endpoint)
 from app.api.v1.ws_notifications import websocket_notifications_endpoint
 app.websocket(f"{settings.API_V1_PREFIX}/ws/notifications")(websocket_notifications_endpoint)
-app.include_router(analytics.router, prefix=f"{settings.API_V1_PREFIX}/analytics", tags=["Analytics"])
+app.include_router(analytics.router, prefix=f"{settings.API_V1_PREFIX}/analytics", tags=["Analytics"], dependencies=_KYC_GATED)
 app.include_router(admin.router, prefix=f"{settings.API_V1_PREFIX}/admin", tags=["Admin"])
-app.include_router(investment.router, prefix=f"{settings.API_V1_PREFIX}/investment", tags=["Investment"])
+app.include_router(investment.router, prefix=f"{settings.API_V1_PREFIX}/investment", tags=["Investment"], dependencies=_KYC_GATED)
 app.include_router(market.router, prefix=f"{settings.API_V1_PREFIX}/market", tags=["Market"])
-app.include_router(tasks.router, prefix=f"{settings.API_V1_PREFIX}/tasks", tags=["Tasks"])
-app.include_router(reminders.router, prefix=f"{settings.API_V1_PREFIX}/reminders", tags=["Reminders"])
-app.include_router(concierge.router, prefix=f"{settings.API_V1_PREFIX}/concierge", tags=["Concierge"])
-app.include_router(crm.router, prefix=f"{settings.API_V1_PREFIX}/crm", tags=["CRM"])
-app.include_router(entities.router, prefix=f"{settings.API_V1_PREFIX}/entities", tags=["Entities"])
-app.include_router(compliance.router, prefix=f"{settings.API_V1_PREFIX}/compliance", tags=["Compliance"])
-app.include_router(referrals.router, prefix=f"{settings.API_V1_PREFIX}/referrals", tags=["Referrals"])
+app.include_router(tasks.router, prefix=f"{settings.API_V1_PREFIX}/tasks", tags=["Tasks"], dependencies=_KYC_GATED)
+app.include_router(reminders.router, prefix=f"{settings.API_V1_PREFIX}/reminders", tags=["Reminders"], dependencies=_KYC_GATED)
+app.include_router(concierge.router, prefix=f"{settings.API_V1_PREFIX}/concierge", tags=["Concierge"], dependencies=_KYC_GATED)
+app.include_router(crm.router, prefix=f"{settings.API_V1_PREFIX}/crm", tags=["CRM"], dependencies=_KYC_GATED)
+app.include_router(entities.router, prefix=f"{settings.API_V1_PREFIX}/entities", tags=["Entities"], dependencies=_KYC_GATED)
+app.include_router(compliance.router, prefix=f"{settings.API_V1_PREFIX}/compliance", tags=["Compliance"], dependencies=_KYC_GATED)
+app.include_router(referrals.router, prefix=f"{settings.API_V1_PREFIX}/referrals", tags=["Referrals"], dependencies=_KYC_GATED)
+app.include_router(advisor.router, prefix=f"{settings.API_V1_PREFIX}/advisor", tags=["Advisor"], dependencies=_KYC_GATED)
 app.include_router(webhooks.router, prefix=f"{settings.API_V1_PREFIX}/webhooks", tags=["Webhooks"])
 
 
@@ -217,89 +341,74 @@ def is_origin_allowed(origin: str) -> bool:
 
 # Global exception handlers to ensure proper error responses
 # CORS middleware should handle headers automatically, but we ensure responses are properly formatted
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    response = JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.detail if isinstance(exc.detail, str) else exc.detail}
-    )
-    # Ensure CORS headers are present (CORS middleware should add them, but this ensures it)
+def _apply_cors_headers(request: Request, response: JSONResponse, allow_dev_fallback: bool = False) -> JSONResponse:
+    """Mirror the CORS headers onto an error response.
+
+    The CORS middleware normally adds these, but it does not always run for
+    responses produced by exception handlers, so we ensure they are present.
+    """
     origin = request.headers.get("origin")
-    if origin and is_origin_allowed(origin):
+    if origin and (is_origin_allowed(origin) or (allow_dev_fallback and settings.APP_ENV == "development")):
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Accept, X-Requested-With, *"
+    elif origin and allow_dev_fallback:
+        response.headers["Access-Control-Allow-Origin"] = origins[0] if origins else "*"
     elif not origin:
-        # Allow requests without origin (e.g., Postman, curl)
-        response.headers["Access-Control-Allow-Origin"] = "*"
+        if allow_dev_fallback and settings.APP_ENV != "development":
+            response.headers["Access-Control-Allow-Origin"] = origins[0] if origins else "*"
+        else:
+            response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Accept, X-Requested-With, *"
     return response
+
+
+def _http_exception_to_envelope(exc: HTTPException) -> JSONResponse:
+    # FullegoException subclasses carry a stable ``code``; raw HTTPExceptions fall
+    # back to a status-derived code. ``detail`` is the user-facing message when it
+    # is a plain string.
+    code = getattr(exc, "code", None) or error_code_for(exc.status_code)
+    message = exc.detail if isinstance(exc.detail, str) else None
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=error_envelope(exc.status_code, message=message, code=code),
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return _apply_cors_headers(request, _http_exception_to_envelope(exc))
 
 
 @app.exception_handler(StarletteHTTPException)
 async def starlette_http_exception_handler(request: Request, exc: StarletteHTTPException):
-    response = JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.detail if isinstance(exc.detail, str) else exc.detail}
-    )
-    # Ensure CORS headers are present
-    origin = request.headers.get("origin")
-    if origin and is_origin_allowed(origin):
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Accept, X-Requested-With, *"
-    elif not origin:
-        response.headers["Access-Control-Allow-Origin"] = "*"
-    return response
+    return _apply_cors_headers(request, _http_exception_to_envelope(exc))
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     response = JSONResponse(
         status_code=422,
-        content={"detail": exc.errors()}
+        content=error_envelope(
+            422,
+            message="Some of the information provided is invalid. Please check the highlighted fields.",
+            code="VALIDATION_ERROR",
+            details=flatten_validation_errors(exc.errors()),
+        ),
     )
-    # Ensure CORS headers are present
-    origin = request.headers.get("origin")
-    if origin and is_origin_allowed(origin):
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Accept, X-Requested-With, *"
-    return response
+    return _apply_cors_headers(request, response)
 
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
-    detail = "Internal server error"
-    if settings.APP_DEBUG:
-        detail = str(exc)
+    # Never leak internals to clients; show the real error only in debug.
+    message = str(exc) if settings.APP_DEBUG else "Something went wrong on our end. Please try again."
     response = JSONResponse(
         status_code=500,
-        content={"detail": detail}
+        content=error_envelope(500, message=message, code="INTERNAL_ERROR"),
     )
-    # Ensure CORS headers are ALWAYS present for 500 errors
-    origin = request.headers.get("origin")
-    if origin:
-        # Check if origin is allowed, if not, still allow it in development
-        if is_origin_allowed(origin) or settings.APP_ENV == "development":
-            response.headers["Access-Control-Allow-Origin"] = origin
-            response.headers["Access-Control-Allow-Credentials"] = "true"
-        else:
-            # In production, only allow from allowed origins
-            response.headers["Access-Control-Allow-Origin"] = origins[0] if origins else "*"
-    else:
-        # No origin header, allow all in development
-        if settings.APP_ENV == "development":
-            response.headers["Access-Control-Allow-Origin"] = "*"
-        else:
-            response.headers["Access-Control-Allow-Origin"] = origins[0] if origins else "*"
-    
-    # Always add these headers
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Accept, X-Requested-With, *"
+    response = _apply_cors_headers(request, response, allow_dev_fallback=True)
     response.headers["Access-Control-Expose-Headers"] = "*"
     return response
 

@@ -11,6 +11,7 @@ class Role(str, Enum):
 class Permission(str, Enum):
     READ_USERS = "read:users"
     WRITE_USERS = "write:users"
+    MANAGE_USERS = "manage:users"
     READ_ASSETS = "read:assets"
     WRITE_ASSETS = "write:assets"
     READ_PORTFOLIO = "read:portfolio"
@@ -18,6 +19,7 @@ class Permission(str, Enum):
     TRADE = "trade"
     CREATE_LISTINGS = "create:listings"
     APPROVE_LISTINGS = "approve:listings"
+    MANAGE_MARKETPLACE = "manage:marketplace"
     MANAGE_SUBSCRIPTIONS = "manage:subscriptions"
     VIEW_ANALYTICS = "view:analytics"
     MANAGE_SUPPORT = "manage:support"
@@ -27,6 +29,7 @@ ROLE_PERMISSIONS = {
     Role.ADMIN: [
         Permission.READ_USERS,
         Permission.WRITE_USERS,
+        Permission.MANAGE_USERS,
         Permission.READ_ASSETS,
         Permission.WRITE_ASSETS,
         Permission.READ_PORTFOLIO,
@@ -34,6 +37,7 @@ ROLE_PERMISSIONS = {
         Permission.TRADE,
         Permission.CREATE_LISTINGS,
         Permission.APPROVE_LISTINGS,
+        Permission.MANAGE_MARKETPLACE,
         Permission.MANAGE_SUBSCRIPTIONS,
         Permission.VIEW_ANALYTICS,
         Permission.MANAGE_SUPPORT,

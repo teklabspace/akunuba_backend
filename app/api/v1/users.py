@@ -12,7 +12,7 @@ from app.models.account import Account
 from app.models.kyc import KYCVerification
 from app.schemas.user import UserResponse, UserUpdate
 from app.core.exceptions import NotFoundException, BadRequestException
-from app.core.permissions import Role, Permission, has_permission
+from app.core.permissions import Role, Permission, has_permission, get_role_permissions
 from app.core.security import verify_password, get_password_hash
 from app.utils.logger import logger
 from uuid import UUID
@@ -110,6 +110,8 @@ class UserProfileResponse(BaseModel):
     phone: Optional[str] = None
     email_verified: bool
     kyc_status: str
+    role: Role
+    permissions: List[str]
     created_at: datetime
 
     class Config:
@@ -139,7 +141,11 @@ async def get_current_user_info(
     
     # Check email verification
     email_verified = current_user.email_verified_at is not None
-    
+
+    # Effective role -> permission set, so the frontend can stop hardcoding it.
+    # Source of truth is ROLE_PERMISSIONS in app/core/permissions.py.
+    permissions = [p.value for p in get_role_permissions(current_user.role)]
+
     return UserProfileResponse(
         id=current_user.id,
         email=current_user.email,
@@ -148,6 +154,8 @@ async def get_current_user_info(
         phone=current_user.phone,
         email_verified=email_verified,
         kyc_status=kyc_status,
+        role=current_user.role,
+        permissions=permissions,
         created_at=current_user.created_at
     )
 

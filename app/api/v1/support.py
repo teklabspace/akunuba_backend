@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Body, File, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_, and_
 from typing import List, Optional, Dict, Any
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from app.database import get_db
 from app.api.deps import get_current_user
 from app.models.user import User
@@ -16,9 +16,39 @@ from app.core.permissions import Role, Permission, has_permission
 from app.utils.logger import logger
 from app.config import settings
 from uuid import UUID
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 router = APIRouter()
+
+
+def _ticket_code(n: Optional[int]) -> Optional[str]:
+    """Format the sequential ticket number for display, e.g. 1042 -> 'TCK-1042'."""
+    return f"TCK-{n:04d}" if n else None
+
+
+def _display_name(user: Optional[User]) -> str:
+    """Best available human name for a user, robust to NULL name parts."""
+    if not user:
+        return "User"
+    name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+    return name or (user.email or "User")
+
+
+def _ticket_dict(ticket: SupportTicket, requester: Optional[User]) -> dict:
+    """Enriched ticket row: adds the display ticket number + requester identity."""
+    return {
+        "id": ticket.id,
+        "ticket_number": _ticket_code(ticket.ticket_number),
+        "subject": ticket.subject,
+        "status": ticket.status.value,
+        "priority": ticket.priority.value,
+        "created_at": ticket.created_at,
+        "requester": {
+            "id": requester.id if requester else None,
+            "name": _display_name(requester),
+            "email": requester.email if requester else None,
+        },
+    }
 
 
 class TicketCreate(BaseModel):
@@ -28,12 +58,20 @@ class TicketCreate(BaseModel):
     category: Optional[str] = None
 
 
+class TicketRequester(BaseModel):
+    id: Optional[UUID] = None
+    name: str
+    email: Optional[str] = None
+
+
 class TicketResponse(BaseModel):
     id: UUID
+    ticket_number: Optional[str] = None
     subject: str
     status: str
     priority: str
     created_at: datetime
+    requester: Optional[TicketRequester] = None
 
     class Config:
         from_attributes = True
@@ -92,38 +130,55 @@ async def create_ticket(
     except Exception as e:
         logger.error(f"Failed to notify admins of new ticket {ticket.id}: {e}")
 
-    return ticket
+    return _ticket_dict(ticket, current_user)
 
 
 @router.get("/tickets", response_model=List[TicketResponse])
 async def list_tickets(
-    status_filter: Optional[TicketStatus] = Query(None),
+    status: Optional[TicketStatus] = Query(None, description="Filter by status: open, in_progress, resolved, closed"),
+    status_filter: Optional[TicketStatus] = Query(None, description="Alias of `status` (backward compatible)"),
+    search: Optional[str] = Query(None, description="Case-insensitive match on subject or description"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """List support tickets"""
+    """List support tickets, enriched with ticket number + requester identity.
+
+    Scope by role:
+      - staff (MANAGE_SUPPORT: admin, advisor) see all tickets;
+      - everyone else (investor) sees only their own tickets.
+    `status`/`status_filter` and `search` behave identically for every role.
+    """
     account_result = await db.execute(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
-    
+
     if not account:
         raise NotFoundException("Account", str(current_user.id))
-    
-    query = select(SupportTicket).where(SupportTicket.account_id == account.id)
-    
-    # Admins can see all tickets
-    if has_permission(current_user.role, Permission.MANAGE_SUPPORT):
-        query = select(SupportTicket)
-        if status_filter:
-            query = query.where(SupportTicket.status == status_filter)
-    elif status_filter:
-        query = query.where(SupportTicket.status == status_filter)
-    
+
+    status_value = status or status_filter
+    is_staff = has_permission(current_user.role, Permission.MANAGE_SUPPORT)
+
+    # Join the requester (account -> user) so we can return their name/email.
+    query = (
+        select(SupportTicket, User)
+        .join(Account, SupportTicket.account_id == Account.id)
+        .join(User, Account.user_id == User.id)
+    )
+
+    if not is_staff:
+        query = query.where(SupportTicket.account_id == account.id)
+    if status_value:
+        query = query.where(SupportTicket.status == status_value)
+    if search:
+        term = f"%{search.strip()}%"
+        query = query.where(or_(
+            SupportTicket.subject.ilike(term),
+            SupportTicket.description.ilike(term),
+        ))
+
     result = await db.execute(query.order_by(SupportTicket.created_at.desc()))
-    tickets = result.scalars().all()
-    
-    return tickets
+    return [_ticket_dict(ticket, requester) for ticket, requester in result.all()]
 
 
 @router.get("/tickets/{ticket_id}", response_model=TicketResponse)
@@ -142,16 +197,22 @@ async def get_ticket(
         select(SupportTicket).where(SupportTicket.id == ticket_id)
     )
     ticket = result.scalar_one_or_none()
-    
+
     if not ticket:
         raise NotFoundException("Ticket", str(ticket_id))
-    
+
     # Check access
     if not has_permission(current_user.role, Permission.MANAGE_SUPPORT):
         if ticket.account_id != account.id:
             raise HTTPException(status_code=403, detail="Access denied")
-    
-    return ticket
+
+    # Resolve the requester (owner of the ticket's account) for display.
+    requester = (await db.execute(
+        select(User).join(Account, Account.user_id == User.id)
+        .where(Account.id == ticket.account_id)
+    )).scalar_one_or_none()
+
+    return _ticket_dict(ticket, requester)
 
 
 class TicketUpdateRequest(BaseModel):
@@ -323,6 +384,53 @@ async def get_ticket_replies(
     replies = result.scalars().all()
     
     return replies
+
+
+class TicketRatingRequest(BaseModel):
+    rating: int = Field(..., ge=1, le=5, description="Satisfaction rating, 1-5")
+    comment: Optional[str] = None
+
+
+@router.post("/tickets/{ticket_id}/rating", response_model=Dict[str, Any])
+async def rate_ticket(
+    ticket_id: UUID,
+    body: TicketRatingRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Submit a CSAT rating for a resolved/closed ticket. Owner only.
+
+    Feeds the admin support dashboard's satisfaction_rate metric.
+    """
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+
+    result = await db.execute(select(SupportTicket).where(SupportTicket.id == ticket_id))
+    ticket = result.scalar_one_or_none()
+    if not ticket:
+        raise NotFoundException("Ticket", str(ticket_id))
+
+    # Only the requester rates their own ticket.
+    if ticket.account_id != account.id:
+        raise HTTPException(status_code=403, detail="You can only rate your own tickets")
+
+    if ticket.status not in (TicketStatus.RESOLVED, TicketStatus.CLOSED):
+        raise BadRequestException("You can only rate a ticket once it's resolved or closed")
+
+    ticket.satisfaction_rating = body.rating
+    ticket.satisfaction_comment = body.comment
+    await db.commit()
+    await db.refresh(ticket)
+
+    logger.info(f"Ticket {ticket_id} rated {body.rating}/5")
+    return {
+        "message": "Thanks for your feedback",
+        "data": {"ticket_id": str(ticket.id), "rating": ticket.satisfaction_rating},
+    }
 
 
 @router.get("/tickets/stats")
@@ -666,9 +774,162 @@ async def get_ticket_history(
     
     # Sort by timestamp
     history.sort(key=lambda x: x["timestamp"] or "")
-    
+
     return {
         "data": history,
         "count": len(history)
+    }
+
+
+def _duration_label(sec: Optional[float]) -> Optional[str]:
+    if sec is None:
+        return None
+    sec = int(sec)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def _pct_change(cur, prev):
+    if not prev or cur is None:
+        return None
+    return round((cur - prev) / prev * 100, 1)
+
+
+@router.get("/analytics", response_model=Dict[str, Any])
+async def support_analytics(
+    range: str = Query("30d", description="7d | 30d | 90d"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Role-scoped support analytics for the Reports tab.
+
+    Scope is derived from the caller's role so every role gets a meaningful view:
+      - admin    -> scope "all"      (every ticket on the platform)
+      - advisor  -> scope "assigned" (tickets assigned to this advisor)
+      - investor -> scope "own"      (tickets this investor opened)
+
+    Metrics are computed over the selected window (by ticket ``created_at``), with a
+    period-over-period ``change_pct`` versus the immediately preceding window.
+    For staff scopes ``satisfaction_rate`` reflects CSAT *received*; for the investor
+    scope it reflects CSAT *they submitted*.
+    """
+    account = (await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )).scalar_one_or_none()
+
+    # Determine scope + the base predicate that filters the ticket set.
+    if current_user.role == Role.ADMIN:
+        scope = "all"
+        base = []
+    elif current_user.role == Role.ADVISOR:
+        scope = "assigned"
+        base = [SupportTicket.assigned_to == current_user.id]
+    else:
+        scope = "own"
+        if not account:
+            raise NotFoundException("Account", str(current_user.id))
+        base = [SupportTicket.account_id == account.id]
+
+    days = {"7d": 7, "30d": 30, "90d": 90}.get((range or "30d").lower(), 30)
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    prev_start = start - timedelta(days=days)
+
+    async def _count(*conds) -> int:
+        return (await db.execute(
+            select(func.count(SupportTicket.id)).where(and_(*base, *conds))
+        )).scalar() or 0
+
+    # Volume (current vs previous window)
+    cur_total = await _count(SupportTicket.created_at >= start)
+    prev_total = await _count(and_(SupportTicket.created_at >= prev_start,
+                                   SupportTicket.created_at < start))
+
+    # Status breakdown within the current window
+    status_rows = (await db.execute(
+        select(SupportTicket.status, func.count(SupportTicket.id))
+        .where(and_(*base, SupportTicket.created_at >= start))
+        .group_by(SupportTicket.status)
+    )).all()
+    by_status = {s.value: 0 for s in TicketStatus}
+    for st, cnt in status_rows:
+        by_status[st.value] = cnt
+
+    # Unresolved snapshot (open + in_progress), not time-bounded
+    unresolved = await _count(SupportTicket.status.in_([TicketStatus.OPEN, TicketStatus.IN_PROGRESS]))
+
+    # Avg first-response time (seconds) for tickets first-responded in the window
+    async def _avg_first_response(win_start, win_end=None):
+        conds = [SupportTicket.first_response_at.isnot(None), SupportTicket.created_at >= win_start]
+        if win_end is not None:
+            conds.append(SupportTicket.created_at < win_end)
+        return (await db.execute(
+            select(func.avg(func.extract("epoch", SupportTicket.first_response_at - SupportTicket.created_at)))
+            .where(and_(*base, *conds))
+        )).scalar()
+
+    avg_fr_cur = await _avg_first_response(start)
+    avg_fr_prev = await _avg_first_response(prev_start, start)
+    avg_fr_cur_s = int(avg_fr_cur) if avg_fr_cur is not None else None
+    avg_fr_prev_s = int(avg_fr_prev) if avg_fr_prev is not None else None
+
+    # Avg resolution time (created -> resolved) for tickets resolved in the window
+    async def _avg_resolution(win_start, win_end=None):
+        conds = [SupportTicket.resolved_at.isnot(None), SupportTicket.resolved_at >= win_start]
+        if win_end is not None:
+            conds.append(SupportTicket.resolved_at < win_end)
+        return (await db.execute(
+            select(func.avg(func.extract("epoch", SupportTicket.resolved_at - SupportTicket.created_at)))
+            .where(and_(*base, *conds))
+        )).scalar()
+
+    avg_res_cur = await _avg_resolution(start)
+    avg_res_prev = await _avg_resolution(prev_start, start)
+    avg_res_cur_s = int(avg_res_cur) if avg_res_cur is not None else None
+    avg_res_prev_s = int(avg_res_prev) if avg_res_prev is not None else None
+
+    # Satisfaction (avg CSAT rating -> percentage) over rated tickets in the window
+    def _rating_pct(avg):
+        return round(float(avg) / 5 * 100, 1) if avg is not None else None
+
+    async def _avg_rating(win_start, win_end=None):
+        conds = [SupportTicket.satisfaction_rating.isnot(None), SupportTicket.created_at >= win_start]
+        if win_end is not None:
+            conds.append(SupportTicket.created_at < win_end)
+        return (await db.execute(
+            select(func.avg(SupportTicket.satisfaction_rating)).where(and_(*base, *conds))
+        )).scalar()
+
+    sat_cur = _rating_pct(await _avg_rating(start))
+    sat_prev = _rating_pct(await _avg_rating(prev_start, start))
+
+    return {
+        "scope": scope,
+        "range": f"{days}d",
+        "summary": {
+            "total_tickets": {"value": cur_total, "change_pct": _pct_change(cur_total, prev_total)},
+            "by_status": by_status,
+            "unresolved_issues": {"value": unresolved, "change_pct": None},
+            "avg_first_response": {
+                "value_seconds": avg_fr_cur_s,
+                "value_label": _duration_label(avg_fr_cur_s),
+                "change_pct": _pct_change(avg_fr_cur_s, avg_fr_prev_s),
+            },
+            "avg_resolution": {
+                "value_seconds": avg_res_cur_s,
+                "value_label": _duration_label(avg_res_cur_s),
+                "change_pct": _pct_change(avg_res_cur_s, avg_res_prev_s),
+            },
+            "satisfaction_rate": {
+                "value": sat_cur,
+                "change_pct": _pct_change(sat_cur, sat_prev),
+                "note": None if sat_cur is not None else "No CSAT ratings in this period yet.",
+            },
+        },
     }
 

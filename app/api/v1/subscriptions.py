@@ -10,8 +10,10 @@ from app.api.deps import get_current_user
 from app.models.user import User, Role
 from app.models.account import Account
 from app.models.payment import Subscription, SubscriptionPlan, SubscriptionStatus
+from app.models.kyc import KYCVerification, KYCStatus
 from app.integrations.stripe_client import StripeClient
-from app.core.exceptions import NotFoundException, BadRequestException, ConflictException
+from app.core.exceptions import NotFoundException, BadRequestException, ConflictException, ForbiddenException
+from app.core.responses import success_envelope
 from app.core.rate_limit import limiter
 from app.utils.logger import logger
 from uuid import UUID
@@ -86,27 +88,6 @@ PLANS_CONFIG = {
         },
         "popular": False,
         "is_custom": False
-    },
-    "concierge": {
-        "id": "concierge",
-        "name": "Concierge",
-        "description": "Custom enterprise solution",
-        "monthly_price": None,
-        "annual_price": None,
-        "currency": "USD",
-        "features": [
-            "Everything in Premium",
-            "Dedicated account manager",
-            "Custom integrations",
-            "White-glove onboarding",
-            "24/7 concierge support"
-        ],
-        "limits": {
-            "max_accounts": -1,
-            "max_assets": -1
-        },
-        "popular": False,
-        "is_custom": True
     }
 }
 
@@ -115,7 +96,6 @@ class SubscriptionCreate(BaseModel):
     plan_id: str
     billing_cycle: str
     payment_method_id: Optional[str] = None
-    coupon_code: Optional[str] = None
 
 
 class PlanResponse(BaseModel):
@@ -172,12 +152,12 @@ class SubscriptionCreateResponse(BaseModel):
     client_secret: Optional[str] = None
 
 
-# Subscription pricing (mapping from plan_id to prices)
+# Subscription pricing (mapping from plan_id to prices).
+# Annual = ~20% off 12x the monthly price.
 PLAN_PRICES = {
     "starter": {"monthly": Decimal("49.00"), "annual": Decimal("470.00")},
     "pro": {"monthly": Decimal("299.00"), "annual": Decimal("2870.00")},
     "premium": {"monthly": Decimal("899.00"), "annual": Decimal("8630.00")},
-    "concierge": {"monthly": None, "annual": None},
 }
 
 # Map plan_id to internal SubscriptionPlan enum
@@ -185,11 +165,8 @@ PLAN_ID_TO_ENUM = {
     "starter": SubscriptionPlan.FREE,
     "pro": SubscriptionPlan.MONTHLY,
     "premium": SubscriptionPlan.ANNUAL,
-    "concierge": SubscriptionPlan.ANNUAL,
 }
 
-# Explicit reverse map — avoids dict-inversion collision where concierge
-# would overwrite premium (both map to ANNUAL).
 PLAN_ENUM_TO_ID = {
     SubscriptionPlan.FREE: "starter",
     SubscriptionPlan.MONTHLY: "pro",
@@ -208,10 +185,111 @@ def normalize_plan_id(plan_id: Optional[str]) -> Optional[str]:
         return plan_id[len("plan_"):]
     return plan_id
 
-DISCOUNT_CODES = {
-    "EARLYBIRD": Decimal("10"),  # 10% off
-    "ANNUAL20": Decimal("20"),  # 20% off annual
-}
+
+def get_plan_tier(subscription: Subscription) -> str:
+    """The product tier the user actually bought ("starter" | "pro" | "premium").
+
+    Prefer the explicit ``plan_tier`` column; fall back to reverse-mapping the
+    legacy ``plan`` enum for rows written before that column existed.
+    """
+    if getattr(subscription, "plan_tier", None):
+        return subscription.plan_tier
+    return PLAN_ENUM_TO_ID.get(subscription.plan, "starter")
+
+
+def get_billing_cycle(subscription: Subscription) -> str:
+    """The billing cycle ("monthly" | "annual").
+
+    Prefer the explicit ``billing_cycle`` column; fall back to inferring it from
+    the period length for legacy rows.
+    """
+    if getattr(subscription, "billing_cycle", None):
+        return subscription.billing_cycle
+    if subscription.current_period_start and subscription.current_period_end:
+        if (subscription.current_period_end - subscription.current_period_start).days > 60:
+            return "annual"
+    return "monthly"
+
+
+def is_email_verified(user: User) -> bool:
+    """A user's email counts as verified via either the boolean flag or a recorded
+    verification timestamp."""
+    return bool(user.is_verified or user.email_verified_at)
+
+
+async def is_kyc_approved(db: AsyncSession, account_id: UUID) -> bool:
+    """True only when the account's Persona (KYC) verification is approved."""
+    result = await db.execute(
+        select(KYCVerification).where(KYCVerification.account_id == account_id)
+    )
+    kyc = result.scalar_one_or_none()
+    return bool(kyc and kyc.status == KYCStatus.APPROVED)
+
+
+async def assert_can_purchase(user: User, account: Account, db: AsyncSession) -> None:
+    """Enforce who may buy a plan: only an investor whose email AND Persona (KYC)
+    verification are both complete. Raises a 403 with a specific code otherwise."""
+    if user.role in (Role.ADMIN, Role.ADVISOR):
+        raise ForbiddenException(
+            "Your account does not require a subscription.",
+            code="SUBSCRIPTION_NOT_APPLICABLE",
+        )
+    if not is_email_verified(user):
+        raise ForbiddenException(
+            "Verify your email before purchasing a plan.",
+            code="EMAIL_NOT_VERIFIED",
+        )
+    if not await is_kyc_approved(db, account.id):
+        raise ForbiddenException(
+            "Complete identity verification (Persona) before purchasing a plan.",
+            code="KYC_NOT_APPROVED",
+        )
+
+
+async def build_capabilities(
+    user: User,
+    account: Optional[Account],
+    subscription: Optional[Subscription],
+    db: AsyncSession,
+) -> Dict[str, Any]:
+    """Role/verification-aware capability flags so the frontend can render the
+    right buttons (subscribe / cancel / upgrade) without re-deriving the rules.
+
+    ``reason`` explains why ``can_subscribe`` is False (role or missing
+    verification) so the UI can prompt the next step.
+    """
+    # Admin/advisor never subscribe.
+    if user.role in (Role.ADMIN, Role.ADVISOR):
+        return {
+            "subscription_required": False,
+            "can_subscribe": False,
+            "can_cancel": False,
+            "can_upgrade": False,
+            "reason": "Your account does not require a subscription.",
+        }
+
+    has_active = bool(subscription and subscription.status == SubscriptionStatus.ACTIVE)
+
+    reason: Optional[str] = None
+    eligible = True
+    if not is_email_verified(user):
+        eligible = False
+        reason = "Verify your email to purchase a plan."
+    elif account is None or not await is_kyc_approved(db, account.id):
+        # No account means the user hasn't started KYC yet -> not eligible.
+        eligible = False
+        reason = "Complete identity verification (Persona) to purchase a plan."
+
+    return {
+        "subscription_required": True,
+        # Can start a new plan only when eligible and not already active.
+        "can_subscribe": eligible and not has_active,
+        # Can cancel only an active plan that isn't already pending cancellation.
+        "can_cancel": has_active and not bool(getattr(subscription, "cancel_at_period_end", False)),
+        # Can upgrade/downgrade only an active plan.
+        "can_upgrade": has_active,
+        "reason": reason,
+    }
 
 
 @router.get("/plans", response_model=PlansResponse)
@@ -231,11 +309,11 @@ async def create_subscription(
     db: AsyncSession = Depends(get_db)
 ):
     """Create/activate a subscription"""
-    # Admin/advisor accounts do not use subscriptions — reject as a safety check.
+    # Admin/advisor accounts do not use subscriptions — only investors subscribe.
     if current_user.role in (Role.ADMIN, Role.ADVISOR):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Your account does not require a subscription."
+        raise ForbiddenException(
+            "Your account does not require a subscription.",
+            code="SUBSCRIPTION_NOT_APPLICABLE",
         )
 
     account_result = await db.execute(
@@ -246,16 +324,28 @@ async def create_subscription(
     if not account:
         raise NotFoundException("Account", str(current_user.id))
 
+    # Only a verified investor may purchase: email verified AND Persona (KYC) approved.
+    if not is_email_verified(current_user):
+        raise ForbiddenException(
+            "Verify your email before purchasing a plan.",
+            code="EMAIL_NOT_VERIFIED",
+        )
+    if not await is_kyc_approved(db, account.id):
+        raise ForbiddenException(
+            "Complete identity verification (Persona) before purchasing a plan.",
+            code="KYC_NOT_APPROVED",
+        )
+
     # Validate plan_id (accepts both bare and legacy 'plan_'-prefixed IDs)
     plan_id = normalize_plan_id(subscription_data.plan_id)
     if plan_id not in PLANS_CONFIG:
-        raise BadRequestException("Invalid plan_id provided")
+        raise BadRequestException("Invalid plan_id provided", code="PLAN_INVALID")
 
     plan_config = PLANS_CONFIG[plan_id]
     
     # Validate billing_cycle
     if subscription_data.billing_cycle not in ["monthly", "annual"]:
-        raise BadRequestException("billing_cycle must be 'monthly' or 'annual'")
+        raise BadRequestException("billing_cycle must be 'monthly' or 'annual'", code="BILLING_CYCLE_INVALID")
     
     # Get price based on billing cycle
     if subscription_data.billing_cycle == "monthly":
@@ -264,23 +354,25 @@ async def create_subscription(
         base_amount = plan_config["annual_price"]
     
     if base_amount is None:
-        raise BadRequestException("This plan requires custom pricing. Please contact support.")
-    
-    # Calculate amount with discount
-    discount_amount = Decimal("0")
-    if subscription_data.coupon_code:
-        discount_percent = DISCOUNT_CODES.get(subscription_data.coupon_code.upper())
-        if discount_percent:
-            discount_amount = (base_amount * discount_percent) / 100
-    
-    final_amount = base_amount - discount_amount
+        raise BadRequestException("This plan requires custom pricing. Please contact support.", code="PLAN_REQUIRES_CUSTOM_PRICING")
+
+    final_amount = base_amount
     
     # Check if subscription already exists
     existing_result = await db.execute(
         select(Subscription).where(Subscription.account_id == account.id)
     )
     existing = existing_result.scalar_one_or_none()
-    
+
+    # Backstop guard: never create/overwrite-charge on top of a live subscription —
+    # those users belong in the upgrade flow. Re-subscribing on an expired/cancelled
+    # record is still allowed (it reactivates below).
+    if existing and existing.status in (SubscriptionStatus.ACTIVE, SubscriptionStatus.PAST_DUE):
+        raise ConflictException(
+            "You already have an active subscription. Use the upgrade flow to change plans.",
+            code="SUBSCRIPTION_ALREADY_EXISTS",
+        )
+
     # Map plan_id to internal enum
     internal_plan = PLAN_ID_TO_ENUM.get(plan_id, SubscriptionPlan.FREE)
     
@@ -336,20 +428,27 @@ async def create_subscription(
     # Create or update subscription
     if existing:
         existing.plan = internal_plan
+        existing.plan_tier = plan_id
+        existing.billing_cycle = subscription_data.billing_cycle
         existing.status = SubscriptionStatus.ACTIVE
         existing.amount = final_amount
         existing.current_period_start = now
         existing.current_period_end = period_end
+        existing.cancel_at_period_end = False
+        existing.cancelled_at = None
         subscription = existing
     else:
         subscription = Subscription(
             account_id=account.id,
             plan=internal_plan,
+            plan_tier=plan_id,
+            billing_cycle=subscription_data.billing_cycle,
             status=SubscriptionStatus.ACTIVE,
             amount=final_amount,
             currency="USD",
             current_period_start=now,
             current_period_end=period_end,
+            cancel_at_period_end=False,
         )
         db.add(subscription)
     
@@ -367,12 +466,12 @@ async def create_subscription(
         billing_cycle=subscription_data.billing_cycle,
         current_period_start=subscription.current_period_start,
         current_period_end=subscription.current_period_end,
-        cancel_at_period_end=False,
+        cancel_at_period_end=subscription.cancel_at_period_end,
         canceled_at=subscription.cancelled_at,
         features=plan_config["features"],
         created_at=subscription.created_at
     )
-    
+
     # A payment intent that has not yet succeeded means the frontend must complete
     # confirmation/3DS via Stripe.js using the client_secret.
     requires_action = bool(
@@ -393,56 +492,71 @@ async def get_subscription(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get current subscription status"""
+    """Get the current subscription plus role/verification-aware capability flags.
+
+    Response ``data`` shape (always this shape, for every role):
+        {
+          "subscription": <object|null>,
+          "subscription_required": bool,   # false for admin/advisor
+          "can_subscribe": bool,
+          "can_cancel": bool,
+          "can_upgrade": bool,
+          "reason": str|null               # why can_subscribe is false
+        }
+    """
     # Admin/advisor accounts do not require a subscription — return a graceful
     # payload (HTTP 200) instead of risking a 404 from the account lookup.
     if current_user.role in (Role.ADMIN, Role.ADVISOR):
-        return {
-            "subscription": None,
-            "subscription_required": False,
-            "message": "Your account does not require a subscription."
-        }
+        caps = await build_capabilities(current_user, None, None, db)
+        return success_envelope(
+            data={"subscription": None, **caps},
+            message="Your account does not require a subscription.",
+        )
 
     account_result = await db.execute(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
-    
+
+    # No account yet (e.g. a brand-new investor before KYC, or a user just promoted
+    # to investor) — return graceful capability flags instead of a 404.
     if not account:
-        raise NotFoundException("Account", str(current_user.id))
-    
+        caps = await build_capabilities(current_user, None, None, db)
+        return success_envelope(
+            data={"subscription": None, **caps},
+            message="No active subscription found.",
+        )
+
     result = await db.execute(
         select(Subscription).where(Subscription.account_id == account.id)
     )
     subscription = result.scalar_one_or_none()
-    
+
+    # No subscription yet: still return capability flags so the UI knows whether
+    # the "Subscribe" button should be enabled (and why not, if disabled).
     if not subscription:
-        return None
-    
-    # Check if subscription needs renewal
+        caps = await build_capabilities(current_user, account, None, db)
+        return success_envelope(
+            data={"subscription": None, **caps},
+            message="No active subscription found.",
+        )
+
+    # Lazily expire an active subscription whose period has lapsed.
     now = datetime.now(timezone.utc)
-    if subscription.status == SubscriptionStatus.ACTIVE:
-        if subscription.current_period_end:
-            # Ensure timezone-aware comparison
-            period_end = subscription.current_period_end
-            if period_end.tzinfo is None:
-                period_end = period_end.replace(tzinfo=timezone.utc)
-            if period_end < now:
-                subscription.status = SubscriptionStatus.EXPIRED
-                await db.commit()
-    
-    # Map internal plan to plan_id
-    plan_id = PLAN_ENUM_TO_ID.get(subscription.plan, "starter")
+    if subscription.status == SubscriptionStatus.ACTIVE and subscription.current_period_end:
+        period_end = subscription.current_period_end
+        if period_end.tzinfo is None:
+            period_end = period_end.replace(tzinfo=timezone.utc)
+        if period_end < now:
+            subscription.status = SubscriptionStatus.EXPIRED
+            await db.commit()
+
+    plan_id = get_plan_tier(subscription)
     plan_config = PLANS_CONFIG.get(plan_id, PLANS_CONFIG["starter"])
-    
-    # Determine billing cycle from period length
-    billing_cycle = "monthly"
-    if subscription.current_period_start and subscription.current_period_end:
-        days = (subscription.current_period_end - subscription.current_period_start).days
-        if days > 60:  # Annual is ~365 days
-            billing_cycle = "annual"
-    
-    return SubscriptionResponse(
+    billing_cycle = get_billing_cycle(subscription)
+
+    caps = await build_capabilities(current_user, account, subscription, db)
+    subscription_payload = SubscriptionResponse(
         id=subscription.id,
         plan_id=plan_id,
         plan_name=plan_config["name"],
@@ -452,10 +566,14 @@ async def get_subscription(
         billing_cycle=billing_cycle,
         current_period_start=subscription.current_period_start,
         current_period_end=subscription.current_period_end,
-        cancel_at_period_end=False,  # TODO: Add this field to model
+        cancel_at_period_end=subscription.cancel_at_period_end,
         canceled_at=subscription.cancelled_at,
         features=plan_config["features"],
-        created_at=subscription.created_at
+        created_at=subscription.created_at,
+    )
+    return success_envelope(
+        data={"subscription": subscription_payload, **caps},
+        message="Subscription retrieved successfully.",
     )
 
 
@@ -471,57 +589,67 @@ async def cancel_subscription(
     db: AsyncSession = Depends(get_db)
 ):
     """Cancel the current active subscription"""
+    # Only investors hold subscriptions; admin/advisor have nothing to cancel.
+    if current_user.role in (Role.ADMIN, Role.ADVISOR):
+        raise ForbiddenException(
+            "Your account does not have a subscription to cancel.",
+            code="SUBSCRIPTION_NOT_APPLICABLE",
+        )
+
     account_result = await db.execute(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
-    
+
     if not account:
         raise NotFoundException("Account", str(current_user.id))
-    
+
     result = await db.execute(
         select(Subscription).where(Subscription.account_id == account.id)
     )
     subscription = result.scalar_one_or_none()
-    
+
     if not subscription:
-        raise BadRequestException("No active subscription to cancel")
-    
+        raise BadRequestException("No active subscription to cancel", code="NO_ACTIVE_SUBSCRIPTION")
+
     if subscription.status != SubscriptionStatus.ACTIVE:
-        raise BadRequestException("No active subscription to cancel")
-    
+        raise BadRequestException("No active subscription to cancel", code="NO_ACTIVE_SUBSCRIPTION")
+
     cancel_immediately = cancel_data.cancel_immediately if cancel_data else False
     cancellation_reason = cancel_data.cancellation_reason if cancel_data else None
-    
+
     # Cancel in Stripe
     if subscription.stripe_subscription_id:
         try:
             StripeClient.cancel_subscription(subscription.stripe_subscription_id, cancel_immediately)
         except Exception as e:
             logger.error(f"Failed to cancel Stripe subscription: {e}")
-    
+
     if cancel_immediately:
         subscription.status = SubscriptionStatus.CANCELLED
+        subscription.cancel_at_period_end = False
         subscription.cancelled_at = datetime.now(timezone.utc)
         message = "Subscription cancelled immediately"
     else:
-        # Mark to cancel at period end
+        # Stays ACTIVE until the period ends, then expires; flag the pending cancel.
+        subscription.cancel_at_period_end = True
         subscription.cancelled_at = datetime.now(timezone.utc)
-        # TODO: Add cancel_at_period_end field to model
         period_end_str = subscription.current_period_end.isoformat() if subscription.current_period_end else "end of period"
         message = f"Subscription will remain active until {period_end_str}"
-    
+
     await db.commit()
     await db.refresh(subscription)
-    
+
     # Map to response format
-    plan_id = PLAN_ENUM_TO_ID.get(subscription.plan, "starter")
+    plan_id = get_plan_tier(subscription)
     plan_config = PLANS_CONFIG.get(plan_id, PLANS_CONFIG["starter"])
-    
+
     subscription_response = {
         "id": str(subscription.id),
+        "plan_id": plan_id,
+        "plan_name": plan_config["name"],
         "status": subscription.status.value,
-        "cancel_at_period_end": not cancel_immediately,
+        "cancel_at_period_end": subscription.cancel_at_period_end,
         "canceled_at": subscription.cancelled_at.isoformat() if subscription.cancelled_at else None,
         "current_period_end": subscription.current_period_end.isoformat() if subscription.current_period_end else None,
         "cancellation_reason": cancellation_reason
@@ -540,42 +668,39 @@ async def renew_subscription(
     db: AsyncSession = Depends(get_db)
 ):
     """Renew an expired or canceled subscription"""
+    # Only investors hold subscriptions.
+    if current_user.role in (Role.ADMIN, Role.ADVISOR):
+        raise ForbiddenException(
+            "Your account does not require a subscription.",
+            code="SUBSCRIPTION_NOT_APPLICABLE",
+        )
+
     account_result = await db.execute(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
-    
+
     if not account:
         raise NotFoundException("Account", str(current_user.id))
-    
+
     result = await db.execute(
         select(Subscription).where(Subscription.account_id == account.id)
     )
     subscription = result.scalar_one_or_none()
-    
+
     if not subscription:
-        raise NotFoundException("Subscription", str(account.id))
-    
+        raise NotFoundException("Subscription", str(account.id), code="SUBSCRIPTION_NOT_FOUND")
+
     if subscription.status == SubscriptionStatus.ACTIVE:
-        raise BadRequestException("Subscription is already active")
-    
-    # Determine billing cycle from previous period
+        raise BadRequestException("Subscription is already active", code="SUBSCRIPTION_ALREADY_ACTIVE")
+
+    # Renew on the same tier + cycle the user previously had.
     now = datetime.now(timezone.utc)
-    if subscription.current_period_start and subscription.current_period_end:
-        days = (subscription.current_period_end - subscription.current_period_start).days
-        if days > 60:
-            period_end = now + timedelta(days=365)
-            billing_cycle = "annual"
-        else:
-            period_end = now + timedelta(days=30)
-            billing_cycle = "monthly"
-    else:
-        # Default to monthly if no previous period
-        period_end = now + timedelta(days=30)
-        billing_cycle = "monthly"
-    
+    billing_cycle = get_billing_cycle(subscription)
+    period_end = now + (timedelta(days=365) if billing_cycle == "annual" else timedelta(days=30))
+
     # Check if payment is required
-    plan_id = PLAN_ENUM_TO_ID.get(subscription.plan, "starter")
+    plan_id = get_plan_tier(subscription)
     plan_config = PLANS_CONFIG.get(plan_id, PLANS_CONFIG["starter"])
     
     if billing_cycle == "monthly":
@@ -615,10 +740,14 @@ async def renew_subscription(
             )
     
     subscription.status = SubscriptionStatus.ACTIVE
+    subscription.plan_tier = plan_id
+    subscription.billing_cycle = billing_cycle
+    subscription.cancel_at_period_end = False
+    subscription.cancelled_at = None
     subscription.current_period_start = now
     subscription.current_period_end = period_end
     subscription.amount = renewal_amount if renewal_amount else subscription.amount
-    
+
     await db.commit()
     await db.refresh(subscription)
     
@@ -655,49 +784,52 @@ async def upgrade_subscription(
     db: AsyncSession = Depends(get_db)
 ):
     """Upgrade/downgrade subscription plan or billing cycle"""
+    # Only investors hold subscriptions.
+    if current_user.role in (Role.ADMIN, Role.ADVISOR):
+        raise ForbiddenException(
+            "Your account does not require a subscription.",
+            code="SUBSCRIPTION_NOT_APPLICABLE",
+        )
+
     if not upgrade_data.plan_id and not upgrade_data.billing_cycle:
         raise BadRequestException("At least one of plan_id or billing_cycle must be provided")
-    
+
     account_result = await db.execute(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
-    
+
     if not account:
         raise NotFoundException("Account", str(current_user.id))
-    
+
     result = await db.execute(
         select(Subscription).where(Subscription.account_id == account.id)
     )
     subscription = result.scalar_one_or_none()
-    
+
     if not subscription:
-        raise NotFoundException("Subscription", str(account.id))
-    
+        raise NotFoundException("Subscription", str(account.id), code="SUBSCRIPTION_NOT_FOUND")
+
     if subscription.status != SubscriptionStatus.ACTIVE:
-        raise BadRequestException("Subscription must be active to upgrade/downgrade")
-    
+        raise BadRequestException("Subscription must be active to upgrade/downgrade", code="SUBSCRIPTION_NOT_ACTIVE")
+
     # Get current plan info
-    current_plan_id = PLAN_ENUM_TO_ID.get(subscription.plan, "starter")
+    current_plan_id = get_plan_tier(subscription)
     current_plan_config = PLANS_CONFIG.get(current_plan_id, PLANS_CONFIG["starter"])
-    
+
     # Determine new plan_id (accepts both bare and legacy 'plan_'-prefixed IDs)
     new_plan_id = normalize_plan_id(upgrade_data.plan_id) if upgrade_data.plan_id else current_plan_id
     if new_plan_id not in PLANS_CONFIG:
-        raise BadRequestException("Invalid plan_id provided")
-    
+        raise BadRequestException("Invalid plan_id provided", code="PLAN_INVALID")
+
     new_plan_config = PLANS_CONFIG[new_plan_id]
-    
+
     # Determine new billing cycle
-    if subscription.current_period_start and subscription.current_period_end:
-        days = (subscription.current_period_end - subscription.current_period_start).days
-        current_billing_cycle = "annual" if days > 60 else "monthly"
-    else:
-        current_billing_cycle = "monthly"
-    
+    current_billing_cycle = get_billing_cycle(subscription)
+
     new_billing_cycle = upgrade_data.billing_cycle if upgrade_data.billing_cycle else current_billing_cycle
     if new_billing_cycle not in ["monthly", "annual"]:
-        raise BadRequestException("billing_cycle must be 'monthly' or 'annual'")
+        raise BadRequestException("billing_cycle must be 'monthly' or 'annual'", code="BILLING_CYCLE_INVALID")
     
     # Get prices
     if new_billing_cycle == "monthly":
@@ -706,7 +838,7 @@ async def upgrade_subscription(
         new_amount = new_plan_config["annual_price"]
     
     if new_amount is None:
-        raise BadRequestException("This plan requires custom pricing. Please contact support.")
+        raise BadRequestException("This plan requires custom pricing. Please contact support.", code="PLAN_REQUIRES_CUSTOM_PRICING")
     
     # Calculate prorated amount
     now = datetime.now(timezone.utc)
@@ -777,13 +909,18 @@ async def upgrade_subscription(
     
     # Update subscription
     subscription.plan = new_internal_plan
+    subscription.plan_tier = new_plan_id
+    subscription.billing_cycle = new_billing_cycle
     subscription.amount = new_amount
     subscription.current_period_start = now
     subscription.current_period_end = new_period_end
-    
+    # A plan change clears any pending end-of-period cancellation.
+    subscription.cancel_at_period_end = False
+    subscription.cancelled_at = None
+
     await db.commit()
     await db.refresh(subscription)
-    
+
     # Build response
     subscription_response = SubscriptionResponse(
         id=subscription.id,
@@ -795,6 +932,8 @@ async def upgrade_subscription(
         billing_cycle=new_billing_cycle,
         current_period_start=subscription.current_period_start,
         current_period_end=subscription.current_period_end,
+        cancel_at_period_end=subscription.cancel_at_period_end,
+        canceled_at=subscription.cancelled_at,
         created_at=subscription.created_at
     )
     
@@ -845,16 +984,10 @@ async def get_subscription_history(
     
     data = []
     for subscription in subscriptions:
-        plan_id = PLAN_ENUM_TO_ID.get(subscription.plan, "starter")
+        plan_id = get_plan_tier(subscription)
         plan_config = PLANS_CONFIG.get(plan_id, PLANS_CONFIG["starter"])
-        
-        # Determine billing cycle
-        billing_cycle = "monthly"
-        if subscription.current_period_start and subscription.current_period_end:
-            days = (subscription.current_period_end - subscription.current_period_start).days
-            if days > 60:
-                billing_cycle = "annual"
-        
+        billing_cycle = get_billing_cycle(subscription)
+
         data.append({
             "id": str(subscription.id),
             "plan_id": plan_id,
@@ -977,7 +1110,6 @@ async def get_subscription_permissions(
         "document_center": Feature.DOCUMENTS_UNLIMITED in plan_features,
         "tax_advisory": False,  # Not in current feature set
         "priority_support": Feature.SUPPORT_PRIORITY in plan_features,
-        "concierge_support": False,  # Only for concierge plan
     }
     
     # Map limits to spec format

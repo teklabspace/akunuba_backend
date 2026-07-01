@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, DateTime, ForeignKey, Text, Enum as SQLEnum, Integer
+from sqlalchemy import Column, String, DateTime, ForeignKey, Text, Enum as SQLEnum, Integer, Sequence
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -25,6 +25,15 @@ class SupportTicket(Base):
     __tablename__ = "support_tickets"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Short, human-readable, sequential ticket number (displayed as "TCK-1042").
+    # DB-backed sequence so it's monotonic and collision-free under concurrency.
+    ticket_number = Column(
+        Integer,
+        Sequence("support_ticket_number_seq"),
+        server_default=Sequence("support_ticket_number_seq").next_value(),
+        unique=True,
+        index=True,
+    )
     account_id = Column(UUID(as_uuid=True), ForeignKey("accounts.id"), nullable=False)
     subject = Column(String(255), nullable=False)
     description = Column(Text, nullable=False)
@@ -38,6 +47,9 @@ class SupportTicket(Base):
     escalation_count = Column(Integer, default=0)
     last_escalated_at = Column(DateTime(timezone=True))
     resolved_at = Column(DateTime(timezone=True))
+    # CSAT: requester's satisfaction rating (1-5) after resolution, + optional note.
+    satisfaction_rating = Column(Integer)
+    satisfaction_comment = Column(Text)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
