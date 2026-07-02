@@ -95,6 +95,53 @@ class PersonaClient:
             return None
 
     @staticmethod
+    def get_inquiry_with_verifications(inquiry_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch an inquiry expanded with its verifications (the objects that carry the
+        extracted fields, check results, and the ID/selfie photo URLs)."""
+        try:
+            with httpx.Client() as client:
+                response = client.get(
+                    f"{PersonaClient.BASE_URL}/inquiries/{inquiry_id}",
+                    headers=PersonaClient._get_headers(),
+                    params={"include": "verifications"},
+                    timeout=30.0,
+                )
+                response.raise_for_status()
+                return response.json()
+        except Exception as e:
+            logger.error(f"Failed to fetch inquiry+verifications {inquiry_id}: {e}")
+            return None
+
+    # Hosts we trust to receive our Persona API credential. Pre-signed file URLs on
+    # other hosts (S3/CDN) must NOT get the bearer — it would leak our secret key.
+    _PERSONA_AUTH_HOSTS = ("withpersona.com",)
+
+    @staticmethod
+    def download_file(url: str) -> Optional[bytes]:
+        """Download a Persona file (ID/selfie photo). Only sends our API key to Persona
+        API hosts; pre-signed CDN/S3 links are fetched without credentials."""
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            logger.error("Refusing to download non-http(s) Persona file url")
+            return None
+
+        host = parsed.hostname.lower()
+        send_auth = any(host == h or host.endswith("." + h) for h in PersonaClient._PERSONA_AUTH_HOSTS)
+        headers = {"Authorization": f"Bearer {settings.PERSONA_API_KEY}"} if send_auth else {}
+        try:
+            with httpx.Client() as client:
+                response = client.get(url, headers=headers, timeout=60.0, follow_redirects=True)
+                if response.status_code >= 400:
+                    logger.error("Persona file download failed (%s) host=%s", response.status_code, host)
+                    return None
+                return response.content
+        except Exception as e:
+            logger.error(f"Failed to download Persona file: {e}")
+            return None
+
+    @staticmethod
     def submit_inquiry(inquiry_id: str) -> Dict[str, Any]:
         try:
             with httpx.Client() as client:

@@ -20,6 +20,34 @@ from datetime import datetime
 router = APIRouter()
 
 
+def _hosted_url_matches_config(url: Optional[str], template_id: Optional[str], environment_id: Optional[str]) -> bool:
+    """True if a cached verification URL is still safe to reuse under the current config.
+
+    A stored URL can go stale when the Persona template or environment changes (e.g. after
+    switching accounts / fixing env vars). Serving such a URL sends users to a dead
+    "application misconfigured" page. This guards the status endpoint's cache-reuse path:
+    - API-flow URLs (``inquiry-id=...``) are always reusable — they point at a real inquiry.
+    - Hosted-template URLs (``inquiry-template-id=...``) are only reusable when their
+      template-id and environment-id still match the current settings.
+    """
+    if not url:
+        return False
+    from urllib.parse import urlparse, parse_qs
+    try:
+        q = parse_qs(urlparse(url).query)
+    except Exception:
+        return False
+    if q.get("inquiry-id"):
+        return True  # points at a concrete inquiry; never stale
+    tmpl = (q.get("inquiry-template-id") or [None])[0]
+    if template_id and tmpl and tmpl != template_id:
+        return False
+    env = (q.get("environment-id") or [None])[0]
+    if environment_id and env and env != environment_id:
+        return False
+    return True
+
+
 class KYCResponse(BaseModel):
     id: UUID
     status: str
@@ -338,9 +366,12 @@ async def get_kyc_status(
         and kyc.status == KYCStatus.IN_PROGRESS
         and settings.PERSONA_TEMPLATE_ID
     ):
-        if isinstance(kyc.persona_response, dict):
-            verification_url = kyc.persona_response.get("verification_url")
-        if not verification_url:
+        cached = kyc.persona_response.get("verification_url") if isinstance(kyc.persona_response, dict) else None
+        # Only reuse a cached URL if it still matches the current template/environment;
+        # otherwise regenerate so a config change can't strand users on a dead link.
+        if _hosted_url_matches_config(cached, settings.PERSONA_TEMPLATE_ID, settings.PERSONA_ENVIRONMENT_ID):
+            verification_url = cached
+        else:
             verification_url = PersonaClient.get_hosted_flow_url(
                 PersonaClient.kyc_reference_id(str(account.id)),
                 PersonaClient.get_redirect_uri(),

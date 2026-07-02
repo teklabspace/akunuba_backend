@@ -7,7 +7,7 @@ import hashlib
 import json
 import time
 from datetime import datetime
-from fastapi import APIRouter, Request, HTTPException, status, Depends
+from fastapi import APIRouter, Request, HTTPException, status, Depends, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from jose import jwt as jose_jwt
@@ -56,12 +56,48 @@ def verify_persona_signature(payload: bytes, signature_header: str) -> bool:
         return False
 
 
+def _parse_persona_event(data: dict) -> dict:
+    """Extract the inquiry id + status from a Persona webhook body.
+
+    Persona nests the affected resource under ``data.attributes.payload.data``; the
+    TOP-LEVEL ``data.id`` is the EVENT id (``evt_...``), NOT the inquiry id
+    (``inq_...``). Reading the top-level id (the old bug) meant the KYC lookup never
+    matched and the webhook silently no-op'd. Falls back to a flat shape defensively,
+    and derives status from the event name (e.g. ``inquiry.approved`` -> ``approved``)
+    when the resource omits an explicit ``status``.
+    """
+    top = (data or {}).get("data", {}) or {}
+    event_attrs = top.get("attributes", {}) or {}
+    event_type = event_attrs.get("name") or top.get("type")
+
+    inner = ((event_attrs.get("payload") or {}).get("data")) or {}
+    resource = inner if inner.get("id") else top
+    attributes = resource.get("attributes") or {}
+
+    inquiry_id = resource.get("id") or attributes.get("inquiry-id")
+    status_value = (attributes.get("status") or "").lower()
+    if not status_value and event_type and "." in event_type:
+        status_value = event_type.rsplit(".", 1)[-1].lower()
+
+    return {
+        "event_type": event_type,
+        "inquiry_id": inquiry_id,
+        "status": status_value,
+        "attributes": attributes,
+    }
+
+
 @router.post("/persona")
 @limiter.exempt
-async def persona_webhook(request: Request, db: AsyncSession = Depends(get_db)):
+async def persona_webhook(
+    request: Request,
+    background: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
     """
     Receive Persona webhook events: verification approved, rejected, document requested.
-    Updates user KYC status automatically.
+    Updates user KYC status automatically, then captures the user's docs/images and
+    extracted fields for later admin review (as a background task).
     """
     body = await request.body()
     signature = request.headers.get("Persona-Signature", "")
@@ -70,9 +106,11 @@ async def persona_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid signature")
     try:
         data = json.loads(body)
-        event_type = data.get("data", {}).get("attributes", {}).get("name") or data.get("data", {}).get("type")
-        payload = data.get("data", {})
-        inquiry_id = payload.get("id") or (payload.get("attributes") or {}).get("inquiry-id")
+        parsed = _parse_persona_event(data)
+        event_type = parsed["event_type"]
+        inquiry_id = parsed["inquiry_id"]
+        attributes = parsed["attributes"]
+        status_value = parsed["status"]
         if not inquiry_id:
             logger.warning("Persona webhook missing inquiry id")
             return {"received": True}
@@ -84,8 +122,6 @@ async def persona_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         if not kyc:
             logger.info(f"Persona webhook: no local KYC for inquiry {inquiry_id}")
             return {"received": True}
-        attributes = payload.get("attributes", payload)
-        status_value = (attributes.get("status") or "").lower()
         # Map Persona statuses to our KYCStatus
         if status_value in ("approved", "completed"):
             kyc.status = KYCStatus.APPROVED
@@ -94,13 +130,20 @@ async def persona_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         elif status_value in ("declined", "failed", "rejected"):
             kyc.status = KYCStatus.REJECTED
             kyc.rejection_reason = attributes.get("rejection-reason") or attributes.get("reason") or "Verification rejected"
-        elif status_value in ("pending", "in-progress", "needs-review"):
+        elif status_value in ("pending", "in-progress", "needs-review", "marked-for-review"):
             kyc.status = KYCStatus.PENDING_REVIEW
         # document-requested: Persona may send when more documents are needed
         if "document" in (event_type or "") or "document-requested" in str(attributes):
             kyc.documents_submitted = True
         await db.commit()
         logger.info(f"Persona webhook: updated KYC {kyc.id} to {kyc.status}")
+
+        # On a terminal outcome, capture the user's Persona docs/images + fields for
+        # admin review. Runs after we ack Persona so a slow download never blocks the 200.
+        if status_value in ("approved", "completed", "declined", "failed", "rejected"):
+            from app.services.persona_capture import PersonaCaptureService
+            background.add_task(PersonaCaptureService.capture, kyc.account_id, inquiry_id)
+
         return {"received": True}
     except Exception as e:
         record_webhook_failure("persona")

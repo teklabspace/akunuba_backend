@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from typing import List, Optional, Dict, Any
@@ -8,7 +8,7 @@ from app.api.deps import get_current_user
 from app.models.user import User, Role
 from app.models.account import Account, AccountType
 from app.models.payment import Subscription, SubscriptionStatus, SubscriptionPlan
-from app.models.kyc import KYCVerification, KYCStatus
+from app.models.kyc import KYCVerification, KYCStatus, KYCDocument, KYCCaptureStatus
 from app.models.kyb import KYBVerification, KYBStatus
 from app.models.marketplace import MarketplaceListing, ListingStatus, EscrowTransaction, EscrowStatus
 from app.models.support import SupportTicket, TicketStatus
@@ -717,6 +717,10 @@ async def approve_user_kyc(
     except Exception as e:
         logger.warning(f"Failed to send KYC approval notification: {e}")
 
+    kyc.reviewed_by = current_user.id
+    kyc.reviewed_at = datetime.utcnow()
+    await db.commit()
+
     logger.info(f"Admin {current_user.id} manually approved KYC for user {user_id}")
     return {
         "message": "KYC approved",
@@ -726,6 +730,158 @@ async def approve_user_kyc(
             "kyc_id": str(kyc.id),
             "status": kyc.status.value,
         },
+    }
+
+
+class KYCRejectRequest(BaseModel):
+    reason: str
+
+
+async def _load_user_account_kyc(db: AsyncSession, user_id: UUID):
+    """Resolve (user, account, kyc) for the admin KYC endpoints, or raise 404."""
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if not user:
+        raise NotFoundException("User", str(user_id))
+    account = (await db.execute(select(Account).where(Account.user_id == user.id))).scalar_one_or_none()
+    kyc = None
+    if account:
+        kyc = (await db.execute(
+            select(KYCVerification).where(KYCVerification.account_id == account.id)
+        )).scalar_one_or_none()
+    return user, account, kyc
+
+
+@router.get("/users/{user_id}/kyc", response_model=Dict[str, Any])
+async def get_user_kyc_detail(
+    user_id: UUID,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Full KYC review payload for a user — admin only.
+
+    Returns the (Persona-driven) status, extracted identity fields, per-check
+    results, capture state, and each stored document with a short-lived signed URL
+    the admin can open to view the image (the bucket itself stays private).
+    """
+    from app.integrations.supabase_client import SupabaseClient
+
+    user, account, kyc = await _load_user_account_kyc(db, user_id)
+    if not kyc:
+        return {
+            "data": {
+                "user_id": str(user.id),
+                "account_id": str(account.id) if account else None,
+                "status": KYCStatus.NOT_STARTED.value,
+                "capture_status": KYCCaptureStatus.NOT_CAPTURED.value,
+                "extracted_fields": None,
+                "checks": None,
+                "documents": [],
+            }
+        }
+
+    docs = (await db.execute(
+        select(KYCDocument).where(KYCDocument.kyc_id == kyc.id).order_by(KYCDocument.document_type)
+    )).scalars().all()
+
+    documents = []
+    for d in docs:
+        signed = SupabaseClient.create_signed_url(d.bucket, d.file_path, settings.KYC_SIGNED_URL_EXPIRY)
+        documents.append({
+            "id": str(d.id),
+            "document_type": d.document_type,
+            "mime_type": d.mime_type,
+            "file_size": d.file_size,
+            "view_url": signed,  # short-lived; refetch this endpoint to renew
+            "created_at": d.created_at.isoformat() if d.created_at else None,
+        })
+
+    return {
+        "data": {
+            "user_id": str(user.id),
+            "account_id": str(account.id),
+            "kyc_id": str(kyc.id),
+            "persona_inquiry_id": kyc.persona_inquiry_id,
+            "status": kyc.status.value,
+            "capture_status": kyc.capture_status.value if kyc.capture_status else KYCCaptureStatus.NOT_CAPTURED.value,
+            "capture_error": kyc.capture_error,
+            "captured_at": kyc.captured_at.isoformat() if kyc.captured_at else None,
+            "verified_at": kyc.verified_at.isoformat() if kyc.verified_at else None,
+            "rejection_reason": kyc.rejection_reason,
+            "reviewed_by": str(kyc.reviewed_by) if kyc.reviewed_by else None,
+            "reviewed_at": kyc.reviewed_at.isoformat() if kyc.reviewed_at else None,
+            "extracted_fields": kyc.extracted_fields,
+            "checks": kyc.checks,
+            "documents": documents,
+            "signed_url_expires_in": settings.KYC_SIGNED_URL_EXPIRY,
+        }
+    }
+
+
+@router.post("/users/{user_id}/kyc/reject", response_model=Dict[str, Any])
+async def reject_user_kyc(
+    user_id: UUID,
+    body: KYCRejectRequest,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Manually reject/override a user's KYC after reviewing the captured docs — admin only."""
+    reason = (body.reason or "").strip()
+    if not reason:
+        raise BadRequestException("A rejection reason is required")
+
+    user, account, kyc = await _load_user_account_kyc(db, user_id)
+    if user.role == Role.ADMIN:
+        raise BadRequestException("Admins do not require KYC verification.")
+    if not account or not kyc:
+        raise NotFoundException("KYC record", str(user_id))
+
+    kyc.status = KYCStatus.REJECTED
+    kyc.rejection_reason = reason
+    kyc.reviewed_by = current_user.id
+    kyc.reviewed_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(kyc)
+
+    try:
+        from app.services.notification_service import NotificationService, NotificationType
+        await NotificationService.create_notification(
+            db=db,
+            account_id=account.id,
+            notification_type=NotificationType.GENERAL,
+            title="KYC Verification Rejected",
+            message=f"Your identity verification was not approved. Reason: {reason}",
+        )
+    except Exception as e:
+        logger.warning(f"Failed to send KYC rejection notification: {e}")
+
+    logger.info(f"Admin {current_user.id} rejected KYC for user {user_id}")
+    return {
+        "message": "KYC rejected",
+        "data": {"user_id": str(user.id), "kyc_id": str(kyc.id), "status": kyc.status.value},
+    }
+
+
+@router.post("/users/{user_id}/kyc/recapture", response_model=Dict[str, Any])
+async def recapture_user_kyc(
+    user_id: UUID,
+    background: BackgroundTasks,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Re-run the Persona document capture for a user (e.g. after a failed capture) — admin only."""
+    user, account, kyc = await _load_user_account_kyc(db, user_id)
+    if not account or not kyc:
+        raise NotFoundException("KYC record", str(user_id))
+    if not kyc.persona_inquiry_id:
+        raise BadRequestException("This user has no Persona inquiry to capture from.")
+
+    from app.services.persona_capture import PersonaCaptureService
+    background.add_task(PersonaCaptureService.capture, account.id, kyc.persona_inquiry_id)
+
+    logger.info(f"Admin {current_user.id} triggered KYC re-capture for user {user_id}")
+    return {
+        "message": "Re-capture started",
+        "data": {"user_id": str(user.id), "kyc_id": str(kyc.id), "capture_status": KYCCaptureStatus.PENDING.value},
     }
 
 

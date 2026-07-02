@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     PERSONA_TEMPLATE_ID: str = ""  # Inquiry Template ID (starts with 'itmpl_') - defines verification flow
     PERSONA_ENVIRONMENT_ID: str = ""  # Sandbox/production env ID (starts with 'env_') for hosted flow
     PERSONA_FILE_ACCESS_TOKEN_EXPIRY: int = 21600  # seconds (6 hours default)
+    KYC_DOCUMENTS_BUCKET: str = "kyc-documents"  # private Supabase bucket for captured KYC files
+    KYC_SIGNED_URL_EXPIRY: int = 600  # seconds an admin's KYC image view link stays valid
     PERSONA_REDIRECT_URI: str = ""  # Must exactly match Persona template allowed redirect URIs
     PERSONA_USE_REDIRECT_URI: bool = False  # Set true only after URI is allowlisted in Persona
 

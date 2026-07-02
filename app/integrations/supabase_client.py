@@ -246,6 +246,46 @@ class SupabaseClient:
             return cls._download_via_http(bucket, file_path)
 
     @classmethod
+    def ensure_bucket(cls, bucket: str, public: bool = False) -> None:
+        """Create the bucket if it doesn't exist (idempotent). Used for the private
+        KYC bucket so uploads never fail on a missing bucket in a fresh project."""
+        cls._ensure_configured()
+        url = f"{cls._storage_base_url()}/bucket"
+        headers = cls._auth_headers(content_type="application/json")
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(url, json={"id": bucket, "name": bucket, "public": public}, headers=headers)
+            # 200 = created; 400/409 "already exists" = fine.
+            if resp.status_code >= 400 and "exist" not in resp.text.lower():
+                logger.warning("ensure_bucket(%s) unexpected response %s: %s",
+                               bucket, resp.status_code, resp.text[:300])
+
+    @classmethod
+    def create_signed_url(cls, bucket: str, file_path: str, expires_in: int = 600) -> Optional[str]:
+        """Return a time-limited signed URL to view a private object, or None on failure.
+
+        Used to let admins view stored KYC images without making the bucket public.
+        """
+        cls._ensure_configured()
+        url = f"{cls._storage_base_url()}/object/sign/{bucket}/{file_path}"
+        headers = cls._auth_headers(content_type="application/json")
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(url, json={"expiresIn": expires_in}, headers=headers)
+                if resp.status_code >= 400:
+                    logger.error("create_signed_url failed (%s): %s", resp.status_code, resp.text[:300])
+                    return None
+                signed = resp.json().get("signedURL") or resp.json().get("signedUrl")
+                if not signed:
+                    return None
+                # Supabase returns a path like "/object/sign/...": make it absolute.
+                if signed.startswith("/"):
+                    return f"{settings.SUPABASE_URL.rstrip('/')}/storage/v1{signed}"
+                return signed
+        except Exception as e:
+            logger.error("create_signed_url error: %s", e)
+            return None
+
+    @classmethod
     def list_files(cls, bucket: str, folder: str = "") -> list:
         client = cls.get_client()
         if client is None:
