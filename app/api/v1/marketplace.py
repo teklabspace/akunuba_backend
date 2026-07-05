@@ -159,6 +159,28 @@ async def create_listing(
     return listing
 
 
+PUBLIC_LISTING_STATUSES = [ListingStatus.APPROVED, ListingStatus.ACTIVE]
+
+
+def _resolve_listing_status_filter(status_filter: Optional[ListingStatus], is_staff: bool) -> List[ListingStatus]:
+    """Decide which listing statuses a caller may see on the public browse endpoint.
+
+    Guests and non-staff users may only ever see publicly visible listings
+    (APPROVED/ACTIVE). Only staff (APPROVE_LISTINGS) may filter to non-public
+    statuses; otherwise a visitor could enumerate unapproved listings via
+    ``?status_filter=pending_approval``. Returns the list of statuses to query,
+    or raises 403 when a non-staff caller requests a non-public status.
+    """
+    if status_filter is None:
+        return PUBLIC_LISTING_STATUSES
+    if is_staff or status_filter in PUBLIC_LISTING_STATUSES:
+        return [status_filter]
+    raise ForbiddenException(
+        "You can only filter marketplace listings by publicly visible statuses.",
+        code="LISTING_STATUS_FILTER_FORBIDDEN",
+    )
+
+
 @router.get("/listings", response_model=Dict[str, Any])
 async def list_listings(
     status_filter: Optional[ListingStatus] = Query(None),
@@ -167,19 +189,17 @@ async def list_listings(
     current_user: Optional[User] = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """List marketplace listings with optional auth and pagination."""
-    # Base query: only approved/active listings by default
-    query = select(MarketplaceListing)
-    count_query = select(func.count(MarketplaceListing.id))
-    
-    if status_filter:
-        query = query.where(MarketplaceListing.status == status_filter)
-        count_query = count_query.where(MarketplaceListing.status == status_filter)
-    else:
-        visible_statuses = [ListingStatus.APPROVED, ListingStatus.ACTIVE]
-        query = query.where(MarketplaceListing.status.in_(visible_statuses))
-        count_query = count_query.where(MarketplaceListing.status.in_(visible_statuses))
-    
+    """List marketplace listings with optional auth and pagination.
+
+    Public: guests and non-staff only ever see APPROVED/ACTIVE listings, even when
+    passing status_filter. Staff (APPROVE_LISTINGS) may filter to any status.
+    """
+    is_staff = bool(current_user) and has_permission(current_user.role, Permission.APPROVE_LISTINGS)
+    statuses = _resolve_listing_status_filter(status_filter, is_staff)
+
+    query = select(MarketplaceListing).where(MarketplaceListing.status.in_(statuses))
+    count_query = select(func.count(MarketplaceListing.id)).where(MarketplaceListing.status.in_(statuses))
+
     # Total count for pagination
     total_result = await db.execute(count_query)
     total = total_result.scalar() or 0
