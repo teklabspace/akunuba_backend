@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Body
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func, case
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import aliased, selectinload
 from typing import List, Optional, Dict, Any
 from decimal import Decimal
 from datetime import datetime, timedelta
@@ -12,7 +12,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from app.core.security import decode_access_token
 from app.models.user import User
 from app.models.account import Account, AccountType
-from app.models.asset import Asset
+from app.models.asset import Asset, AssetCategory, CategoryGroup
 from app.models.marketplace import (
     MarketplaceListing, Offer, EscrowTransaction, WatchlistItem,
     ListingStatus, OfferStatus, EscrowStatus
@@ -57,6 +57,11 @@ async def get_optional_user(
 
 router = APIRouter()
 
+# Browse endpoints live on a separate router mounted WITHOUT the KYC gate:
+# anyone (guest, unverified investor) may view public listings — auth/KYC is
+# only required to transact (create listings, offers, escrow, watchlist, ...).
+public_router = APIRouter()
+
 
 class ListingCreate(BaseModel):
     asset_id: UUID
@@ -68,16 +73,56 @@ class ListingCreate(BaseModel):
 
 class ListingResponse(BaseModel):
     id: UUID
+    asset_id: Optional[UUID] = None
     title: str
     asking_price: Decimal
     currency: str
     status: str
+    # Canonical asset category name (same values as GET /assets/categories).
+    category: Optional[str] = None
+    # Main category group of the asset's category (Assets, Portfolio, ...).
+    category_group: Optional[str] = None
     listing_fee: Optional[Decimal] = None
     rejection_reason: Optional[str] = None
+    # Primary asset photo: thumbnail_url for cards, image_url for detail pages.
+    thumbnail_url: Optional[str] = None
+    image_url: Optional[str] = None
     created_at: datetime
 
     class Config:
         from_attributes = True
+
+
+def _primary_photo(photos):
+    """The listing's display photo. Asset.photos is ordered is_primary-first,
+    so the first row is the primary photo when one exists."""
+    return photos[0] if photos else None
+
+
+def _listing_with_category(listing: "MarketplaceListing") -> ListingResponse:
+    """Serialize a listing including its asset's canonical category name,
+    category group, and primary photo URLs.
+
+    Callers must eager-load listing.asset, asset.category and asset.photos."""
+    resp = ListingResponse.model_validate(listing)
+    asset = listing.asset
+    if asset is None:
+        return resp
+    if asset.category is not None:
+        resp.category = asset.category.name
+        group = asset.category.category_group
+        resp.category_group = group.value if hasattr(group, "value") else group
+    photo = _primary_photo(asset.photos)
+    if photo is not None:
+        resp.image_url = photo.url
+        resp.thumbnail_url = photo.thumbnail_url or photo.url
+    return resp
+
+
+_LISTING_ASSET_LOAD = selectinload(MarketplaceListing.asset).options(
+    selectinload(Asset.category),
+    selectinload(Asset.photos),
+)
 
 
 class OfferCreate(BaseModel):
@@ -181,11 +226,12 @@ def _resolve_listing_status_filter(status_filter: Optional[ListingStatus], is_st
     )
 
 
-@router.get("/listings", response_model=Dict[str, Any])
+@public_router.get("/listings", response_model=Dict[str, Any])
 async def list_listings(
     status_filter: Optional[ListingStatus] = Query(None),
+    category: Optional[str] = Query(None, description="Canonical asset category name (see GET /assets/categories)"),
     page: int = Query(1, ge=1, description="Page number"),
-    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    limit: int = Query(20, ge=1, le=1000, description="Items per page (frontend uses 20/50/100 presets; 1000 is an anti-scrape ceiling)"),
     current_user: Optional[User] = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -200,19 +246,32 @@ async def list_listings(
     query = select(MarketplaceListing).where(MarketplaceListing.status.in_(statuses))
     count_query = select(func.count(MarketplaceListing.id)).where(MarketplaceListing.status.in_(statuses))
 
+    if category:
+        query = query.join(Asset, Asset.id == MarketplaceListing.asset_id).join(
+            AssetCategory, AssetCategory.id == Asset.category_id
+        ).where(func.lower(AssetCategory.name) == category.strip().lower())
+        count_query = count_query.join(Asset, Asset.id == MarketplaceListing.asset_id).join(
+            AssetCategory, AssetCategory.id == Asset.category_id
+        ).where(func.lower(AssetCategory.name) == category.strip().lower())
+
     # Total count for pagination
     total_result = await db.execute(count_query)
     total = total_result.scalar() or 0
-    
+
     # Apply pagination (newest first)
     offset = (page - 1) * limit
-    query = query.order_by(MarketplaceListing.created_at.desc()).offset(offset).limit(limit)
-    
+    query = (
+        query.options(_LISTING_ASSET_LOAD)
+        .order_by(MarketplaceListing.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+
     result = await db.execute(query)
     listings = result.scalars().all()
-    
+
     return {
-        "data": [ListingResponse.model_validate(l) for l in listings],
+        "data": [_listing_with_category(l) for l in listings],
         "pagination": {
             "page": page,
             "limit": limit,
@@ -220,6 +279,64 @@ async def list_listings(
             "total_pages": (total + limit - 1) // limit if total > 0 else 0,
         },
     }
+
+
+@public_router.get("/categories", response_model=Dict[str, Any])
+async def list_marketplace_categories(
+    db: AsyncSession = Depends(get_db)
+):
+    """Categories that currently have publicly visible listings (public, no auth).
+
+    Returns only non-empty categories with their main category_group and listing
+    count, so browse tabs/chips can be built without fetching listings.
+    ``uncategorized`` counts public listings whose asset has no category (the
+    frontend buckets these under "Others").
+    """
+    rows = (await db.execute(
+        select(
+            AssetCategory.name,
+            AssetCategory.category_group,
+            func.count(MarketplaceListing.id).label("count"),
+        )
+        .join(Asset, Asset.category_id == AssetCategory.id)
+        .join(MarketplaceListing, MarketplaceListing.asset_id == Asset.id)
+        .where(MarketplaceListing.status.in_(PUBLIC_LISTING_STATUSES))
+        .group_by(AssetCategory.name, AssetCategory.category_group)
+        .order_by(AssetCategory.category_group, AssetCategory.name)
+    )).all()
+
+    uncategorized = (await db.execute(
+        select(func.count(MarketplaceListing.id))
+        .join(Asset, Asset.id == MarketplaceListing.asset_id, isouter=True)
+        .where(
+            MarketplaceListing.status.in_(PUBLIC_LISTING_STATUSES),
+            Asset.category_id.is_(None),
+        )
+    )).scalar() or 0
+
+    return {
+        "data": [
+            {
+                "category": name,
+                "category_group": group.value if hasattr(group, "value") else group,
+                "count": count,
+            }
+            for name, group, count in rows
+        ],
+        "uncategorized": uncategorized,
+        "total": len(rows),
+    }
+
+
+def _require_categorized_asset(asset: Optional[Asset]) -> None:
+    """A listing may only go public when its asset has a category — the browse
+    UI is category-driven, so an uncategorized listing would be unreachable
+    through every category tab/chip/filter."""
+    if asset is None or asset.category_id is None:
+        raise BadRequestException(
+            "The listing's asset must have a category before it can be published to the marketplace.",
+            code="LISTING_CATEGORY_REQUIRED",
+        )
 
 
 async def _assert_can_moderate_listing(db: AsyncSession, user: User, listing: MarketplaceListing) -> None:
@@ -277,6 +394,11 @@ async def approve_listing(
         raise NotFoundException("Listing", str(listing_id))
 
     await _assert_can_moderate_listing(db, current_user, listing)
+
+    asset = (await db.execute(
+        select(Asset).where(Asset.id == listing.asset_id)
+    )).scalar_one_or_none()
+    _require_categorized_asset(asset)
 
     listing.status = ListingStatus.APPROVED
     listing.approved_by = current_user.id
@@ -415,41 +537,63 @@ async def create_offer(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Create an offer on a listing"""
+    """Create an offer on a listing (the marketplace "Buy" action).
+
+    Buyable statuses: APPROVED and ACTIVE. Staff (admin/advisor) cannot buy.
+    Machine-readable error codes: STAFF_CANNOT_BUY, SUBSCRIPTION_REQUIRED,
+    OFFER_LIMIT_REACHED, OWN_LISTING (plus KYC_REQUIRED from the router gate
+    and 401 AUTH_REQUIRED when unauthenticated).
+    """
     from app.api.deps import get_account, get_user_subscription_plan
     from app.core.features import Feature, has_feature, get_limit, check_usage_limit
     from sqlalchemy import func
-    
+
+    # Staff moderate the marketplace; they don't transact in it.
+    if current_user.role.value in ("admin", "advisor"):
+        raise ForbiddenException(
+            "Admins and advisors cannot buy or make offers on listings.",
+            code="STAFF_CANNOT_BUY",
+        )
+
     account = await get_account(current_user=current_user, db=db)
     plan = await get_user_subscription_plan(account=account, db=db)
-    
+
     # Check subscription feature (FREE tier can make offers but limited)
     if not has_feature(plan, Feature.MARKETPLACE_OFFER):
-        raise ForbiddenException("Making offers requires a subscription")
-    
-    # Check usage limit for offers — admins are exempt
-    if current_user.role.value != "admin":
-        pending_offers_count = await db.execute(
-            select(func.count(Offer.id)).where(
-                Offer.account_id == account.id,
-                Offer.status == OfferStatus.PENDING
-            )
+        raise ForbiddenException(
+            "Making offers requires a subscription.",
+            code="SUBSCRIPTION_REQUIRED",
         )
-        current_count = pending_offers_count.scalar() or 0
-        if not check_usage_limit(plan, "offers", current_count):
-            limit = get_limit(plan, "offers")
-            raise ForbiddenException(f"Offer limit reached. Maximum {limit} active offers allowed for your plan.")
-    
+
+    # Check usage limit for offers
+    pending_offers_count = await db.execute(
+        select(func.count(Offer.id)).where(
+            Offer.account_id == account.id,
+            Offer.status == OfferStatus.PENDING
+        )
+    )
+    current_count = pending_offers_count.scalar() or 0
+    if not check_usage_limit(plan, "offers", current_count):
+        limit = get_limit(plan, "offers")
+        raise ForbiddenException(
+            f"Offer limit reached. Maximum {limit} active offers allowed for your plan.",
+            code="OFFER_LIMIT_REACHED",
+        )
+
     listing_result = await db.execute(
         select(MarketplaceListing).where(MarketplaceListing.id == listing_id)
     )
     listing = listing_result.scalar_one_or_none()
-    
-    if not listing or listing.status != ListingStatus.ACTIVE:
+
+    # Both APPROVED (published) and ACTIVE listings are buyable.
+    if not listing or listing.status not in (ListingStatus.APPROVED, ListingStatus.ACTIVE):
         raise NotFoundException("Listing", str(listing_id))
-    
+
     if listing.account_id == account.id:
-        raise BadRequestException("Cannot make offer on your own listing")
+        raise ForbiddenException(
+            "You cannot make an offer on your own listing.",
+            code="OWN_LISTING",
+        )
     
     offer = Offer(
         listing_id=listing_id,
@@ -617,22 +761,36 @@ class EscrowResponse(BaseModel):
         from_attributes = True
 
 
-@router.get("/listings/{listing_id}", response_model=ListingResponse)
+@public_router.get("/listings/{listing_id}", response_model=ListingResponse)
 async def get_listing(
     listing_id: UUID,
     current_user: Optional[User] = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get listing details"""
+    """Get listing details. Public for APPROVED/ACTIVE listings; non-public
+    listings are visible only to staff and the owning account (404 otherwise)."""
     result = await db.execute(
-        select(MarketplaceListing).where(MarketplaceListing.id == listing_id)
+        select(MarketplaceListing)
+        .options(_LISTING_ASSET_LOAD)
+        .where(MarketplaceListing.id == listing_id)
     )
     listing = result.scalar_one_or_none()
-    
+
     if not listing:
         raise NotFoundException("Listing", str(listing_id))
-    
-    return listing
+
+    if listing.status not in (ListingStatus.APPROVED, ListingStatus.ACTIVE):
+        is_staff = bool(current_user) and has_permission(current_user.role, Permission.APPROVE_LISTINGS)
+        is_owner = False
+        if current_user and not is_staff:
+            account = (await db.execute(
+                select(Account).where(Account.user_id == current_user.id)
+            )).scalar_one_or_none()
+            is_owner = bool(account) and account.id == listing.account_id
+        if not (is_staff or is_owner):
+            raise NotFoundException("Listing", str(listing_id))
+
+    return _listing_with_category(listing)
 
 
 @router.put("/listings/{listing_id}", response_model=ListingResponse)
@@ -1211,15 +1369,57 @@ async def refund_escrow(
     return {"message": "Escrow refunded successfully"}
 
 
-@router.get("/search", response_model=Dict[str, Any])
+def _resolve_category_group(value: str) -> CategoryGroup:
+    """Match a category_group query param to the CategoryGroup enum,
+    case-insensitively. Raises 400 with the valid values on no match."""
+    for group in CategoryGroup:
+        if group.value.lower() == value.strip().lower():
+            return group
+    raise BadRequestException(
+        f"Invalid category_group '{value}'. Must be one of: "
+        f"{', '.join(g.value for g in CategoryGroup)}",
+        code="INVALID_CATEGORY_GROUP",
+    )
+
+
+def _listing_sort_clause(sort_by: Optional[str], sort_order: Optional[str]):
+    """Sort clause for /search. Without an explicit sort_order the historical
+    defaults hold (price ascending, created_at newest-first) so existing
+    consumers keep their ordering."""
+    column = (
+        MarketplaceListing.asking_price
+        if sort_by == "price"
+        else MarketplaceListing.created_at
+    )
+    if sort_order is None:
+        return column.asc() if sort_by == "price" else column.desc()
+    order = sort_order.strip().lower()
+    if order == "asc":
+        return column.asc()
+    if order == "desc":
+        return column.desc()
+    raise BadRequestException(
+        f"Invalid sort_order '{sort_order}'. Must be 'asc' or 'desc'.",
+        code="INVALID_SORT_ORDER",
+    )
+
+
+@public_router.get("/search", response_model=Dict[str, Any])
 async def search_listings(
     q: Optional[str] = Query(None, description="Search query"),
-    asset_type: Optional[str] = Query(None),
+    asset_type: Optional[str] = Query(
+        None,
+        deprecated=True,
+        description="DEPRECATED (frontend no longer sends this): legacy asset type filter. Use category/category_group instead. Slated for removal after a usage-log quiet period.",
+    ),
+    category: Optional[str] = Query(None, description="Canonical asset category name (see GET /assets/categories)"),
+    category_group: Optional[str] = Query(None, description="Main category group (Assets, Portfolio, Liabilities, ...)"),
     min_price: Optional[Decimal] = Query(None),
     max_price: Optional[Decimal] = Query(None),
     sort_by: Optional[str] = Query("created_at", description="Sort by: price, created_at"),
+    sort_order: Optional[str] = Query(None, description="asc or desc. Defaults: price asc, created_at desc"),
     page: int = Query(1, ge=1, description="Page number"),
-    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    limit: int = Query(20, ge=1, le=1000, description="Items per page (frontend uses 20/50/100 presets; 1000 is an anti-scrape ceiling)"),
     current_user: Optional[User] = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -1246,11 +1446,28 @@ async def search_listings(
         query = query.where(text_filter)
         count_query = count_query.where(text_filter)
 
-    # Filter by asset type (join Asset)
-    if asset_type:
-        from app.models.asset import Asset
-        query = query.join(Asset).where(Asset.asset_type == asset_type)
-        count_query = count_query.join(Asset).where(Asset.asset_type == asset_type)
+    # Filter by asset type, canonical category and/or main category group
+    # (join Asset once, AssetCategory once)
+    if asset_type or category or category_group:
+        query = query.join(Asset, Asset.id == MarketplaceListing.asset_id)
+        count_query = count_query.join(Asset, Asset.id == MarketplaceListing.asset_id)
+        if asset_type:
+            # Deprecated 2026-07-05 (frontend removed its Asset Type checkboxes).
+            # Log callers so we know when it's safe to remove the param for good.
+            logger.warning(f"Deprecated asset_type filter used on /marketplace/search: {asset_type!r}")
+            query = query.where(Asset.asset_type == asset_type)
+            count_query = count_query.where(Asset.asset_type == asset_type)
+        if category or category_group:
+            query = query.join(AssetCategory, AssetCategory.id == Asset.category_id)
+            count_query = count_query.join(AssetCategory, AssetCategory.id == Asset.category_id)
+            if category:
+                category_filter = func.lower(AssetCategory.name) == category.strip().lower()
+                query = query.where(category_filter)
+                count_query = count_query.where(category_filter)
+            if category_group:
+                group_filter = AssetCategory.category_group == _resolve_category_group(category_group)
+                query = query.where(group_filter)
+                count_query = count_query.where(group_filter)
 
     # Price range filters
     if min_price is not None:
@@ -1264,22 +1481,19 @@ async def search_listings(
         count_query = count_query.where(price_max_filter)
 
     # Sorting
-    if sort_by == "price":
-        query = query.order_by(MarketplaceListing.asking_price.asc())
-    else:
-        query = query.order_by(MarketplaceListing.created_at.desc())
+    query = query.order_by(_listing_sort_clause(sort_by, sort_order))
 
     # Pagination
     total_result = await db.execute(count_query)
     total = total_result.scalar() or 0
     offset = (page - 1) * limit
-    query = query.offset(offset).limit(limit)
+    query = query.options(_LISTING_ASSET_LOAD).offset(offset).limit(limit)
 
     result = await db.execute(query)
     listings = result.scalars().all()
 
     return {
-        "data": [ListingResponse.model_validate(l) for l in listings],
+        "data": [_listing_with_category(l) for l in listings],
         "pagination": {
             "page": page,
             "limit": limit,
@@ -1308,7 +1522,7 @@ class MarketHighlightsResponse(BaseModel):
     time_range: str
 
 
-@router.get("/market-highlights", response_model=MarketHighlightsResponse)
+@public_router.get("/market-highlights", response_model=MarketHighlightsResponse)
 async def get_market_highlights(
     time_range: Optional[str] = Query("1d", description="Time range: 1d, 7d, 30d, 90d, 1y, all"),
     categories: Optional[str] = Query(None, description="Comma-separated categories"),
@@ -1436,7 +1650,7 @@ class MarketTrendsResponse(BaseModel):
     summary: dict
 
 
-@router.get("/market-trends", response_model=MarketTrendsResponse)
+@public_router.get("/market-trends", response_model=MarketTrendsResponse)
 async def get_market_trends(
     time_range: Optional[str] = Query("30d", description="Time range: 7d, 30d, 90d, 1y, all"),
     category: Optional[str] = Query(None),
@@ -1534,7 +1748,7 @@ class MarketSummaryResponse(BaseModel):
     updated_at: datetime
 
 
-@router.get("/market-summary", response_model=MarketSummaryResponse)
+@public_router.get("/market-summary", response_model=MarketSummaryResponse)
 async def get_market_summary(
     time_range: Optional[str] = Query("1d", description="Time range: 1d, 7d, 30d, 90d, 1y"),
     current_user: Optional[User] = Depends(get_optional_user),

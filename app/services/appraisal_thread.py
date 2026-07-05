@@ -26,6 +26,19 @@ STAFF_ROLES = {"admin", "advisor"}
 DOCUMENTS_BUCKET = "documents"
 
 
+class DocumentRejected(Exception):
+    """A single uploaded file could not be saved (validation or storage).
+
+    Raised per-file so upload endpoints can report exactly which files were
+    rejected and why, instead of silently returning a 200 with an empty list.
+    """
+
+    def __init__(self, file_name: str, reason: str):
+        self.file_name = file_name
+        self.reason = reason
+        super().__init__(f"{file_name}: {reason}")
+
+
 def display_author_name(user: Optional[User], role: str, *, for_investor: bool) -> str:
     """Render an author's display name.
 
@@ -44,8 +57,8 @@ def display_author_name(user: Optional[User], role: str, *, for_investor: bool) 
 
 async def author_map(db: AsyncSession, rows) -> Dict[UUID, User]:
     """Fetch the author Users for a set of comments/documents in one query."""
-    ids = {r.author_user_id for r in rows} if rows else set()
-    # documents use uploaded_by_user_id
+    # comments use author_user_id, documents use uploaded_by_user_id
+    ids = {getattr(r, "author_user_id", None) for r in rows}
     ids |= {getattr(r, "uploaded_by_user_id", None) for r in rows}
     ids.discard(None)
     if not ids:
@@ -101,6 +114,7 @@ def serialize_document(doc: AppraisalDocument, author: Optional[User], *, for_in
         "uploaded_by_role": doc.uploaded_by_role,
         "uploaded_by_name": display_author_name(author, doc.uploaded_by_role, for_investor=for_investor),
         "fulfills_comment_id": str(doc.fulfills_comment_id) if doc.fulfills_comment_id else None,
+        "document_type": doc.document_type,
         "created_at": doc.created_at.isoformat() if doc.created_at else None,
     }
     if not for_investor:
@@ -118,11 +132,14 @@ async def create_appraisal_document(
     is_client_visible: bool,
     fulfills_comment_id: Optional[UUID] = None,
     asset_id: Optional[UUID] = None,
-) -> Optional[AppraisalDocument]:
+    document_type: Optional[str] = None,
+) -> AppraisalDocument:
     """Validate, upload to Supabase, and persist one appraisal document.
 
-    Returns the created (unflushed) AppraisalDocument, or None if the file was
-    rejected (bad extension / too large / upload failure). Caller commits.
+    Returns the created (unflushed) AppraisalDocument. Caller commits.
+    Raises DocumentRejected if the file cannot be saved (bad extension /
+    too large / storage failure) so endpoints can surface the reason
+    instead of silently succeeding with an empty result.
 
     When asset_id is provided and the document is client-visible, an
     AssetDocument is also created so the file appears in the asset's document
@@ -133,12 +150,18 @@ async def create_appraisal_document(
     filename = file.filename or "file"
     ext = filename.split(".")[-1].lower() if "." in filename else ""
     if ext not in settings.ALLOWED_FILE_TYPES:
-        return None
+        raise DocumentRejected(
+            filename,
+            f"unsupported file type '.{ext}' — allowed: {', '.join(settings.ALLOWED_FILE_TYPES)}",
+        )
 
     file_data = await file.read()
     file_size = len(file_data)
     if file_size > settings.MAX_UPLOAD_SIZE:
-        return None
+        raise DocumentRejected(
+            filename,
+            f"file too large ({file_size} bytes, max {settings.MAX_UPLOAD_SIZE})",
+        )
 
     storage_path = f"appraisals/{appraisal_id}/{user_id}_{filename}"
     try:
@@ -151,7 +174,7 @@ async def create_appraisal_document(
     except Exception as e:  # noqa: BLE001
         from app.utils.logger import logger
         logger.error("Failed to upload appraisal document: %s", e)
-        return None
+        raise DocumentRejected(filename, "storage upload failed") from e
 
     doc = AppraisalDocument(
         appraisal_id=appraisal_id,
@@ -163,6 +186,7 @@ async def create_appraisal_document(
         storage_path=storage_path,
         is_client_visible=is_client_visible,
         fulfills_comment_id=fulfills_comment_id,
+        document_type=document_type,
     )
     db.add(doc)
 

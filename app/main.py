@@ -294,9 +294,13 @@ app.include_router(subscriptions.router, prefix=f"{settings.API_V1_PREFIX}/subsc
 app.include_router(notifications.router, prefix=f"{settings.API_V1_PREFIX}/notifications", tags=["Notifications"])
 
 # --- KYC-gated (dashboard / data) ---
+# Asset category reference data is public (used by the public marketplace filters)
+app.include_router(assets.public_router, prefix=f"{settings.API_V1_PREFIX}/assets", tags=["Assets"])
 app.include_router(assets.router, prefix=f"{settings.API_V1_PREFIX}/assets", tags=["Assets"], dependencies=_KYC_GATED)
 app.include_router(portfolio.router, prefix=f"{settings.API_V1_PREFIX}/portfolio", tags=["Portfolio"], dependencies=_KYC_GATED)
 app.include_router(trading.router, prefix=f"{settings.API_V1_PREFIX}/trading", tags=["Trading"], dependencies=_KYC_GATED)
+# Marketplace browse is public (guests view listings; auth/KYC only to transact)
+app.include_router(marketplace.public_router, prefix=f"{settings.API_V1_PREFIX}/marketplace", tags=["Marketplace"])
 app.include_router(marketplace.router, prefix=f"{settings.API_V1_PREFIX}/marketplace", tags=["Marketplace"], dependencies=_KYC_GATED)
 app.include_router(payments.router, prefix=f"{settings.API_V1_PREFIX}/payments", tags=["Payments"], dependencies=_KYC_GATED)
 app.include_router(banking.router, prefix=f"{settings.API_V1_PREFIX}/banking", tags=["Banking"], dependencies=_KYC_GATED)

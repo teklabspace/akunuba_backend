@@ -14,7 +14,10 @@ from app.core.exceptions import UnauthorizedException, ForbiddenException, NotFo
 from app.core.features import Feature, get_permissions, get_plan_limits, has_feature
 from sqlalchemy import select
 
-security = HTTPBearer()
+# auto_error=False so a missing token raises our 401 (AUTH_REQUIRED) below
+# instead of FastAPI's default 403 — "not logged in" must be distinguishable
+# from "logged in but not allowed" for the frontend's login redirect.
+security = HTTPBearer(auto_error=False)
 
 
 def _as_aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
@@ -32,9 +35,11 @@ def _as_aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
 
 
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     db: AsyncSession = Depends(get_db)
 ) -> User:
+    if credentials is None:
+        raise UnauthorizedException("Not authenticated", code="AUTH_REQUIRED")
     token = credentials.credentials
     payload = decode_access_token(token)
     if payload is None:

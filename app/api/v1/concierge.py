@@ -404,6 +404,7 @@ async def upload_appraisal_documents(
     files: List[UploadFile] = File(...),
     is_client_visible: bool = Query(True, description="Staff only: if false, the document is staff-internal and hidden from the investor"),
     fulfills_comment_id: Optional[UUID] = Query(None, description="Optional document_request comment id this upload fulfills"),
+    document_type: Optional[str] = Query(None, description="Optional category, e.g. 'valuation' (staff only). A staff 'valuation' doc + a saved amount auto-publishes the asset to the marketplace."),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -418,6 +419,14 @@ async def upload_appraisal_documents(
     # Investors can never upload staff-internal documents.
     effective_visible = is_client_visible if is_staff else True
 
+    # Only staff may tag a document as the "valuation" doc (it's a trigger for
+    # auto-publishing the asset to the marketplace). Aliases like "Valuation
+    # Report" are collapsed to the canonical tag first.
+    from app.services.asset_listing_service import normalize_document_type
+    effective_doc_type = normalize_document_type(document_type)
+    if effective_doc_type == "valuation" and not is_staff:
+        effective_doc_type = None
+
     # If fulfilling a request, validate it's a document_request on this appraisal.
     if fulfills_comment_id is not None:
         req = (await db.execute(
@@ -431,26 +440,43 @@ async def upload_appraisal_documents(
             raise BadRequestException("fulfills_comment_id is not a document request on this appraisal")
 
     created = []
+    rejected = []
     for file in files:
-        doc = await appraisal_thread.create_appraisal_document(
-            db, appraisal_id, file,
-            user_id=current_user.id,
-            role=current_user.role.value,
-            is_client_visible=effective_visible,
-            fulfills_comment_id=fulfills_comment_id,
-            asset_id=appraisal.asset_id,
-        )
-        if doc is not None:
+        try:
+            doc = await appraisal_thread.create_appraisal_document(
+                db, appraisal_id, file,
+                user_id=current_user.id,
+                role=current_user.role.value,
+                is_client_visible=effective_visible,
+                fulfills_comment_id=fulfills_comment_id,
+                asset_id=appraisal.asset_id,
+                document_type=effective_doc_type,
+            )
             created.append(doc)
+        except appraisal_thread.DocumentRejected as e:
+            rejected.append({"file_name": e.file_name, "reason": e.reason})
+
+    if not created and rejected:
+        raise BadRequestException(
+            "No documents were saved: "
+            + "; ".join(f"{r['file_name']} ({r['reason']})" for r in rejected)
+        )
 
     await db.commit()
     for doc in created:
         await db.refresh(doc)
 
     logger.info(f"User {current_user.id} uploaded {len(created)} document(s) to appraisal {appraisal_id}")
+
+    # If staff just attached the valuation document, and the amount is already
+    # set, this auto-publishes the asset to the marketplace (idempotent).
+    if is_staff and effective_doc_type == "valuation":
+        from app.services.asset_listing_service import maybe_publish_valued_asset
+        await maybe_publish_valued_asset(db, appraisal, current_user)
     return {
         "data": [appraisal_thread.serialize_document(d, current_user, for_investor=not is_staff) for d in created],
         "count": len(created),
+        "rejected": rejected,
     }
 
 
@@ -731,11 +757,16 @@ async def update_appraisal_valuation(
     
     # Mark appraisal as completed
     appraisal.status = AppraisalStatus.COMPLETED
-    
+
     await db.commit()
     await db.refresh(appraisal)
-    
+
     logger.info(f"Appraisal valuation updated: {appraisal_id}")
+
+    # Amount is now saved; if a valuation document is already attached this
+    # auto-publishes the asset to the marketplace (idempotent, never raises).
+    from app.services.asset_listing_service import maybe_publish_valued_asset
+    await maybe_publish_valued_asset(db, appraisal, current_user)
     
     asset_name = None
     if appraisal.asset:

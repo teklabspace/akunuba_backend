@@ -48,6 +48,11 @@ import secrets
 
 router = APIRouter()
 
+# Category reference data is public (no auth/KYC): the marketplace browse
+# experience filters by these same canonical values. Mounted without the KYC
+# gate in app/main.py.
+public_router = APIRouter()
+
 
 def format_time_ago(dt: datetime) -> str:
     """Format datetime as human-readable time ago"""
@@ -675,6 +680,11 @@ async def create_asset(
         asset = result.scalar_one()
 
         logger.info(f"Asset created: {asset.id} for account {account.id}")
+
+        # Every active ("Active Investment") asset is public in the marketplace.
+        from app.services.asset_listing_service import ensure_listing_for_active_asset
+        await ensure_listing_for_active_asset(db, asset)
+
         return {"data": build_asset_response(asset)}
     except HTTPException:
         raise
@@ -1293,8 +1303,12 @@ async def update_asset(
     )
     asset = result.scalar_one()
     
+    # If the asset is (still or newly) active, make sure it's on the marketplace.
+    from app.services.asset_listing_service import ensure_listing_for_active_asset
+    await ensure_listing_for_active_asset(db, asset)
+
     response = build_asset_response(asset)
-    
+
     logger.info(f"Asset updated: {asset.id}")
     return {"data": response}
 
@@ -1695,12 +1709,16 @@ async def get_asset_stats(
 
 # ==================== CATEGORIES ====================
 
-@router.get("/categories", response_model=Dict[str, Any])
+@public_router.get("/categories", response_model=Dict[str, Any])
 async def get_categories(
-    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get all available asset categories grouped by category_group."""
+    """Get all available asset categories (public, no auth).
+
+    ``data`` is grouped by category_group (existing consumers); ``names`` is the
+    flat canonical list — the same values accepted by asset creation and by the
+    marketplace ``category`` filter.
+    """
     from collections import defaultdict
     result = await db.execute(
         select(AssetCategory)
@@ -1715,16 +1733,16 @@ async def get_categories(
 
     return {
         "data": {group: cats for group, cats in grouped.items()},
+        "names": [cat.name for cat in categories],
         "total": len(categories),
     }
 
 
-@router.get("/category-groups", response_model=Dict[str, List[str]])
+@public_router.get("/category-groups", response_model=Dict[str, List[str]])
 async def get_category_groups(
-    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get all category groups"""
+    """Get all category groups (public, no auth)"""
     groups = [group.value for group in CategoryGroup]
     return {"data": groups}
 
@@ -2466,17 +2484,26 @@ async def upload_my_appraisal_document(
             raise BadRequestException("fulfills_comment_id is not a document request on this appraisal")
 
     created = []
+    rejected = []
     for file in files:
-        doc = await appraisal_thread.create_appraisal_document(
-            db, appraisal_id, file,
-            user_id=current_user.id,
-            role=current_user.role.value,
-            is_client_visible=True,
-            fulfills_comment_id=fulfills_comment_id,
-            asset_id=asset_id,
-        )
-        if doc is not None:
+        try:
+            doc = await appraisal_thread.create_appraisal_document(
+                db, appraisal_id, file,
+                user_id=current_user.id,
+                role=current_user.role.value,
+                is_client_visible=True,
+                fulfills_comment_id=fulfills_comment_id,
+                asset_id=asset_id,
+            )
             created.append(doc)
+        except appraisal_thread.DocumentRejected as e:
+            rejected.append({"file_name": e.file_name, "reason": e.reason})
+
+    if not created and rejected:
+        raise BadRequestException(
+            "No documents were saved: "
+            + "; ".join(f"{r['file_name']} ({r['reason']})" for r in rejected)
+        )
 
     await db.commit()
     for doc in created:
@@ -2486,6 +2513,7 @@ async def upload_my_appraisal_document(
     return {
         "data": [appraisal_thread.serialize_document(d, current_user, for_investor=True) for d in created],
         "count": len(created),
+        "rejected": rejected,
     }
 
 

@@ -138,9 +138,39 @@ async def persona_webhook(
         await db.commit()
         logger.info(f"Persona webhook: updated KYC {kyc.id} to {kyc.status}")
 
-        # On a terminal outcome, capture the user's Persona docs/images + fields for
-        # admin review. Runs after we ack Persona so a slow download never blocks the 200.
+        # On a terminal outcome, notify the user (bell + realtime WS) — without the
+        # Persona redirect flow enabled this is how the user learns the result —
+        # and capture the user's Persona docs/images + fields for admin review.
+        # Capture runs after we ack Persona so a slow download never blocks the 200.
         if status_value in ("approved", "completed", "declined", "failed", "rejected"):
+            try:
+                from app.services.notification_service import NotificationService
+                from app.models.notification import NotificationType
+                if kyc.status == KYCStatus.APPROVED:
+                    await NotificationService.create_notification(
+                        db=db, account_id=kyc.account_id,
+                        notification_type=NotificationType.KYC_APPROVED,
+                        title="Identity verification approved",
+                        message="Your identity verification is complete. You now have full access to the platform.",
+                        metadata=f'{{"event": "kyc_approved", "inquiry_id": "{inquiry_id}"}}',
+                        send_email=False,
+                    )
+                elif kyc.status == KYCStatus.REJECTED:
+                    await NotificationService.create_notification(
+                        db=db, account_id=kyc.account_id,
+                        notification_type=NotificationType.GENERAL,
+                        title="Identity verification unsuccessful",
+                        message=(
+                            f"Your identity verification could not be completed. "
+                            f"Reason: {kyc.rejection_reason or 'Verification rejected'}. "
+                            f"You can restart verification from your account."
+                        ),
+                        metadata=f'{{"event": "kyc_rejected", "inquiry_id": "{inquiry_id}"}}',
+                        send_email=False,
+                    )
+            except Exception as e:
+                logger.error(f"Persona webhook: failed to notify user for KYC {kyc.id}: {e}")
+
             from app.services.persona_capture import PersonaCaptureService
             background.add_task(PersonaCaptureService.capture, kyc.account_id, inquiry_id)
 

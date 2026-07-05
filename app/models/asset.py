@@ -485,6 +485,9 @@ class AppraisalDocument(Base):
     file_size = Column(Integer)
     storage_path = Column(String(500), nullable=False)
     is_client_visible = Column(Boolean, nullable=False, default=True, server_default="true")
+    # Optional category, e.g. "valuation". A staff-set "valuation" document is one of
+    # the two conditions that auto-publish the asset to the marketplace.
+    document_type = Column(String(50), nullable=True)
     fulfills_comment_id = Column(UUID(as_uuid=True), ForeignKey("appraisal_comments.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), server_default=func.now(), nullable=False)
 
