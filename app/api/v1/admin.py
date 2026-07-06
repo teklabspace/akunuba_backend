@@ -2265,3 +2265,183 @@ async def admin_get_asset_by_code(
 
     return {"data": payload}
 
+
+
+# ==================== Admin Marketplace Overview ====================
+# System-wide views for the admin marketplace page: admins judge the whole
+# marketplace, not a personal portfolio (they have no account/watchlist rows).
+
+_ADMIN_MKT_RANGES = {"7d": 7, "30d": 30, "90d": 90, "1y": 365, "all": None}
+
+
+@router.get("/marketplace/watchlist-top", response_model=Dict[str, Any])
+async def admin_top_watchlisted_listings(
+    limit: int = Query(6, ge=1, le=50),
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Most-watchlisted listings across ALL users — the admin's 'Your
+    Watchlist' card shows what the whole market is watching."""
+    from app.api.v1.marketplace import _listing_with_category, _LISTING_ASSET_LOAD
+    from app.models.marketplace import WatchlistItem, Offer, OfferStatus
+
+    top_rows = (await db.execute(
+        select(WatchlistItem.listing_id, func.count(WatchlistItem.id).label("watchers"))
+        .group_by(WatchlistItem.listing_id)
+        .order_by(func.count(WatchlistItem.id).desc())
+        .limit(limit)
+    )).all()
+    if not top_rows:
+        return {"data": [], "total_watchlisted_listings": 0}
+
+    watcher_counts = {listing_id: watchers for listing_id, watchers in top_rows}
+
+    listings = (await db.execute(
+        select(MarketplaceListing)
+        .options(_LISTING_ASSET_LOAD)
+        .where(MarketplaceListing.id.in_(list(watcher_counts)))
+    )).scalars().all()
+
+    pending_counts = {
+        listing_id: count
+        for listing_id, count in (await db.execute(
+            select(Offer.listing_id, func.count(Offer.id))
+            .where(Offer.listing_id.in_(list(watcher_counts)),
+                   Offer.status == OfferStatus.PENDING)
+            .group_by(Offer.listing_id)
+        ))
+    }
+
+    total_watchlisted = (await db.execute(
+        select(func.count(func.distinct(WatchlistItem.listing_id)))
+    )).scalar() or 0
+
+    items = [
+        {
+            **_listing_with_category(l).model_dump(),
+            "watchers_count": watcher_counts.get(l.id, 0),
+            "pending_offers_count": pending_counts.get(l.id, 0),
+        }
+        for l in listings
+    ]
+    items.sort(key=lambda i: i["watchers_count"], reverse=True)
+
+    return {"data": items, "total_watchlisted_listings": total_watchlisted}
+
+
+@router.get("/marketplace/highlights", response_model=Dict[str, Any])
+async def admin_marketplace_highlights(
+    time_range: str = Query("30d", description="7d, 30d, 90d, 1y, all"),
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """System-wide marketplace health for the admin highlights section:
+    listing/offer funnel, escrow volume and engagement — whole market,
+    not any individual portfolio. Change percentages compare the selected
+    period against the equally-long preceding period."""
+    from app.models.asset import AssetCategory
+    from app.models.marketplace import WatchlistItem, Offer, OfferStatus
+
+    if time_range not in _ADMIN_MKT_RANGES:
+        raise BadRequestException(
+            f"Invalid time_range. Must be one of: {', '.join(_ADMIN_MKT_RANGES)}")
+
+    days = _ADMIN_MKT_RANGES[time_range]
+    now = datetime.now(timezone.utc)
+    period_start = now - timedelta(days=days) if days else None
+    prev_start = now - timedelta(days=days * 2) if days else None
+
+    async def count_where(model, *conditions):
+        return (await db.execute(
+            select(func.count(model.id)).where(*conditions)
+        )).scalar() or 0
+
+    def pct_change(current: int, previous: int):
+        if previous <= 0:
+            return None  # no baseline: UI shows "new" instead of a percentage
+        return round((current - previous) / previous * 100, 2)
+
+    # Listings funnel
+    listings_total = await count_where(MarketplaceListing)
+    listings_by_status = {
+        s.value: await count_where(MarketplaceListing, MarketplaceListing.status == s)
+        for s in (ListingStatus.ACTIVE, ListingStatus.APPROVED,
+                  ListingStatus.PENDING_APPROVAL, ListingStatus.REJECTED, ListingStatus.SOLD)
+    }
+    listings_new = await count_where(
+        MarketplaceListing, MarketplaceListing.created_at >= period_start
+    ) if period_start else listings_total
+    listings_prev = await count_where(
+        MarketplaceListing,
+        MarketplaceListing.created_at >= prev_start,
+        MarketplaceListing.created_at < period_start,
+    ) if period_start else 0
+
+    # Offers funnel
+    offers_total = await count_where(Offer)
+    offers_pending = await count_where(Offer, Offer.status == OfferStatus.PENDING)
+    offers_accepted = await count_where(Offer, Offer.status == OfferStatus.ACCEPTED)
+    offers_new = await count_where(
+        Offer, Offer.created_at >= period_start) if period_start else offers_total
+    offers_prev = await count_where(
+        Offer, Offer.created_at >= prev_start, Offer.created_at < period_start,
+    ) if period_start else 0
+
+    # Escrow volume (whole-market money movement)
+    async def escrow_sum(*conditions):
+        return float((await db.execute(
+            select(func.coalesce(func.sum(EscrowTransaction.amount), 0)).where(*conditions)
+        )).scalar() or 0)
+
+    escrow_conditions = [EscrowTransaction.created_at >= period_start] if period_start else []
+    escrow = {
+        "funded_volume": await escrow_sum(EscrowTransaction.status == EscrowStatus.FUNDED, *escrow_conditions),
+        "released_volume": await escrow_sum(EscrowTransaction.status == EscrowStatus.RELEASED, *escrow_conditions),
+        "disputed_count": await count_where(EscrowTransaction, EscrowTransaction.status == EscrowStatus.DISPUTED),
+        "currency": "USD",
+    }
+
+    # Engagement
+    engagement = {
+        "watchlist_items": await count_where(WatchlistItem),
+        "unique_watchers": (await db.execute(
+            select(func.count(func.distinct(WatchlistItem.account_id)))
+        )).scalar() or 0,
+        "unique_bidders_in_period": (await db.execute(
+            select(func.count(func.distinct(Offer.account_id))).where(
+                *( [Offer.created_at >= period_start] if period_start else [] ))
+        )).scalar() or 0,
+    }
+
+    # Category breakdown (listing counts across the whole market)
+    category_rows = (await db.execute(
+        select(AssetCategory.name, func.count(MarketplaceListing.id))
+        .join(Asset, Asset.category_id == AssetCategory.id)
+        .join(MarketplaceListing, MarketplaceListing.asset_id == Asset.id)
+        .group_by(AssetCategory.name)
+        .order_by(func.count(MarketplaceListing.id).desc())
+        .limit(8)
+    )).all()
+
+    return {
+        "time_range": time_range,
+        "listings": {
+            "total": listings_total,
+            **listings_by_status,
+            "new_in_period": listings_new,
+            "new_change_pct": pct_change(listings_new, listings_prev),
+        },
+        "offers": {
+            "total": offers_total,
+            "pending": offers_pending,
+            "accepted": offers_accepted,
+            "new_in_period": offers_new,
+            "new_change_pct": pct_change(offers_new, offers_prev),
+        },
+        "escrow": escrow,
+        "engagement": engagement,
+        "top_categories": [
+            {"category": name, "listings": count} for name, count in category_rows
+        ],
+        "generated_at": now.isoformat(),
+    }

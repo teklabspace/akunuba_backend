@@ -2,17 +2,17 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query, Body
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func, case
 from sqlalchemy.orm import aliased, selectinload
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone
 from uuid import UUID
 from app.database import get_db
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, require_kyc_verified
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from app.core.security import decode_access_token
 from app.models.user import User
 from app.models.account import Account, AccountType
-from app.models.asset import Asset, AssetCategory, CategoryGroup
+from app.models.asset import Asset, AssetCategory, CategoryGroup, AssetDocument, AssetValuation
 from app.models.marketplace import (
     MarketplaceListing, Offer, EscrowTransaction, WatchlistItem,
     ListingStatus, OfferStatus, EscrowStatus
@@ -63,7 +63,44 @@ router = APIRouter()
 public_router = APIRouter()
 
 
-class ListingCreate(BaseModel):
+class ListingOverview(BaseModel):
+    summary: Optional[str] = None
+    investment_rationale: List[str] = []
+    asset_security: Optional[str] = None
+    investment_objectives: List[str] = []
+
+
+class ListingFAQ(BaseModel):
+    question: str
+    answer: str
+
+
+class ListingDetailFields(BaseModel):
+    """Seller-provided marketing content for the listing detail page.
+    Stored in MarketplaceListing.meta_data (JSONB) — no dedicated columns."""
+    expected_return: Optional[str] = None   # e.g. "7.2%"
+    duration: Optional[str] = None          # e.g. "24 months"
+    risk_level: Optional[Literal["low", "medium", "high"]] = None
+    slots_total: Optional[int] = None
+    slots_filled: Optional[int] = None
+    overview: Optional[ListingOverview] = None
+    faqs: Optional[List[ListingFAQ]] = None
+    # AssetDocument ids (of the listing's asset) the seller exposes to buyers
+    # on the public Documents tab. Anything not listed here stays private.
+    document_ids: Optional[List[UUID]] = None
+
+
+# meta_data keys used by the detail page
+_DETAILS_KEY = "details"
+_PUBLIC_DOCS_KEY = "public_document_ids"
+
+_DETAIL_FIELD_NAMES = (
+    "expected_return", "duration", "risk_level",
+    "slots_total", "slots_filled", "overview", "faqs",
+)
+
+
+class ListingCreate(ListingDetailFields):
     asset_id: UUID
     title: str
     description: Optional[str] = None
@@ -123,6 +160,135 @@ _LISTING_ASSET_LOAD = selectinload(MarketplaceListing.asset).options(
     selectinload(Asset.category),
     selectinload(Asset.photos),
 )
+
+
+class ListingDetailResponse(ListingResponse):
+    """Full payload for the listing detail page. Nullable fields are hidden
+    by the frontend when null."""
+    description: Optional[str] = None
+    seller_name: Optional[str] = None
+    seller_id: Optional[UUID] = None      # listing owner's USER id (standardized)
+    is_owner: bool = False                # computed for the authenticated caller
+    fee_paid: bool = False
+    expected_return: Optional[str] = None
+    duration: Optional[str] = None
+    risk_level: Optional[str] = None
+    slots_total: Optional[int] = None
+    slots_filled: Optional[int] = None
+    overview: Optional[ListingOverview] = None
+    faqs: Optional[List[ListingFAQ]] = None
+
+
+def _listing_detail_response(listing: MarketplaceListing, is_owner: bool) -> ListingDetailResponse:
+    """Detail-page serialization. Callers must eager-load listing.asset
+    (category+photos) and listing.account.user."""
+    meta = listing.meta_data or {}
+    details = meta.get(_DETAILS_KEY) or {}
+    seller_user = listing.account.user if listing.account else None
+    return ListingDetailResponse(
+        **_listing_with_category(listing).model_dump(),
+        description=listing.description,
+        seller_name=_full_name(seller_user) if seller_user else None,
+        seller_id=seller_user.id if seller_user else None,
+        is_owner=is_owner,
+        fee_paid=bool(listing.listing_fee_paid),
+        expected_return=details.get("expected_return"),
+        duration=details.get("duration"),
+        risk_level=details.get("risk_level"),
+        slots_total=details.get("slots_total"),
+        slots_filled=details.get("slots_filled"),
+        overview=details.get("overview"),
+        faqs=details.get("faqs"),
+    )
+
+
+async def _apply_listing_details(listing: MarketplaceListing, data: ListingDetailFields, db: AsyncSession) -> None:
+    """Merge seller-provided detail fields into listing.meta_data.
+
+    Only fields explicitly present in the request change (send null/[] to
+    clear one). document_ids are validated to belong to the listing's own
+    asset — this is the seller's explicit opt-in that makes those documents
+    publicly visible on the Documents tab."""
+    provided = data.model_dump(exclude_unset=True, mode="json")
+    meta = dict(listing.meta_data or {})
+    details = dict(meta.get(_DETAILS_KEY) or {})
+
+    for field in _DETAIL_FIELD_NAMES:
+        if field in provided:
+            if provided[field] is None:
+                details.pop(field, None)
+            else:
+                details[field] = provided[field]
+    meta[_DETAILS_KEY] = details
+
+    if "document_ids" in provided:
+        doc_ids = data.document_ids or []
+        if doc_ids:
+            valid_rows = await db.execute(
+                select(AssetDocument.id).where(
+                    AssetDocument.id.in_(doc_ids),
+                    AssetDocument.asset_id == listing.asset_id,
+                )
+            )
+            valid_ids = {row[0] for row in valid_rows}
+            invalid = [str(d) for d in doc_ids if d not in valid_ids]
+            if invalid:
+                raise BadRequestException(
+                    f"Documents not found on this listing's asset: {', '.join(invalid)}",
+                    code="INVALID_LISTING_DOCUMENTS",
+                )
+        meta[_PUBLIC_DOCS_KEY] = [str(d) for d in doc_ids]
+
+    # JSONB columns don't track in-place mutation; reassign a new dict.
+    listing.meta_data = meta
+
+
+def _full_name(user: Optional[User]) -> str:
+    """NULL-safe display name: 'First Last', falling back to email, then 'Unknown'."""
+    if not user:
+        return "Unknown"
+    name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+    return name or user.email or "Unknown"
+
+
+def _my_offer_item(offer: Offer, viewer_account_id, escrow_id=None) -> dict:
+    """Serialize one offer for GET /offers/my from the viewer's perspective.
+
+    role is "seller" when the viewer owns the listing (offer received),
+    otherwise "buyer" (offer made). Callers must eager-load offer.account.user
+    and offer.listing with its account.user, asset and asset.photos."""
+    listing = offer.listing
+    is_seller = listing is not None and listing.account_id == viewer_account_id
+    counterparty_account = offer.account if is_seller else (listing.account if listing else None)
+    counterparty_user = counterparty_account.user if counterparty_account else None
+
+    asset = listing.asset if listing else None
+    asset_type = None
+    asset_thumbnail = None
+    if asset is not None:
+        if asset.asset_type:
+            asset_type = getattr(asset.asset_type, "value", asset.asset_type)
+        photo = _primary_photo(asset.photos)
+        if photo is not None:
+            asset_thumbnail = photo.thumbnail_url or photo.url
+
+    return {
+        "id": offer.id,
+        "listing_id": offer.listing_id,
+        "listing_title": listing.title if listing else None,
+        "asset_type": asset_type,
+        "asset_thumbnail": asset_thumbnail,
+        "offer_amount": offer.offer_amount,
+        "currency": offer.currency,
+        "status": getattr(offer.status, "value", offer.status),
+        "role": "seller" if is_seller else "buyer",
+        "counterparty": _full_name(counterparty_user),
+        "counterparty_id": counterparty_user.id if counterparty_user else None,
+        "escrow_id": escrow_id,
+        "message": offer.message,
+        "created_at": offer.created_at,
+        "updated_at": offer.updated_at or offer.created_at,
+    }
 
 
 class OfferCreate(BaseModel):
@@ -195,7 +361,8 @@ async def create_listing(
         listing_fee_paid=False,
         status=ListingStatus.PENDING_APPROVAL,
     )
-    
+    await _apply_listing_details(listing, listing_data, db)
+
     db.add(listing)
     await db.commit()
     await db.refresh(listing)
@@ -272,6 +439,90 @@ async def list_listings(
 
     return {
         "data": [_listing_with_category(l) for l in listings],
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "total_pages": (total + limit - 1) // limit if total > 0 else 0,
+        },
+    }
+
+
+class MyListingResponse(ListingResponse):
+    # Count of PENDING offers awaiting the owner's response (badge on cards).
+    pending_offers_count: int = 0
+
+
+@public_router.get("/listings/my", response_model=Dict[str, Any])
+async def get_my_listings(
+    status_filter: Optional[ListingStatus] = Query(None),
+    min_price: Optional[Decimal] = Query(None, ge=0),
+    max_price: Optional[Decimal] = Query(None, ge=0),
+    sort_by: Optional[str] = Query("created_at", description="Sort by: price, created_at"),
+    sort_order: Optional[str] = Query(None, description="asc or desc. Defaults: price asc, created_at desc (newest first)"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(require_kyc_verified),
+    db: AsyncSession = Depends(get_db),
+):
+    """The caller's own marketplace listings, any status, newest first.
+
+    Owners may filter by ANY status (draft/pending_approval/rejected/... —
+    it's their own data, unlike the public browse endpoint). Defined on
+    public_router purely for route ordering: it must match before
+    GET /listings/{listing_id}; auth + KYC are enforced by the
+    require_kyc_verified dependency, same gate as the transact router."""
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+
+    conditions = [MarketplaceListing.account_id == account.id]
+    if status_filter:
+        conditions.append(MarketplaceListing.status == status_filter)
+    if min_price is not None:
+        conditions.append(MarketplaceListing.asking_price >= min_price)
+    if max_price is not None:
+        conditions.append(MarketplaceListing.asking_price <= max_price)
+
+    total = (
+        await db.execute(
+            select(func.count(MarketplaceListing.id)).where(and_(*conditions))
+        )
+    ).scalar() or 0
+
+    result = await db.execute(
+        select(MarketplaceListing)
+        .where(and_(*conditions))
+        .options(_LISTING_ASSET_LOAD)
+        .order_by(_listing_sort_clause(sort_by, sort_order))
+        .offset((page - 1) * limit)
+        .limit(limit)
+    )
+    listings = result.scalars().all()
+
+    pending_counts: Dict[Any, int] = {}
+    if listings:
+        count_rows = await db.execute(
+            select(Offer.listing_id, func.count(Offer.id))
+            .where(
+                Offer.listing_id.in_([l.id for l in listings]),
+                Offer.status == OfferStatus.PENDING,
+            )
+            .group_by(Offer.listing_id)
+        )
+        pending_counts = {listing_id: count for listing_id, count in count_rows}
+
+    return {
+        "data": [
+            MyListingResponse(
+                **_listing_with_category(l).model_dump(),
+                pending_offers_count=pending_counts.get(l.id, 0),
+            )
+            for l in listings
+        ],
         "pagination": {
             "page": page,
             "limit": limit,
@@ -730,7 +981,7 @@ async def release_escrow(
     return {"message": "Escrow released successfully"}
 
 
-class ListingUpdate(BaseModel):
+class ListingUpdate(ListingDetailFields):
     title: Optional[str] = None
     description: Optional[str] = None
     asking_price: Optional[Decimal] = None
@@ -761,17 +1012,20 @@ class EscrowResponse(BaseModel):
         from_attributes = True
 
 
-@public_router.get("/listings/{listing_id}", response_model=ListingResponse)
-async def get_listing(
+async def _visible_listing_or_404(
     listing_id: UUID,
-    current_user: Optional[User] = Depends(get_optional_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Get listing details. Public for APPROVED/ACTIVE listings; non-public
-    listings are visible only to staff and the owning account (404 otherwise)."""
+    current_user: Optional[User],
+    db: AsyncSession,
+) -> tuple[MarketplaceListing, bool]:
+    """Load a listing for detail-page reads and enforce visibility: public for
+    APPROVED/ACTIVE; non-public listings are visible only to staff and the
+    owning account (404 otherwise). Returns (listing, is_owner)."""
     result = await db.execute(
         select(MarketplaceListing)
-        .options(_LISTING_ASSET_LOAD)
+        .options(
+            _LISTING_ASSET_LOAD,
+            selectinload(MarketplaceListing.account).selectinload(Account.user),
+        )
         .where(MarketplaceListing.id == listing_id)
     )
     listing = result.scalar_one_or_none()
@@ -779,18 +1033,227 @@ async def get_listing(
     if not listing:
         raise NotFoundException("Listing", str(listing_id))
 
+    is_owner = False
+    if current_user:
+        account = (await db.execute(
+            select(Account).where(Account.user_id == current_user.id)
+        )).scalar_one_or_none()
+        is_owner = bool(account) and account.id == listing.account_id
+
     if listing.status not in (ListingStatus.APPROVED, ListingStatus.ACTIVE):
         is_staff = bool(current_user) and has_permission(current_user.role, Permission.APPROVE_LISTINGS)
-        is_owner = False
-        if current_user and not is_staff:
-            account = (await db.execute(
-                select(Account).where(Account.user_id == current_user.id)
-            )).scalar_one_or_none()
-            is_owner = bool(account) and account.id == listing.account_id
         if not (is_staff or is_owner):
             raise NotFoundException("Listing", str(listing_id))
 
-    return _listing_with_category(listing)
+    return listing, is_owner
+
+
+@public_router.get("/listings/{listing_id}", response_model=ListingDetailResponse)
+async def get_listing(
+    listing_id: UUID,
+    current_user: Optional[User] = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get listing details. Public for APPROVED/ACTIVE listings; non-public
+    listings are visible only to staff and the owning account (404 otherwise)."""
+    listing, is_owner = await _visible_listing_or_404(listing_id, current_user, db)
+    return _listing_detail_response(listing, is_owner)
+
+
+_PERFORMANCE_RANGES = {"30d": 30, "90d": 90, "1y": 365, "all": None}
+
+
+def _bucket_series(points, granularity: str):
+    """Collapse [(datetime, value)] (sorted asc) to the LAST point per
+    daily/weekly/monthly bucket. Pure; unit-tested without a DB."""
+    def key(dt):
+        if granularity == "monthly":
+            return (dt.year, dt.month)
+        if granularity == "weekly":
+            iso = dt.isocalendar()
+            return (iso[0], iso[1])
+        return dt.date()
+
+    out, last_key = [], None
+    for dt, value in points:
+        k = key(dt)
+        if k == last_key:
+            out[-1] = (dt, value)
+        else:
+            out.append((dt, value))
+            last_key = k
+    return out
+
+
+def _performance_metrics(points) -> dict:
+    """Return/volatility metrics over [(datetime, value)] sorted asc.
+    Fewer than 2 points (or a non-positive start) yields zeros. Pure."""
+    zeros = {
+        "total_return_pct": 0.0,
+        "annualized_return_pct": 0.0,
+        "volatility_pct": 0.0,
+        "value_change_abs": 0.0,
+    }
+    if len(points) < 2:
+        return zeros
+    (first_dt, first_v), (last_dt, last_v) = points[0], points[-1]
+    if first_v <= 0:
+        return zeros
+
+    total_return = (last_v / first_v - 1) * 100
+    days = max((last_dt - first_dt).days, 1)
+    # Annualizing a short window compounds noise into absurd numbers
+    # (real case: +846% in 30 days -> 1.9e14% annualized). Under 90 days
+    # report null and let the UI hide the tile.
+    annualized = ((last_v / first_v) ** (365.0 / days) - 1) * 100 if days >= 90 else None
+
+    returns = [
+        points[i][1] / points[i - 1][1] - 1
+        for i in range(1, len(points))
+        if points[i - 1][1] > 0
+    ]
+    volatility = 0.0
+    if len(returns) >= 2:
+        mean = sum(returns) / len(returns)
+        volatility = (sum((r - mean) ** 2 for r in returns) / (len(returns) - 1)) ** 0.5 * 100
+
+    return {
+        "total_return_pct": round(total_return, 2),
+        "annualized_return_pct": round(annualized, 2) if annualized is not None else None,
+        "volatility_pct": round(volatility, 2),
+        "value_change_abs": round(last_v - first_v, 2),
+    }
+
+
+@public_router.get("/listings/{listing_id}/performance")
+async def get_listing_performance(
+    listing_id: UUID,
+    time_range: str = Query("1y", description="30d, 90d, 1y, all"),
+    granularity: str = Query("daily", description="daily, weekly, monthly"),
+    current_user: Optional[User] = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Value history of the listing's underlying asset for the Performance tab.
+
+    Series comes from asset_valuations; when an asset has no valuation rows
+    yet, falls back to the two real anchor points we do have (purchase price
+    at acquisition date -> current value now). Empty series when neither
+    exists — the frontend renders an empty state."""
+    if time_range not in _PERFORMANCE_RANGES:
+        raise BadRequestException(
+            f"Invalid time_range. Must be one of: {', '.join(_PERFORMANCE_RANGES)}")
+    if granularity not in ("daily", "weekly", "monthly"):
+        raise BadRequestException("Invalid granularity. Must be one of: daily, weekly, monthly")
+
+    listing, _ = await _visible_listing_or_404(listing_id, current_user, db)
+
+    days = _PERFORMANCE_RANGES[time_range]
+    start_date = datetime.now(dt_timezone.utc) - timedelta(days=days) if days else None
+
+    valuation_query = (
+        select(AssetValuation)
+        .where(AssetValuation.asset_id == listing.asset_id)
+        .order_by(AssetValuation.valuation_date.asc())
+    )
+    if start_date:
+        valuation_query = valuation_query.where(AssetValuation.valuation_date >= start_date)
+    valuations = (await db.execute(valuation_query)).scalars().all()
+
+    points = [(v.valuation_date, float(v.value)) for v in valuations]
+
+    asset = listing.asset
+    if not points and asset is not None and asset.current_value is not None:
+        now = datetime.now(dt_timezone.utc)
+        if asset.purchase_price and asset.acquisition_date:
+            points = [
+                (asset.acquisition_date, float(asset.purchase_price)),
+                (now, float(asset.current_value)),
+            ]
+        else:
+            points = [(now, float(asset.current_value))]
+
+    bucketed = _bucket_series(points, granularity)
+    metrics = _performance_metrics(bucketed)
+    metrics["currency"] = (asset.currency if asset is not None else None) or listing.currency
+
+    return {
+        "metrics": metrics,
+        "series": [
+            {"date": dt.date().isoformat(), "value": value}
+            for dt, value in bucketed
+        ],
+        "time_range": time_range,
+        "granularity": granularity,
+    }
+
+
+def _document_file_type(doc: AssetDocument) -> Optional[str]:
+    """Short file-type label ('pdf', 'docx', ...) from mime type or filename."""
+    mime_map = {
+        "application/pdf": "pdf",
+        "application/msword": "doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+        "application/vnd.ms-excel": "xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+        "image/jpeg": "jpg",
+        "image/png": "png",
+    }
+    if doc.mime_type:
+        mapped = mime_map.get(doc.mime_type.lower())
+        if mapped:
+            return mapped
+    if doc.file_name and "." in doc.file_name:
+        return doc.file_name.rsplit(".", 1)[1].lower()
+    if doc.mime_type and "/" in doc.mime_type:
+        return doc.mime_type.rsplit("/", 1)[1].lower()
+    return None
+
+
+@public_router.get("/listings/{listing_id}/documents")
+async def get_listing_documents(
+    listing_id: UUID,
+    current_user: Optional[User] = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Documents the seller explicitly exposed on this listing (Documents tab).
+
+    Only AssetDocuments whose ids the seller attached via document_ids on
+    listing create/update are returned — the owner's other files stay
+    private, since any authenticated buyer (or guest) can reach this page."""
+    listing, _ = await _visible_listing_or_404(listing_id, current_user, db)
+
+    raw_ids = (listing.meta_data or {}).get(_PUBLIC_DOCS_KEY) or []
+    public_ids = []
+    for raw in raw_ids:
+        try:
+            public_ids.append(UUID(str(raw)))
+        except ValueError:
+            continue
+    if not public_ids:
+        return {"data": []}
+
+    docs = (await db.execute(
+        select(AssetDocument)
+        .where(
+            AssetDocument.id.in_(public_ids),
+            AssetDocument.asset_id == listing.asset_id,
+        )
+        .order_by(AssetDocument.created_at.desc())
+    )).scalars().all()
+
+    return {
+        "data": [
+            {
+                "id": doc.id,
+                "name": doc.name or doc.file_name,
+                "file_type": _document_file_type(doc),
+                "size_bytes": doc.file_size,
+                "url": doc.url,
+                "uploaded_at": doc.created_at,
+            }
+            for doc in docs
+        ]
+    }
 
 
 @router.put("/listings/{listing_id}", response_model=ListingResponse)
@@ -831,7 +1294,8 @@ async def update_listing(
         listing.asking_price = listing_data.asking_price
         # Recalculate listing fee
         listing.listing_fee = calculate_listing_fee(listing_data.asking_price)
-    
+    await _apply_listing_details(listing, listing_data, db)
+
     await db.commit()
     await db.refresh(listing)
     
@@ -1017,29 +1481,62 @@ async def list_offers(
     return offers
 
 
-@router.get("/offers/my", response_model=List[OfferResponse])
+@router.get("/offers/my")
 async def get_my_offers(
     status_filter: Optional[OfferStatus] = Query(None),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get user's offers"""
+    """Offer history for the current user, both sides: offers they made on
+    other accounts' listings (role "buyer") and offers received on listings
+    they own (role "seller")."""
     account_result = await db.execute(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
-    
+
     if not account:
         raise NotFoundException("Account", str(current_user.id))
-    
-    query = select(Offer).where(Offer.account_id == account.id)
+
+    query = (
+        select(Offer)
+        .join(MarketplaceListing, MarketplaceListing.id == Offer.listing_id)
+        .where(
+            or_(
+                Offer.account_id == account.id,
+                MarketplaceListing.account_id == account.id,
+            )
+        )
+        .options(
+            selectinload(Offer.account).selectinload(Account.user),
+            selectinload(Offer.listing).options(
+                selectinload(MarketplaceListing.account).selectinload(Account.user),
+                selectinload(MarketplaceListing.asset).selectinload(Asset.photos),
+            ),
+        )
+    )
     if status_filter:
         query = query.where(Offer.status == status_filter)
-    
+
     result = await db.execute(query.order_by(Offer.created_at.desc()))
     offers = result.scalars().all()
-    
-    return offers
+
+    # Escrow ids let the UI open escrow management from an accepted offer.
+    escrow_by_offer = {}
+    if offers:
+        escrow_rows = await db.execute(
+            select(EscrowTransaction.offer_id, EscrowTransaction.id)
+            .where(EscrowTransaction.offer_id.in_([o.id for o in offers]))
+            .order_by(EscrowTransaction.created_at)  # latest escrow wins below
+        )
+        escrow_by_offer = {offer_id: escrow_id for offer_id, escrow_id in escrow_rows}
+
+    return {
+        "data": [
+            _my_offer_item(offer, account.id, escrow_by_offer.get(offer.id))
+            for offer in offers
+        ]
+    }
 
 
 @router.get("/offers/{offer_id}", response_model=OfferResponse)
@@ -1903,18 +2400,21 @@ class WatchlistItemUpdate(BaseModel):
 async def get_watchlist(
     status_filter: Optional[str] = Query(None, description="Filter by listing status"),
     category: Optional[str] = Query(None),
+    min_price: Optional[Decimal] = Query(None, ge=0),
+    max_price: Optional[Decimal] = Query(None, ge=0),
     sort_by: Optional[str] = Query("added_at", description="Sort by: added_at, price, name"),
+    sort_order: Optional[str] = Query(None, description="asc or desc. Defaults: price/name asc, added_at desc (newest first)"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """Get all items in the authenticated user's watchlist"""
     from app.api.deps import get_account
     from app.models.asset import Asset, AssetCategory
-    
+
     account = await get_account(current_user=current_user, db=db)
-    
+
     query = select(WatchlistItem).where(WatchlistItem.account_id == account.id)
-    
+
     # Apply filters
     if status_filter:
         try:
@@ -1922,17 +2422,35 @@ async def get_watchlist(
             query = query.where(WatchlistItem.listing_status == status_enum)
         except ValueError:
             raise BadRequestException(f"Invalid status_filter: {status_filter}")
-    
+
     if category:
         query = query.where(WatchlistItem.listing_category == category)
-    
-    # Apply sorting
-    if sort_by == "price":
-        query = query.order_by(WatchlistItem.asking_price.asc())
-    elif sort_by == "name":
-        query = query.order_by(WatchlistItem.listing_title.asc())
-    else:  # added_at (default)
-        query = query.order_by(WatchlistItem.created_at.desc())
+
+    if min_price is not None:
+        query = query.where(WatchlistItem.asking_price >= min_price)
+    if max_price is not None:
+        query = query.where(WatchlistItem.asking_price <= max_price)
+
+    # Apply sorting. Without an explicit sort_order the historical defaults
+    # hold (price/name ascending, added_at newest-first).
+    sort_column = {
+        "price": WatchlistItem.asking_price,
+        "name": WatchlistItem.listing_title,
+    }.get(sort_by, WatchlistItem.created_at)
+    if sort_order is None:
+        order_clause = sort_column.desc() if sort_by not in ("price", "name") else sort_column.asc()
+    else:
+        order = sort_order.strip().lower()
+        if order == "asc":
+            order_clause = sort_column.asc()
+        elif order == "desc":
+            order_clause = sort_column.desc()
+        else:
+            raise BadRequestException(
+                f"Invalid sort_order '{sort_order}'. Must be 'asc' or 'desc'.",
+                code="INVALID_SORT_ORDER",
+            )
+    query = query.order_by(order_clause)
     
     result = await db.execute(query)
     watchlist_items = result.scalars().all()

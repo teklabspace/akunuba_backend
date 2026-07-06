@@ -29,7 +29,7 @@ from app.schemas.asset_extended import (
     AutomatedAppraisalResult, AIReviewResponse, AIUsageItem, AIUsageResponse
 )
 from app.schemas.common import PaginatedResponse
-from app.core.exceptions import NotFoundException, BadRequestException, ForbiddenException
+from app.core.exceptions import NotFoundException, BadRequestException, ForbiddenException, ValidationException
 from app.api.deps import get_account, get_user_subscription_plan
 from app.core.features import get_limit, check_usage_limit
 from app.services import ai_appraisal_service
@@ -313,6 +313,52 @@ class AssetDetailResponse(AssetResponse):
     total_ownership_percentage: Decimal = Decimal("100.00")
 
 
+async def _resolve_media_refs(db: AsyncSession, refs, model, account_id):
+    """Resolve photo/document references (UUID or URL) to their rows.
+
+    A reference is valid when it matches a row that is unclaimed
+    (asset_id IS NULL — freshly uploaded) or already attached to one of the
+    caller's own assets. Returns (rows, invalid_refs) so callers can reject
+    the whole request naming every bad reference (BUG-18: no orphaned assets
+    from clients submitting stale/foreign upload ids)."""
+    rows, invalid = [], []
+    for ref in refs:
+        if ref is None or str(ref).strip() == "":
+            continue
+        row = None
+        try:
+            ref_uuid = UUID(str(ref))
+            row = (await db.execute(
+                select(model).where(model.id == ref_uuid)
+            )).scalar_one_or_none()
+        except (ValueError, TypeError):
+            row = None
+        if row is None:
+            url = str(ref)
+            normalized = url.split('?')[0]
+            row = (await db.execute(
+                select(model).where(
+                    or_(
+                        model.url == url,
+                        model.url == normalized,
+                        model.url.like(f"{normalized}%"),
+                    )
+                )
+            )).scalar_one_or_none()
+        if row is None:
+            invalid.append(str(ref))
+            continue
+        if row.asset_id is not None:
+            owner_ok = (await db.execute(
+                select(Asset.id).where(Asset.id == row.asset_id, Asset.account_id == account_id)
+            )).scalar_one_or_none()
+            if not owner_ok:
+                invalid.append(str(ref))
+                continue
+        rows.append(row)
+    return rows, invalid
+
+
 @router.post("", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
 async def create_asset(
     asset_data: AssetCreate,
@@ -509,7 +555,28 @@ async def create_asset(
         metadata = asset_data.metadata
         if metadata == "null" or metadata is None:
             metadata = {}
-        
+
+        # Validate ALL media references BEFORE creating anything (BUG-18):
+        # a bad client payload must fail with 422 naming the invalid ids,
+        # never produce an orphaned asset row.
+        all_photo_refs = list(dict.fromkeys(
+            (asset_data.photos or []) + (asset_data.images or [])
+        ))
+        photo_rows, invalid_photos = await _resolve_media_refs(
+            db, all_photo_refs, AssetPhoto, account.id)
+        document_rows, invalid_documents = await _resolve_media_refs(
+            db, asset_data.documents or [], AssetDocument, account.id)
+        if invalid_photos or invalid_documents:
+            problems = []
+            if invalid_photos:
+                problems.append(f"photos: {', '.join(invalid_photos)}")
+            if invalid_documents:
+                problems.append(f"documents: {', '.join(invalid_documents)}")
+            raise ValidationException(
+                f"Unknown or inaccessible file references - {'; '.join(problems)}",
+                code="INVALID_MEDIA_REFERENCES",
+            )
+
         # Generate the human-readable, globally-unique code shown to users (AK-01, ...)
         asset_code = await generate_asset_code(db)
 
@@ -538,17 +605,12 @@ async def create_asset(
             meta_data=metadata,
         )
         
+        # Single transaction: asset + valuation + ownership + media links all
+        # commit together (BUG-18: creation was previously two commits, so a
+        # failure mid-way left partial asset rows behind).
         db.add(asset)
-        await db.commit()
-        await db.refresh(asset)
-        
-        # Load category relationship if category_id exists
-        if asset.category_id:
-            try:
-                await db.refresh(asset, ["category"])
-            except Exception:
-                pass  # Category might not exist yet
-        
+        await db.flush()
+
         # Create initial valuation
         valuation = AssetValuation(
             asset_id=asset.id,
@@ -567,104 +629,13 @@ async def create_asset(
         )
         db.add(ownership)
         
-        # Merge images field into photos (frontend may send either or both)
-        all_photo_refs = list(dict.fromkeys(
-            (asset_data.photos or []) + (asset_data.images or [])
-        ))
+        # Attach the pre-validated media rows (resolved before the asset was
+        # created; every reference is known-good at this point).
+        for photo in photo_rows:
+            photo.asset_id = asset.id
+        for document in document_rows:
+            document.asset_id = asset.id
 
-        # Link photos if provided (using URLs or IDs as identifiers)
-        if all_photo_refs:
-            asset_data.photos = all_photo_refs
-
-        if asset_data.photos:
-            for photo_ref in asset_data.photos:
-                try:
-                    photo = None
-                    # First, try to treat the reference as a UUID (ID-based linking)
-                    try:
-                        from uuid import UUID as _UUID
-                        photo_uuid = _UUID(str(photo_ref))
-                        photo_result = await db.execute(
-                            select(AssetPhoto).where(AssetPhoto.id == photo_uuid)
-                        )
-                        photo = photo_result.scalar_one_or_none()
-                    except (ValueError, TypeError):
-                        photo = None
-                    
-                    # If not a valid UUID or not found by ID, fall back to URL-based lookup
-                    if not photo:
-                        photo_url = str(photo_ref) if photo_ref is not None else None
-                        if not photo_url:
-                            continue
-                        
-                        # Normalize URL - remove trailing query params (e.g., "?") if present
-                        normalized_url = photo_url.split('?')[0]
-                        
-                        # Look up photo by URL (primary identifier)
-                        # Try exact match first, then try without query params
-                        photo_result = await db.execute(
-                            select(AssetPhoto).where(
-                                or_(
-                                    AssetPhoto.url == photo_url,
-                                    AssetPhoto.url == normalized_url,
-                                    AssetPhoto.url.like(f"{normalized_url}%")  # Match even if there are query params in DB
-                                )
-                            )
-                        )
-                        photo = photo_result.scalar_one_or_none()
-                    
-                    if photo:
-                        photo.asset_id = asset.id
-                    else:
-                        logger.warning(f"Photo not found for reference: {photo_ref}")
-                except Exception as e:
-                    logger.warning(f"Failed to link photo with reference {photo_ref}: {e}")
-        
-        # Link documents if provided (using URLs or IDs as identifiers)
-        if asset_data.documents:
-            for doc_ref in asset_data.documents:
-                try:
-                    document = None
-                    # First, try to treat the reference as a UUID (ID-based linking)
-                    try:
-                        from uuid import UUID as _UUID
-                        doc_uuid = _UUID(str(doc_ref))
-                        doc_result = await db.execute(
-                            select(AssetDocument).where(AssetDocument.id == doc_uuid)
-                        )
-                        document = doc_result.scalar_one_or_none()
-                    except (ValueError, TypeError):
-                        document = None
-                    
-                    # If not a valid UUID or not found by ID, fall back to URL-based lookup
-                    if not document:
-                        doc_url = str(doc_ref) if doc_ref is not None else None
-                        if not doc_url:
-                            continue
-                        
-                        # Normalize URL - remove trailing query params (e.g., "?") if present
-                        normalized_url = doc_url.split('?')[0]
-                        
-                        # Look up document by URL (primary identifier)
-                        # Try exact match first, then try without query params
-                        doc_result = await db.execute(
-                            select(AssetDocument).where(
-                                or_(
-                                    AssetDocument.url == doc_url,
-                                    AssetDocument.url == normalized_url,
-                                    AssetDocument.url.like(f"{normalized_url}%")  # Match even if there are query params in DB
-                                )
-                            )
-                        )
-                        document = doc_result.scalar_one_or_none()
-                    
-                    if document:
-                        document.asset_id = asset.id
-                    else:
-                        logger.warning(f"Document not found for reference: {doc_ref}")
-                except Exception as e:
-                    logger.warning(f"Failed to link document with reference {doc_ref}: {e}")
-        
         await db.commit()
 
         # Reload asset with all relationships for full response
@@ -1319,57 +1290,85 @@ async def delete_asset(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Delete an asset and its related data"""
-    account_result = await db.execute(
-        select(Account).where(Account.user_id == current_user.id)
+    """Delete an asset and its related data.
+
+    Owners delete their own assets. Admins may delete ANY asset (cleanup of
+    orphaned/incomplete records) — admins have no account row, so the asset
+    is looked up without ownership scoping for them. Assets whose listings
+    have offers/escrow history are never hard-deleted (409)."""
+    from sqlalchemy import delete as sa_delete
+    from app.models.marketplace import (
+        MarketplaceListing, ListingStatus, Offer, EscrowTransaction, WatchlistItem,
     )
-    account = account_result.scalar_one_or_none()
-    
-    if not account:
-        raise NotFoundException("Account", str(current_user.id))
-    
-    # Get asset with relationships to check for dependencies
-    result = await db.execute(
-        select(Asset).options(
-            selectinload(Asset.valuations),
-            selectinload(Asset.ownerships)
-        ).where(
-            and_(Asset.id == asset_id, Asset.account_id == account.id)
+
+    is_admin = current_user.role == Role.ADMIN
+
+    asset_query = select(Asset).options(
+        selectinload(Asset.valuations),
+        selectinload(Asset.ownerships),
+    ).where(Asset.id == asset_id)
+
+    if not is_admin:
+        account_result = await db.execute(
+            select(Account).where(Account.user_id == current_user.id)
         )
-    )
-    asset = result.scalar_one_or_none()
-    
+        account = account_result.scalar_one_or_none()
+        if not account:
+            raise NotFoundException("Account", str(current_user.id))
+        asset_query = asset_query.where(Asset.account_id == account.id)
+
+    asset = (await db.execute(asset_query)).scalar_one_or_none()
     if not asset:
         raise NotFoundException("Asset", str(asset_id))
-    
-    # Check if asset is listed in marketplace
-    from app.models.marketplace import MarketplaceListing, ListingStatus
-    listing_result = await db.execute(
-        select(MarketplaceListing).where(
-            and_(
-                MarketplaceListing.asset_id == asset_id,
-                MarketplaceListing.status.in_([ListingStatus.PENDING_APPROVAL, ListingStatus.APPROVED, ListingStatus.ACTIVE])
-            )
-        )
-    )
-    if listing_result.scalar_one_or_none():
+
+    # Marketplace rows referencing this asset (any status — even cancelled or
+    # rejected listings hold an FK that would otherwise fail the delete).
+    listings = (await db.execute(
+        select(MarketplaceListing).where(MarketplaceListing.asset_id == asset_id)
+    )).scalars().all()
+
+    live_statuses = (ListingStatus.PENDING_APPROVAL, ListingStatus.APPROVED, ListingStatus.ACTIVE)
+    if not is_admin and any(l.status in live_statuses for l in listings):
+        # Owners must delist first; admins may remove a junk asset outright.
         raise BadRequestException("Cannot delete asset that is listed in marketplace")
-    
-    # Delete related valuations
+
+    if listings:
+        listing_ids = [l.id for l in listings]
+        offers_count = (await db.execute(
+            select(func.count(Offer.id)).where(Offer.listing_id.in_(listing_ids))
+        )).scalar() or 0
+        escrow_count = (await db.execute(
+            select(func.count(EscrowTransaction.id)).where(EscrowTransaction.listing_id.in_(listing_ids))
+        )).scalar() or 0
+        if offers_count or escrow_count:
+            from app.core.exceptions import ConflictException
+            raise ConflictException(
+                "Asset has marketplace transaction history (offers/escrow) and cannot be hard-deleted.",
+                code="ASSET_HAS_TRANSACTIONS",
+            )
+        # Listings with no transactions are safe to remove together with any
+        # denormalized watchlist rows pointing at them.
+        await db.execute(sa_delete(WatchlistItem).where(WatchlistItem.listing_id.in_(listing_ids)))
+        for listing in listings:
+            await db.delete(listing)
+
+    # Delete related valuations (no ORM cascade on this relationship)
     if asset.valuations:
         for valuation in asset.valuations:
             await db.delete(valuation)
-    
+
     # Delete related ownerships
     if asset.ownerships:
         for ownership in asset.ownerships:
             await db.delete(ownership)
-    
-    # Delete asset
+
+    # Delete asset — photos/documents/appraisals/reviews cascade via ORM even
+    # when their storage files were never finalized (media integrity is not
+    # a precondition for deletion).
     await db.delete(asset)
     await db.commit()
-    
-    logger.info(f"Asset deleted: {asset_id}")
+
+    logger.info(f"Asset deleted: {asset_id} by {'admin' if is_admin else 'owner'} {current_user.id}")
     return None
 
 
