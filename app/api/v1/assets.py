@@ -3442,15 +3442,17 @@ async def upload_file_assets(
         await db.refresh(document)
         file_id = document.id
     
+    # Return the payload directly — the ResponseEnvelopeMiddleware wraps it in the
+    # standard {"success", ..., "data": <this>} envelope. Adding our own "data" key
+    # double-nests it (data.data.id) and the frontend's data.id read returns
+    # undefined ("Upload succeeded but no ID returned").
     return {
-        "data": {
-            "id": str(file_id) if file_id else None,
-            "url": url,
-            "thumbnail_url": thumbnail_url,
-            "file_name": file.filename,
-            "file_size": file_size,
-            "file_type": file_type,
-            "uploaded_at": datetime.now(timezone.utc).isoformat()
-        }
+        "id": str(file_id) if file_id else None,
+        "url": url,
+        "thumbnail_url": thumbnail_url,
+        "file_name": file.filename,
+        "file_size": file_size,
+        "file_type": file_type,
+        "uploaded_at": datetime.now(timezone.utc).isoformat()
     }
 

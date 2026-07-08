@@ -155,16 +155,16 @@ async def upload_file(
     # If asset_id was provided, verify asset exists (already done above if needed)
     # The linking is already done by setting asset_id in the record
     
-    # Return public URL as primary identifier - accessible from anywhere
-    # ID is included for internal linking, but URL is the primary access method
+    # Return the payload directly. The ResponseEnvelopeMiddleware wraps this in
+    # {"success", "status_code", "message", "data": <this dict>}. Do NOT add our own
+    # "data" key here or the id ends up double-nested at data.data.id and the
+    # frontend's data.id read comes back undefined ("no ID returned").
     return {
-        "data": {
-            "url": url,  # PRIMARY: Public URL - accessible from anywhere without authentication
-            "thumbnail_url": thumbnail_url,  # For images: same as url
-            "id": str(file_id) if file_id else None,  # Optional: For internal linking only
-            "file_name": file.filename,
-            "file_size": file_size,
-            "file_type": file_type,
-            "uploaded_at": datetime.now(timezone.utc).isoformat()
-        }
+        "url": url,  # PRIMARY: Public URL - accessible from anywhere without authentication
+        "thumbnail_url": thumbnail_url,  # For images: same as url
+        "id": str(file_id) if file_id else None,  # For internal linking
+        "file_name": file.filename,
+        "file_size": file_size,
+        "file_type": file_type,
+        "uploaded_at": datetime.now(timezone.utc).isoformat()
     }
