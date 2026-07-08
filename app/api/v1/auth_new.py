@@ -708,9 +708,23 @@ async def request_otp(request: OTPRequest, db: AsyncSession = Depends(get_db)):
     user = result.scalar_one_or_none()
     if not user:
         raise NotFoundException("User", request.email)
-    otp_code = generate_otp()
-    user.otp_code = otp_code
-    user.otp_expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+    now = datetime.now(timezone.utc)
+    # Reuse a still-valid OTP instead of minting a new one on every call. Register
+    # already generated and emailed a code; if the verify page (or the user) then
+    # hits resend, regenerating would silently invalidate the code the user
+    # already received, so their first (correct) entry gets rejected and only a
+    # later resend "works". Reusing the live code makes the initial code and any
+    # resend identical. Only mint a fresh code once the old one has expired.
+    existing_expiry = user.otp_expires_at
+    if existing_expiry is not None and existing_expiry.tzinfo is None:
+        existing_expiry = existing_expiry.replace(tzinfo=timezone.utc)
+    if user.otp_code and existing_expiry is not None and existing_expiry > now:
+        otp_code = user.otp_code
+    else:
+        otp_code = generate_otp()
+        user.otp_code = otp_code
+    # Refresh the expiry window so the (reused or new) code stays valid.
+    user.otp_expires_at = now + timedelta(minutes=10)
     await db.commit()
     return await _send_otp_and_build_response(user, otp_code)
 
@@ -722,8 +736,10 @@ async def verify_otp(request: OTPVerify, db: AsyncSession = Depends(get_db)):
         if not user:
             raise NotFoundException("User", request.email)
         
-        # Convert both to strings for comparison to handle type mismatches
-        user_otp = str(user.otp_code) if user.otp_code else None
+        # Convert both to strings for comparison to handle type mismatches.
+        # Strip BOTH sides — a stray space on either the stored or submitted code
+        # would otherwise reject a correct OTP.
+        user_otp = str(user.otp_code).strip() if user.otp_code else None
         request_otp = str(request.otp_code).strip()
         
         if not user_otp or user_otp != request_otp:
