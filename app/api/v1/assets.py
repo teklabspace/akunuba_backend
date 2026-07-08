@@ -652,9 +652,11 @@ async def create_asset(
 
         logger.info(f"Asset created: {asset.id} for account {account.id}")
 
-        # Every active ("Active Investment") asset is public in the marketplace.
-        from app.services.asset_listing_service import ensure_listing_for_active_asset
-        await ensure_listing_for_active_asset(db, asset)
+        # NOTE: assets are NOT auto-published to the marketplace on creation.
+        # A listing only becomes public after staff (admin/advisor) complete a
+        # concierge valuation (see maybe_publish_valued_asset in concierge.py),
+        # or when the owner self-lists via POST /marketplace/listings, which
+        # starts at PENDING_APPROVAL and requires staff approval.
 
         return {"data": build_asset_response(asset)}
     except HTTPException:
@@ -1273,10 +1275,10 @@ async def update_asset(
         .where(Asset.id == asset.id)
     )
     asset = result.scalar_one()
-    
-    # If the asset is (still or newly) active, make sure it's on the marketplace.
-    from app.services.asset_listing_service import ensure_listing_for_active_asset
-    await ensure_listing_for_active_asset(db, asset)
+
+    # NOTE: updating an asset does NOT auto-publish it to the marketplace.
+    # Publishing is concierge/staff-gated (see maybe_publish_valued_asset) or
+    # owner self-listing via POST /marketplace/listings (PENDING_APPROVAL).
 
     response = build_asset_response(asset)
 
