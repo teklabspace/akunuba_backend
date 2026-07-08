@@ -1007,6 +1007,13 @@ class EscrowResponse(BaseModel):
     commission: Optional[Decimal] = None
     status: str
     created_at: datetime
+    # Enriched so the investor "Manage Escrow" card renders without a second call.
+    listing_id: Optional[UUID] = None
+    offer_id: Optional[UUID] = None
+    listing_title: Optional[str] = None
+    asset_name: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    released_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -1729,8 +1736,30 @@ async def get_escrow(
     # Check access - buyer or seller
     if escrow.buyer_id != account.id and escrow.seller_id != account.id:
         raise UnauthorizedException("Access denied")
-    
-    return escrow
+
+    # Enrich with the listing title, asset name and thumbnail so the card is
+    # self-contained. Reuses the same asset/photo eager-load as listing reads.
+    listing = (await db.execute(
+        select(MarketplaceListing)
+        .options(_LISTING_ASSET_LOAD)
+        .where(MarketplaceListing.id == escrow.listing_id)
+    )).scalar_one_or_none()
+    asset = listing.asset if listing else None
+    photo = _primary_photo(asset.photos) if asset else None
+    return EscrowResponse(
+        id=escrow.id,
+        amount=escrow.amount,
+        currency=escrow.currency,
+        commission=escrow.commission,
+        status=escrow.status.value if hasattr(escrow.status, "value") else str(escrow.status),
+        created_at=escrow.created_at,
+        listing_id=escrow.listing_id,
+        offer_id=escrow.offer_id,
+        listing_title=listing.title if listing else None,
+        asset_name=asset.name if asset else None,
+        thumbnail_url=(photo.thumbnail_url or photo.url) if photo else None,
+        released_at=escrow.released_at,
+    )
 
 
 @router.post("/escrow/{escrow_id}/fund")

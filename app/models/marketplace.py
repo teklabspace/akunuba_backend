@@ -92,6 +92,9 @@ class EscrowTransaction(Base):
     status = Column(SQLEnum(EscrowStatus), default=EscrowStatus.PENDING, nullable=False)
     stripe_payment_intent_id = Column(String(255))
     released_at = Column(DateTime(timezone=True))
+    # Audit trail for admin force-release / force-refund (and dispute resolution).
+    resolved_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    resolution_reason = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

@@ -12,7 +12,7 @@ from app.models.kyc import KYCVerification, KYCStatus, KYCDocument, KYCCaptureSt
 from app.models.kyb import KYBVerification, KYBStatus
 from app.models.marketplace import MarketplaceListing, ListingStatus, EscrowTransaction, EscrowStatus
 from app.models.support import SupportTicket, TicketStatus
-from app.models.asset import Asset
+from app.models.asset import Asset, AssetPhoto
 from app.core.exceptions import NotFoundException, BadRequestException, ForbiddenException, ConflictException
 from app.core.permissions import Permission, has_permission
 from app.core.security import get_password_hash, generate_reset_token
@@ -319,6 +319,293 @@ async def resolve_dispute(
     
     logger.info(f"Dispute {dispute_id} resolved by admin {current_user.id}")
     return {"message": f"Dispute resolved: {resolution_data.resolution}", "dispute": dispute}
+
+
+# ==================== ESCROW OVERSIGHT ====================
+# /admin/disputes only surfaces DISPUTED escrows. These give admins visibility of
+# EVERY escrow (pending/funded/released/refunded/disputed) with all its ids and
+# both parties, so the admin UI can show the same escrow_id the buyer/seller see.
+
+async def _escrow_party_lookup(db: AsyncSession, account_ids: set) -> Dict[UUID, Dict[str, Any]]:
+    """Batch-resolve account_id -> {account_name, user_email} for buyers/sellers,
+    so the admin escrow views show who is involved instead of bare UUIDs."""
+    if not account_ids:
+        return {}
+    rows = (await db.execute(
+        select(Account.id, Account.account_name, User.email)
+        .join(User, User.id == Account.user_id)
+        .where(Account.id.in_(account_ids))
+    )).all()
+    return {
+        acc_id: {"account_name": name, "user_email": email}
+        for acc_id, name, email in rows
+    }
+
+
+async def _escrow_listing_lookup(db: AsyncSession, listing_ids: set) -> Dict[UUID, Dict[str, Any]]:
+    """Batch-resolve listing_id -> {title, asset_name, thumbnail_url} so the admin
+    escrow table (and investor 'Manage Escrow' card) can render the item without a
+    second call. Thumbnail prefers the asset's primary photo, else its first."""
+    if not listing_ids:
+        return {}
+    listings = (await db.execute(
+        select(MarketplaceListing.id, MarketplaceListing.title, MarketplaceListing.asset_id)
+        .where(MarketplaceListing.id.in_(listing_ids))
+    )).all()
+
+    asset_ids = {asset_id for _, _, asset_id in listings if asset_id}
+    asset_names: Dict[UUID, str] = {}
+    thumbnails: Dict[UUID, str] = {}
+    if asset_ids:
+        asset_names = {
+            aid: name
+            for aid, name in (await db.execute(
+                select(Asset.id, Asset.name).where(Asset.id.in_(asset_ids))
+            )).all()
+        }
+        # One row per asset: primary photo first, else earliest, wins.
+        photo_rows = (await db.execute(
+            select(AssetPhoto.asset_id, AssetPhoto.url, AssetPhoto.is_primary)
+            .where(AssetPhoto.asset_id.in_(asset_ids))
+            .order_by(AssetPhoto.is_primary.desc(), AssetPhoto.created_at.asc())
+        )).all()
+        for aid, url, _is_primary in photo_rows:
+            thumbnails.setdefault(aid, url)  # first row per asset (primary or earliest)
+
+    result: Dict[UUID, Dict[str, Any]] = {}
+    for lid, title, asset_id in listings:
+        result[lid] = {
+            "title": title,
+            "asset_name": asset_names.get(asset_id),
+            "thumbnail_url": thumbnails.get(asset_id),
+        }
+    return result
+
+
+def _admin_escrow_item(
+    escrow: EscrowTransaction,
+    parties: Dict[UUID, Dict[str, Any]],
+    listings: Dict[UUID, Dict[str, Any]],
+) -> Dict[str, Any]:
+    buyer = parties.get(escrow.buyer_id, {})
+    seller = parties.get(escrow.seller_id, {})
+    listing = listings.get(escrow.listing_id, {})
+    return {
+        "id": str(escrow.id),
+        "listing_id": str(escrow.listing_id),
+        "offer_id": str(escrow.offer_id),
+        "listing_title": listing.get("title"),
+        "asset_name": listing.get("asset_name"),
+        "thumbnail_url": listing.get("thumbnail_url"),
+        "status": escrow.status.value if hasattr(escrow.status, "value") else str(escrow.status),
+        "amount": float(escrow.amount),
+        "commission": float(escrow.commission) if escrow.commission is not None else None,
+        "currency": escrow.currency,
+        "stripe_payment_intent_id": escrow.stripe_payment_intent_id,
+        "buyer": {
+            "account_id": str(escrow.buyer_id),
+            "account_name": buyer.get("account_name"),
+            "email": buyer.get("user_email"),
+        },
+        "seller": {
+            "account_id": str(escrow.seller_id),
+            "account_name": seller.get("account_name"),
+            "email": seller.get("user_email"),
+        },
+        "resolved_by": str(escrow.resolved_by) if escrow.resolved_by else None,
+        "resolution_reason": escrow.resolution_reason,
+        "created_at": escrow.created_at.isoformat() if escrow.created_at else None,
+        "released_at": escrow.released_at.isoformat() if escrow.released_at else None,
+    }
+
+
+@router.get("/escrow", response_model=Dict[str, Any])
+async def list_escrows(
+    status_filter: Optional[EscrowStatus] = Query(None, description="Filter by escrow status"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=200),
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """List ALL escrow transactions (admin oversight), newest first, paginated."""
+    base = select(EscrowTransaction)
+    count_q = select(func.count(EscrowTransaction.id))
+    if status_filter:
+        base = base.where(EscrowTransaction.status == status_filter)
+        count_q = count_q.where(EscrowTransaction.status == status_filter)
+
+    total = (await db.execute(count_q)).scalar() or 0
+    rows = (await db.execute(
+        base.order_by(EscrowTransaction.created_at.desc())
+        .offset((page - 1) * limit)
+        .limit(limit)
+    )).scalars().all()
+
+    party_ids = {e.buyer_id for e in rows} | {e.seller_id for e in rows}
+    parties = await _escrow_party_lookup(db, party_ids)
+    listings = await _escrow_listing_lookup(db, {e.listing_id for e in rows})
+
+    return {
+        "items": [_admin_escrow_item(e, parties, listings) for e in rows],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "pages": (total + limit - 1) // limit if limit else 0,
+    }
+
+
+@router.get("/escrow/{escrow_id}", response_model=Dict[str, Any])
+async def get_escrow_admin(
+    escrow_id: UUID,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Full detail for a single escrow (admin oversight), including both parties."""
+    escrow = (await db.execute(
+        select(EscrowTransaction).where(EscrowTransaction.id == escrow_id)
+    )).scalar_one_or_none()
+    if not escrow:
+        raise NotFoundException("Escrow", str(escrow_id))
+    parties = await _escrow_party_lookup(db, {escrow.buyer_id, escrow.seller_id})
+    listings = await _escrow_listing_lookup(db, {escrow.listing_id})
+    return _admin_escrow_item(escrow, parties, listings)
+
+
+class EscrowActionRequest(BaseModel):
+    reason: Optional[str] = None
+
+
+# Admin may force-resolve only from these live states. Terminal states
+# (released/refunded) are rejected → guarantees idempotency (no double pay/refund).
+_RESOLVABLE_ESCROW_STATES = (EscrowStatus.FUNDED, EscrowStatus.DISPUTED)
+
+
+async def _refund_escrow_via_stripe(escrow: EscrowTransaction) -> None:
+    """Best-effort Stripe refund to the buyer. create_refund takes a CHARGE id, so
+    resolve PaymentIntent -> latest charge -> refund (mirrors marketplace.refund_escrow).
+    Logged, not raised — the DB transition is the source of truth and must not be
+    blocked by a Stripe hiccup."""
+    if not escrow.stripe_payment_intent_id:
+        return
+    try:
+        import stripe
+        from app.integrations.stripe_client import StripeClient
+        payment_intent = stripe.PaymentIntent.retrieve(escrow.stripe_payment_intent_id)
+        charges = getattr(payment_intent, "charges", None)
+        if charges and charges.data:
+            StripeClient.create_refund(charges.data[0].id, amount=int(escrow.amount * 100))
+    except Exception as e:
+        logger.error(f"Stripe refund failed for escrow {escrow.id}: {e}")
+
+
+async def _notify_escrow_parties(db: AsyncSession, escrow: EscrowTransaction, title: str, message: str) -> None:
+    """Notify BOTH buyer and seller of an admin escrow action (best-effort)."""
+    from app.services.notification_service import NotificationService
+    from app.models.notification import NotificationType
+    for account_id in {escrow.buyer_id, escrow.seller_id}:
+        try:
+            await NotificationService.create_notification(
+                db=db,
+                account_id=account_id,
+                notification_type=NotificationType.PAYMENT_RECEIVED,
+                title=title,
+                message=message,
+                send_email=False,
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify {account_id} for escrow {escrow.id}: {e}")
+
+
+async def _admin_escrow_response(db: AsyncSession, escrow: EscrowTransaction) -> Dict[str, Any]:
+    parties = await _escrow_party_lookup(db, {escrow.buyer_id, escrow.seller_id})
+    listings = await _escrow_listing_lookup(db, {escrow.listing_id})
+    return _admin_escrow_item(escrow, parties, listings)
+
+
+@router.post("/escrow/{escrow_id}/release", response_model=Dict[str, Any])
+async def admin_release_escrow(
+    escrow_id: UUID,
+    body: Optional[EscrowActionRequest] = None,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin force-release a funded/disputed escrow to the seller.
+
+    Idempotent: an already released/refunded escrow returns 400 INVALID_ESCROW_STATE
+    (no double action). Persists the acting admin + reason for audit.
+    """
+    escrow = (await db.execute(
+        select(EscrowTransaction).where(EscrowTransaction.id == escrow_id)
+    )).scalar_one_or_none()
+    if not escrow:
+        raise NotFoundException("Escrow", str(escrow_id))
+    if escrow.status not in _RESOLVABLE_ESCROW_STATES:
+        raise BadRequestException(
+            f"Cannot release escrow in '{escrow.status.value}' state; must be funded or disputed.",
+            code="INVALID_ESCROW_STATE",
+        )
+
+    reason = body.reason if body else None
+    # Release is a status transition in this system (funds were captured at fund
+    # time; seller payout via Stripe Connect is not wired here — see resolve_dispute).
+    escrow.status = EscrowStatus.RELEASED
+    escrow.released_at = datetime.utcnow()
+    escrow.resolved_by = current_user.id
+    escrow.resolution_reason = reason
+    await db.commit()
+    await db.refresh(escrow)
+
+    await _notify_escrow_parties(
+        db, escrow,
+        "Escrow released",
+        "An administrator released this escrow; funds are released to the seller."
+        + (f" Reason: {reason}" if reason else ""),
+    )
+    logger.info(f"Admin {current_user.id} released escrow {escrow_id} (reason={reason!r})")
+    return await _admin_escrow_response(db, escrow)
+
+
+@router.post("/escrow/{escrow_id}/refund", response_model=Dict[str, Any])
+async def admin_refund_escrow(
+    escrow_id: UUID,
+    body: Optional[EscrowActionRequest] = None,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin force-refund a funded/disputed escrow to the buyer (Stripe refund).
+
+    Idempotent: an already released/refunded escrow returns 400 INVALID_ESCROW_STATE
+    (no double refund). Persists the acting admin + reason for audit.
+    """
+    escrow = (await db.execute(
+        select(EscrowTransaction).where(EscrowTransaction.id == escrow_id)
+    )).scalar_one_or_none()
+    if not escrow:
+        raise NotFoundException("Escrow", str(escrow_id))
+    if escrow.status not in _RESOLVABLE_ESCROW_STATES:
+        raise BadRequestException(
+            f"Cannot refund escrow in '{escrow.status.value}' state; must be funded or disputed.",
+            code="INVALID_ESCROW_STATE",
+        )
+
+    reason = body.reason if body else None
+    # Refund via Stripe BEFORE flipping state so a hard failure is visible; the
+    # state guard above prevents a second call once we reach 'refunded'.
+    await _refund_escrow_via_stripe(escrow)
+    escrow.status = EscrowStatus.REFUNDED
+    escrow.resolved_by = current_user.id
+    escrow.resolution_reason = reason
+    await db.commit()
+    await db.refresh(escrow)
+
+    await _notify_escrow_parties(
+        db, escrow,
+        "Escrow refunded",
+        "An administrator refunded this escrow; funds are returned to the buyer."
+        + (f" Reason: {reason}" if reason else ""),
+    )
+    logger.info(f"Admin {current_user.id} refunded escrow {escrow_id} (reason={reason!r})")
+    return await _admin_escrow_response(db, escrow)
 
 
 # ==================== USER MANAGEMENT ====================
