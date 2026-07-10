@@ -2564,9 +2564,11 @@ async def run_ai_asset_review(
     """
     account = await get_account(current_user=current_user, db=db)
 
-    # Verify asset belongs to account
+    # Verify asset belongs to account, eagerly loading category for type-specific AI prompts
     asset_result = await db.execute(
-        select(Asset).where(and_(Asset.id == asset_id, Asset.account_id == account.id))
+        select(Asset)
+        .options(selectinload(Asset.category))
+        .where(and_(Asset.id == asset_id, Asset.account_id == account.id))
     )
     asset = asset_result.scalar_one_or_none()
     if not asset:

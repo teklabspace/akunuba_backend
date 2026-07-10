@@ -23,6 +23,10 @@ class PaymentMethod(str, Enum):
 
 
 class SubscriptionStatus(str, Enum):
+    # Created in Stripe but the first invoice is unpaid. Grants NO access
+    # (see ACCESS_GRANTING_STATUSES in app/api/deps.py). Promoted to ACTIVE only
+    # by the invoice.payment_succeeded webhook.
+    INCOMPLETE = "incomplete"
     ACTIVE = "active"
     CANCELLED = "cancelled"
     EXPIRED = "expired"

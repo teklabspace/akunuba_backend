@@ -1,6 +1,6 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, Dict, Any, List
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 from decimal import Decimal
 from app.models.asset import (
@@ -8,7 +8,30 @@ from app.models.asset import (
 )
 
 
-class AssetCreate(BaseModel):
+# How far past "now" an acquisition_date may sit before we reject it. A client in a
+# timezone ahead of UTC submits its own midnight-today, which is briefly in the future
+# by UTC's reckoning; anything beyond a day is a genuine data-entry error.
+ACQUISITION_DATE_FUTURE_TOLERANCE = timedelta(days=1)
+
+
+class _AcquisitionDateGuard(BaseModel):
+    """Rejects acquisition dates in the future. Shared by AssetCreate/AssetUpdate."""
+
+    # check_fields=False: the field is declared on the subclasses, not here.
+    @field_validator("acquisition_date", check_fields=False)
+    @classmethod
+    def _reject_future_acquisition_date(cls, value: Optional[datetime]) -> Optional[datetime]:
+        if value is None:
+            return value
+        # Legacy clients may send naive datetimes; treat them as UTC so the
+        # comparison below can never raise on naive-vs-aware.
+        as_aware = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if as_aware > datetime.now(timezone.utc) + ACQUISITION_DATE_FUTURE_TOLERANCE:
+            raise ValueError("Acquisition date cannot be in the future.")
+        return value
+
+
+class AssetCreate(_AcquisitionDateGuard):
     # Category-based fields (new approach)
     category: Optional[str] = None  # Category name
     category_id: Optional[UUID] = None  # Category ID
@@ -52,7 +75,7 @@ class AssetCreate(BaseModel):
     documents: Optional[List[str]] = None
 
 
-class AssetUpdate(BaseModel):
+class AssetUpdate(_AcquisitionDateGuard):
     # All fields from AssetCreate are optional for updates
     category: Optional[str] = None
     category_id: Optional[UUID] = None

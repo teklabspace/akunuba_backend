@@ -23,6 +23,9 @@ class Account(Base):
     is_joint = Column(Boolean, default=False, nullable=False)
     joint_users = Column(String(500))
     tax_id = Column(String(50))
+    # Stripe customer id. Lives on the account, not the subscription: a customer
+    # outlives any single subscription, and payment history keys on it after cancel.
+    stripe_customer_id = Column(String(255), index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

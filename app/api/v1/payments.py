@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import Optional, List, Dict, Any
@@ -14,7 +14,6 @@ from app.integrations.stripe_client import StripeClient
 from app.core.exceptions import NotFoundException, BadRequestException
 from app.utils.logger import logger
 from app.utils.helpers import generate_reference_id
-from app.core.rate_limit import limiter
 from uuid import UUID
 from pydantic import BaseModel
 
@@ -111,254 +110,85 @@ async def create_payment_intent(
     )
 
 
-@router.post("/webhook")
-@limiter.exempt
-async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
-    """Handle Stripe webhook events for payment status updates, subscription changes, and payment method updates"""
-    payload = await request.body()
-    signature = request.headers.get("Stripe-Signature") or request.headers.get("stripe-signature")
-    
-    if not signature:
-        raise HTTPException(status_code=400, detail="Missing signature")
-    
-    try:
-        event = StripeClient.verify_webhook_signature(payload, signature)
-        if not event:
-            raise HTTPException(status_code=400, detail="Invalid webhook signature")
-    except Exception as e:
-        logger.error(f"Webhook verification failed: {e}")
-        raise HTTPException(status_code=400, detail="Invalid webhook signature")
-    
-    event_type = event.get("type")
-    data = event.get("data", {}).get("object", {})
-    processed_at = datetime.now(timezone.utc)
-    
-    # Handle payment_intent events
-    if event_type == "payment_intent.succeeded":
-        payment_intent_id = data.get("id")
-        result = await db.execute(
-            select(Payment).where(Payment.stripe_payment_intent_id == payment_intent_id)
-        )
-        payment = result.scalar_one_or_none()
-        
-        if payment:
-            payment.status = PaymentStatus.COMPLETED
-            charges_data = data.get("charges", {}).get("data", [])
-            if charges_data:
-                payment.stripe_charge_id = charges_data[0].get("id")
-            await db.commit()
-            
-            # If payment is for subscription, activate subscription
-            metadata = data.get("metadata", {})
-            if metadata.get("subscription_id") or metadata.get("action") == "renewal":
-                from app.models.payment import Subscription, SubscriptionStatus
-                subscription_id = metadata.get("subscription_id")
-                if subscription_id:
-                    sub_result = await db.execute(
-                        select(Subscription).where(Subscription.id == subscription_id)
-                    )
-                    subscription = sub_result.scalar_one_or_none()
-                    if subscription:
-                        subscription.status = SubscriptionStatus.ACTIVE
-                        await db.commit()
-            
-            logger.info(f"Payment completed: {payment.id}")
-    
-    elif event_type == "payment_intent.payment_failed":
-        payment_intent_id = data.get("id")
-        result = await db.execute(
-            select(Payment).where(Payment.stripe_payment_intent_id == payment_intent_id)
-        )
-        payment = result.scalar_one_or_none()
-        
-        if payment:
-            payment.status = PaymentStatus.FAILED
-            await db.commit()
-            logger.info(f"Payment failed: {payment.id}")
-    
-    # Handle subscription events
-    elif event_type == "customer.subscription.created":
-        subscription_id = data.get("id")
-        customer_id = data.get("customer")
-        
-        # Find subscription by Stripe subscription ID
-        result = await db.execute(
-            select(Subscription).where(Subscription.stripe_subscription_id == subscription_id)
-        )
-        subscription = result.scalar_one_or_none()
-        
-        if subscription:
-            subscription.status = SubscriptionStatus.ACTIVE
-            if data.get("current_period_start"):
-                subscription.current_period_start = datetime.fromtimestamp(data["current_period_start"], tz=timezone.utc)
-            if data.get("current_period_end"):
-                subscription.current_period_end = datetime.fromtimestamp(data["current_period_end"], tz=timezone.utc)
-            await db.commit()
-            logger.info(f"Subscription created via webhook: {subscription.id}")
-    
-    elif event_type == "customer.subscription.updated":
-        subscription_id = data.get("id")
-        result = await db.execute(
-            select(Subscription).where(Subscription.stripe_subscription_id == subscription_id)
-        )
-        subscription = result.scalar_one_or_none()
-        
-        if subscription:
-            status = data.get("status")
-            if status == "active":
-                subscription.status = SubscriptionStatus.ACTIVE
-            elif status == "canceled":
-                subscription.status = SubscriptionStatus.CANCELLED
-            elif status == "past_due":
-                subscription.status = SubscriptionStatus.PAST_DUE
-            
-            if data.get("current_period_start"):
-                subscription.current_period_start = datetime.fromtimestamp(data["current_period_start"], tz=timezone.utc)
-            if data.get("current_period_end"):
-                subscription.current_period_end = datetime.fromtimestamp(data["current_period_end"], tz=timezone.utc)
-            
-            await db.commit()
-            logger.info(f"Subscription updated via webhook: {subscription.id}")
-    
-    elif event_type == "customer.subscription.deleted":
-        subscription_id = data.get("id")
-        result = await db.execute(
-            select(Subscription).where(Subscription.stripe_subscription_id == subscription_id)
-        )
-        subscription = result.scalar_one_or_none()
-        
-        if subscription:
-            subscription.status = SubscriptionStatus.CANCELLED
-            subscription.cancelled_at = datetime.now(timezone.utc)
-            await db.commit()
-            logger.info(f"Subscription deleted via webhook: {subscription.id}")
-    
-    # Handle invoice events
-    elif event_type == "invoice.payment_succeeded":
-        invoice_id = data.get("id")
-        payment_intent_id = data.get("payment_intent")
-        
-        if payment_intent_id:
-            result = await db.execute(
-                select(Payment).where(Payment.stripe_payment_intent_id == payment_intent_id)
-            )
-            payment = result.scalar_one_or_none()
-            
-            if payment:
-                payment.status = PaymentStatus.COMPLETED
-                # Find invoice linked to this payment
-                invoice_result = await db.execute(
-                    select(Invoice).where(Invoice.payment_id == payment.id)
-                )
-                invoice = invoice_result.scalar_one_or_none()
-                
-                if invoice:
-                    invoice.paid_at = datetime.now(timezone.utc)
-                await db.commit()
-                logger.info(f"Invoice paid: {invoice_id}")
-    
-    elif event_type == "invoice.payment_failed":
-        invoice_id = data.get("id")
-        payment_intent_id = data.get("payment_intent")
-        
-        if payment_intent_id:
-            result = await db.execute(
-                select(Payment).where(Payment.stripe_payment_intent_id == payment_intent_id)
-            )
-            payment = result.scalar_one_or_none()
-            
-            if payment:
-                payment.status = PaymentStatus.FAILED
-                await db.commit()
-                logger.info(f"Invoice payment failed: {invoice_id}")
-    
-    return {
-        "received": True,
-        "event_type": event_type,
-        "processed_at": processed_at.isoformat()
-    }
-
-
 class PaymentHistoryItem(BaseModel):
-    id: UUID
-    amount: Decimal
-    currency: str
-    status: str
-    payment_method: str
-    description: Optional[str] = None
+    id: str
+    invoice_number: Optional[str] = None
     created_at: datetime
+    total: Decimal
+    currency: str
+    # Stripe's own vocabulary: draft | open | paid | uncollectible | void.
+    # NOT our PaymentStatus enum — do not map completed/failed onto it.
+    status: str
+    hosted_invoice_url: Optional[str] = None
+    invoice_pdf: Optional[str] = None
 
 
 class PaymentHistoryResponse(BaseModel):
     data: List[PaymentHistoryItem]
-    total: int
+    has_more: bool
     limit: int
-    offset: int
+    next_starting_after: Optional[str] = None
+
+
+def _map_stripe_invoice(invoice: dict) -> dict:
+    """Stripe invoice -> history item. Amounts arrive in minor units (cents).
+
+    Decimal throughout: float division of 287000 cents yields 2869.9999999999995.
+    """
+    total_minor = invoice.get("total") or 0
+    created = invoice.get("created")
+    return {
+        "id": invoice.get("id"),
+        "invoice_number": invoice.get("number"),
+        "created_at": datetime.fromtimestamp(created, tz=timezone.utc) if created else datetime.now(timezone.utc),
+        "total": (Decimal(total_minor) / Decimal(100)).quantize(Decimal("0.01")),
+        "currency": (invoice.get("currency") or "usd").upper(),
+        "status": invoice.get("status") or "draft",
+        "hosted_invoice_url": invoice.get("hosted_invoice_url"),
+        "invoice_pdf": invoice.get("invoice_pdf"),
+    }
 
 
 @router.get("/history", response_model=PaymentHistoryResponse)
 async def get_payment_history(
     limit: int = Query(20, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-    status_filter: Optional[str] = Query(None, description="Filter by status: completed, pending, failed, refunded"),
+    starting_after: Optional[str] = Query(None, description="Stripe invoice id cursor"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get payment history"""
+    """Investor payment history, read live from Stripe.
+
+    Cursor pagination, not limit/offset: Stripe's API cannot honour an offset and
+    emulating one would silently return wrong pages.
+    """
     account_result = await db.execute(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
-    
+
     if not account:
         raise NotFoundException("Account", str(current_user.id))
-    
-    query = select(Payment).where(Payment.account_id == account.id)
-    
-    # Filter by status if provided
-    if status_filter:
-        status_map = {
-            "completed": PaymentStatus.COMPLETED,
-            "pending": PaymentStatus.PENDING,
-            "failed": PaymentStatus.FAILED,
-            "refunded": PaymentStatus.REFUNDED
-        }
-        if status_filter.lower() in status_map:
-            query = query.where(Payment.status == status_map[status_filter.lower()])
-    
-    # Get total count
-    from sqlalchemy import func
-    total_result = await db.execute(
-        select(func.count(Payment.id)).where(Payment.account_id == account.id)
-    )
-    total = total_result.scalar() or 0
-    
-    # Get paginated results
-    result = await db.execute(
-        query.order_by(Payment.created_at.desc())
-        .limit(limit)
-        .offset(offset)
-    )
-    payments = result.scalars().all()
-    
-    data = [
-        PaymentHistoryItem(
-            id=payment.id,
-            amount=payment.amount,
-            currency=payment.currency,
-            status=payment.status.value,
-            payment_method=payment.payment_method.value,
-            description=payment.description,
-            created_at=payment.created_at
+
+    # No Stripe customer => never subscribed => empty history. Not an error.
+    if not account.stripe_customer_id:
+        return PaymentHistoryResponse(data=[], has_more=False, limit=limit, next_starting_after=None)
+
+    try:
+        page = StripeClient.list_invoices(
+            customer_id=account.stripe_customer_id, limit=limit, starting_after=starting_after
         )
-        for payment in payments
-    ]
-    
+    except Exception as e:
+        # An empty list means "no invoices". It must never mean "Stripe is down."
+        logger.error(f"Stripe invoice list failed for account {account.id}: {e}")
+        raise HTTPException(status_code=502, detail="Billing provider unavailable. Please try again.")
+
+    rows = [_map_stripe_invoice(inv) for inv in page.get("data", [])]
+    has_more = bool(page.get("has_more"))
     return PaymentHistoryResponse(
-        data=data,
-        total=total,
+        data=[PaymentHistoryItem(**r) for r in rows],
+        has_more=has_more,
         limit=limit,
-        offset=offset
+        next_starting_after=rows[-1]["id"] if rows and has_more else None,
     )
 
 

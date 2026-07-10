@@ -39,7 +39,16 @@ class Settings(BaseSettings):
     STRIPE_SECRET_KEY: str
     STRIPE_PUBLISHABLE_KEY: str
     STRIPE_WEBHOOK_SECRET: str
-    
+
+    # Stripe Price IDs (test-mode objects, created via lookup_key akunuba_<tier>_<cycle>).
+    # Unset values must fail loudly at purchase time — see app/core/stripe_pricing.py.
+    STRIPE_PRICE_STARTER_MONTHLY: str = ""
+    STRIPE_PRICE_STARTER_ANNUAL: str = ""
+    STRIPE_PRICE_PRO_MONTHLY: str = ""
+    STRIPE_PRICE_PRO_ANNUAL: str = ""
+    STRIPE_PRICE_PREMIUM_MONTHLY: str = ""
+    STRIPE_PRICE_PREMIUM_ANNUAL: str = ""
+
     PLAID_CLIENT_ID: str = ""
     PLAID_SECRET_KEY: str = ""
     PLAID_PUBLIC_KEY: str = ""

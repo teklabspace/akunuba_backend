@@ -3,18 +3,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from typing import Optional, List, Dict, Any
 from decimal import Decimal
-from datetime import datetime, timedelta, timezone
-import json
+from datetime import datetime, timezone
 from app.database import get_db
 from app.api.deps import get_current_user
 from app.models.user import User, Role
 from app.models.account import Account
 from app.models.payment import Subscription, SubscriptionPlan, SubscriptionStatus
 from app.models.kyc import KYCVerification, KYCStatus
-from app.integrations.stripe_client import StripeClient
+from app.integrations.stripe_client import StripeClient, incomplete_subscription_action
+from app.core.stripe_pricing import resolve_price_id
 from app.core.exceptions import NotFoundException, BadRequestException, ConflictException, ForbiddenException
 from app.core.responses import success_envelope
-from app.core.rate_limit import limiter
 from app.utils.logger import logger
 from uuid import UUID
 from pydantic import BaseModel
@@ -166,6 +165,60 @@ PLAN_ID_TO_ENUM = {
     "pro": SubscriptionPlan.MONTHLY,
     "premium": SubscriptionPlan.ANNUAL,
 }
+
+
+def _stripe_ts_to_dt(ts):
+    """Stripe unix timestamp -> aware UTC datetime. Periods come from Stripe, never
+    computed locally: a locally-invented period_end drifts from what Stripe bills."""
+    return datetime.fromtimestamp(ts, tz=timezone.utc) if ts else None
+
+
+def _reusable_stripe_subscription(subscription, desired_price_id: str):
+    """Resolve an existing INCOMPLETE subscription before creating another one.
+
+    Returns the Stripe subscription to reuse, or None if the caller should create a
+    fresh one. Raises ConflictException when Stripe says the customer already paid.
+
+    Without this, a second POST /subscriptions on an incomplete row silently created a
+    second Stripe subscription and orphaned the first — which kept a finalized, payable
+    invoice. Paying that orphan charged the customer for a subscription the webhook
+    could no longer match, granting nothing.
+    """
+    if not subscription or subscription.status != SubscriptionStatus.INCOMPLETE:
+        return None
+    if not subscription.stripe_subscription_id:
+        return None
+
+    try:
+        prior = StripeClient.retrieve_subscription(subscription.stripe_subscription_id)
+    except Exception as e:
+        # Gone from Stripe (or unreachable): nothing payable to orphan.
+        logger.warning(f"Could not retrieve prior subscription {subscription.stripe_subscription_id}: {e}")
+        return None
+
+    action = incomplete_subscription_action(prior, desired_price_id)
+
+    if action == "conflict":
+        # Stripe already took the money; our row is stale because a webhook was missed.
+        # Creating another subscription here is exactly the double-charge.
+        logger.error(
+            f"Subscription {subscription.id} is INCOMPLETE locally but "
+            f"{prior.get('status')} in Stripe — webhook missed."
+        )
+        raise ConflictException(
+            "You already have an active subscription. Use the upgrade flow to change plans.",
+            code="SUBSCRIPTION_ALREADY_EXISTS",
+        )
+
+    if action == "reuse":
+        logger.info(f"Reusing incomplete Stripe subscription {prior['id']} for {subscription.id}")
+        return prior
+
+    if action == "replace":
+        logger.info(f"Discarding incomplete Stripe subscription {prior['id']} (plan changed)")
+        StripeClient.discard_incomplete_subscription(prior)
+
+    return None
 
 PLAN_ENUM_TO_ID = {
     SubscriptionPlan.FREE: "starter",
@@ -376,63 +429,67 @@ async def create_subscription(
     # Map plan_id to internal enum
     internal_plan = PLAN_ID_TO_ENUM.get(plan_id, SubscriptionPlan.FREE)
     
-    # Create payment intent via Stripe
-    payment_intent = None
+    # Resolve the Stripe price for this plan+cycle. Fails loudly if unconfigured —
+    # a falsy price id must never yield a free subscription.
     try:
-        # Create or get Stripe customer
-        stripe_customer = StripeClient.create_customer(
-            email=current_user.email,
-            name=f"{current_user.first_name} {current_user.last_name}",
-            metadata={"account_id": str(account.id)}
-        )
-        
-        # Create payment intent
-        stripe_payment_intent = StripeClient.create_payment_intent(
-            amount=int(final_amount * 100),  # Convert to cents
-            currency="usd",
-            metadata={
-                "account_id": str(account.id),
-                "user_id": str(current_user.id),
-                "plan_id": plan_id,
-                "billing_cycle": subscription_data.billing_cycle
-            }
-        )
-        
-        payment_intent = PaymentIntentResponse(
-            id=stripe_payment_intent["id"],
-            client_secret=stripe_payment_intent["client_secret"],
-            status=stripe_payment_intent["status"],
-            amount=final_amount,
-            currency="USD"
-        )
-    except Exception as e:
-        logger.error(f"Failed to create Stripe payment intent: {e}")
-        # Return 402 if payment is required
-        if final_amount > 0:
-            raise HTTPException(
-                status_code=402,
-                detail="Payment method required",
-                headers={"payment_intent": json.dumps({
-                    "id": "pi_xxx",
-                    "client_secret": "pi_xxx_secret_xxx"
-                })}
+        price_id = resolve_price_id(plan_id, subscription_data.billing_cycle)
+    except ValueError as e:
+        logger.error(f"Stripe price not configured: {e}")
+        raise HTTPException(status_code=500, detail="Billing is not configured. Contact support.")
+
+    # A previous checkout the user abandoned must be reused or properly discarded —
+    # never left behind with a payable invoice while we mint a second subscription.
+    # Raises ConflictException if Stripe says they already paid.
+    stripe_sub = _reusable_stripe_subscription(existing, price_id)
+
+    # Reuse the account's Stripe customer if we have one; otherwise create and persist it.
+    try:
+        if account.stripe_customer_id:
+            customer_id = account.stripe_customer_id
+        else:
+            customer = StripeClient.get_or_create_customer(
+                email=current_user.email,
+                name=f"{current_user.first_name} {current_user.last_name}",
+                metadata={"account_id": str(account.id)},
             )
-    
-    # Calculate period dates
-    now = datetime.now(timezone.utc)
-    if subscription_data.billing_cycle == "monthly":
-        period_end = now + timedelta(days=30)
-    else:
-        period_end = now + timedelta(days=365)
-    
-    # Create or update subscription
+            customer_id = customer["id"]
+            account.stripe_customer_id = customer_id
+
+        if stripe_sub is None:
+            stripe_sub = StripeClient.create_subscription(
+                customer_id=customer_id,
+                price_id=price_id,
+                metadata={
+                    "account_id": str(account.id),
+                    "user_id": str(current_user.id),
+                    "plan_id": plan_id,
+                    "billing_cycle": subscription_data.billing_cycle,
+                },
+            )
+    except ConflictException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to create Stripe subscription: {e}")
+        raise HTTPException(status_code=502, detail="Could not reach the payment provider. Please try again.")
+
+    latest_invoice = stripe_sub.get("latest_invoice") or {}
+    intent = latest_invoice.get("payment_intent") or {}
+    client_secret = intent.get("client_secret")
+
+    period_start = _stripe_ts_to_dt(stripe_sub.get("current_period_start"))
+    period_end = _stripe_ts_to_dt(stripe_sub.get("current_period_end"))
+
+    # INCOMPLETE until Stripe's invoice.payment_succeeded webhook says otherwise.
+    # Activation lives in the webhook, never here: writing ACTIVE at purchase time is
+    # how every subscription in this database ended up paid-for-free.
     if existing:
         existing.plan = internal_plan
         existing.plan_tier = plan_id
         existing.billing_cycle = subscription_data.billing_cycle
-        existing.status = SubscriptionStatus.ACTIVE
+        existing.status = SubscriptionStatus.INCOMPLETE
         existing.amount = final_amount
-        existing.current_period_start = now
+        existing.stripe_subscription_id = stripe_sub["id"]
+        existing.current_period_start = period_start
         existing.current_period_end = period_end
         existing.cancel_at_period_end = False
         existing.cancelled_at = None
@@ -443,18 +500,31 @@ async def create_subscription(
             plan=internal_plan,
             plan_tier=plan_id,
             billing_cycle=subscription_data.billing_cycle,
-            status=SubscriptionStatus.ACTIVE,
+            status=SubscriptionStatus.INCOMPLETE,
             amount=final_amount,
             currency="USD",
-            current_period_start=now,
+            stripe_subscription_id=stripe_sub["id"],
+            current_period_start=period_start,
             current_period_end=period_end,
             cancel_at_period_end=False,
         )
         db.add(subscription)
-    
+
     await db.commit()
     await db.refresh(subscription)
-    
+
+    payment_intent = (
+        PaymentIntentResponse(
+            id=intent.get("id", ""),
+            client_secret=client_secret,
+            status=intent.get("status", "requires_payment_method"),
+            amount=final_amount,
+            currency="USD",
+        )
+        if client_secret
+        else None
+    )
+
     # Build response
     subscription_response = SubscriptionResponse(
         id=subscription.id,
@@ -695,57 +765,73 @@ async def renew_subscription(
         raise BadRequestException("Subscription is already active", code="SUBSCRIPTION_ALREADY_ACTIVE")
 
     # Renew on the same tier + cycle the user previously had.
-    now = datetime.now(timezone.utc)
     billing_cycle = get_billing_cycle(subscription)
-    period_end = now + (timedelta(days=365) if billing_cycle == "annual" else timedelta(days=30))
-
-    # Check if payment is required
     plan_id = get_plan_tier(subscription)
     plan_config = PLANS_CONFIG.get(plan_id, PLANS_CONFIG["starter"])
-    
-    if billing_cycle == "monthly":
-        renewal_amount = plan_config["monthly_price"]
-    else:
-        renewal_amount = plan_config["annual_price"]
-    
-    payment_intent = None
-    if renewal_amount and renewal_amount > 0:
-        try:
-            stripe_customer = StripeClient.create_customer(
+
+    renewal_amount = (
+        plan_config["monthly_price"] if billing_cycle == "monthly" else plan_config["annual_price"]
+    )
+
+    # Renew targets a cancelled/expired subscription, so there is no live Stripe
+    # subscription to reuse — create a fresh one, exactly as purchase does.
+    try:
+        price_id = resolve_price_id(plan_id, billing_cycle)
+    except ValueError as e:
+        logger.error(f"Stripe price not configured: {e}")
+        raise HTTPException(status_code=500, detail="Billing is not configured. Contact support.")
+
+    # Renew called twice leaves the same orphaned, payable invoice as purchase does.
+    stripe_sub = _reusable_stripe_subscription(subscription, price_id)
+
+    try:
+        if account.stripe_customer_id:
+            customer_id = account.stripe_customer_id
+        else:
+            customer = StripeClient.get_or_create_customer(
                 email=current_user.email,
                 name=f"{current_user.first_name} {current_user.last_name}",
-                metadata={"account_id": str(account.id)}
+                metadata={"account_id": str(account.id)},
             )
-            
-            stripe_payment_intent = StripeClient.create_payment_intent(
-                amount=int(renewal_amount * 100),
-                currency="usd",
+            customer_id = customer["id"]
+            account.stripe_customer_id = customer_id
+
+        if stripe_sub is None:
+            stripe_sub = StripeClient.create_subscription(
+                customer_id=customer_id,
+                price_id=price_id,
                 metadata={
                     "account_id": str(account.id),
-                    "subscription_id": str(subscription.id),
-                    "action": "renewal"
-                }
+                    "user_id": str(current_user.id),
+                    "plan_id": plan_id,
+                    "billing_cycle": billing_cycle,
+                    "action": "renewal",
+                },
             )
-            
-            payment_intent = {
-                "id": stripe_payment_intent["id"],
-                "client_secret": stripe_payment_intent["client_secret"]
-            }
-        except Exception as e:
-            logger.error(f"Failed to create payment intent for renewal: {e}")
-            raise HTTPException(
-                status_code=402,
-                detail="Payment method required for renewal",
-                headers={"payment_intent": json.dumps(payment_intent) if payment_intent else "{}"}
-            )
-    
-    subscription.status = SubscriptionStatus.ACTIVE
+    except ConflictException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to create Stripe subscription on renew: {e}")
+        raise HTTPException(status_code=502, detail="Could not reach the payment provider. Please try again.")
+
+    latest_invoice = stripe_sub.get("latest_invoice") or {}
+    intent = latest_invoice.get("payment_intent") or {}
+    client_secret = intent.get("client_secret")
+
+    payment_intent = (
+        {"id": intent.get("id"), "client_secret": client_secret} if client_secret else None
+    )
+
+    # INCOMPLETE, not ACTIVE. invoice.payment_succeeded promotes it. Renewing straight
+    # to ACTIVE was the second of three doors into free access.
+    subscription.status = SubscriptionStatus.INCOMPLETE
+    subscription.stripe_subscription_id = stripe_sub["id"]
     subscription.plan_tier = plan_id
     subscription.billing_cycle = billing_cycle
     subscription.cancel_at_period_end = False
     subscription.cancelled_at = None
-    subscription.current_period_start = now
-    subscription.current_period_end = period_end
+    subscription.current_period_start = _stripe_ts_to_dt(stripe_sub.get("current_period_start"))
+    subscription.current_period_end = _stripe_ts_to_dt(stripe_sub.get("current_period_end"))
     subscription.amount = renewal_amount if renewal_amount else subscription.amount
 
     await db.commit()
@@ -765,10 +851,15 @@ async def renew_subscription(
         created_at=subscription.created_at
     )
     
-    logger.info(f"Subscription renewed: {subscription.id}")
+    logger.info(f"Subscription renewal started (incomplete): {subscription.id}")
     return {
         "subscription": subscription_response,
-        "message": "Subscription renewed successfully"
+        "payment_intent": payment_intent,
+        # The plan is NOT live yet. The frontend must confirm the payment with this
+        # client_secret; invoice.payment_succeeded then promotes it to active.
+        "requires_action": bool(client_secret),
+        "client_secret": client_secret,
+        "message": "Renewal pending payment confirmation",
     }
 
 
@@ -840,114 +931,85 @@ async def upgrade_subscription(
     if new_amount is None:
         raise BadRequestException("This plan requires custom pricing. Please contact support.", code="PLAN_REQUIRES_CUSTOM_PRICING")
     
-    # Calculate prorated amount
-    now = datetime.now(timezone.utc)
-    if subscription.current_period_end:
-        period_end = subscription.current_period_end
-        if period_end.tzinfo is None:
-            period_end = period_end.replace(tzinfo=timezone.utc)
-        days_remaining = (period_end - now).days
-        total_days = (subscription.current_period_end - subscription.current_period_start).days if subscription.current_period_start else 30
-        
-        if current_billing_cycle == "monthly":
-            old_daily_rate = float(current_plan_config["monthly_price"] or 0) / 30
-        else:
-            old_daily_rate = float(current_plan_config["annual_price"] or 0) / 365
-        
-        if new_billing_cycle == "monthly":
-            new_daily_rate = float(new_amount) / 30
-        else:
-            new_daily_rate = float(new_amount) / 365
-        
-        prorated_amount = Decimal(str((new_daily_rate - old_daily_rate) * days_remaining))
-    else:
-        prorated_amount = Decimal("0.00")
-    
-    # Map to internal plan enum
-    new_internal_plan = PLAN_ID_TO_ENUM.get(new_plan_id, SubscriptionPlan.FREE)
-    
-    # Calculate new period end
-    if new_billing_cycle == "monthly":
-        new_period_end = now + timedelta(days=30)
-    else:
-        new_period_end = now + timedelta(days=365)
-    
-    # Create payment intent if upgrade requires payment
-    payment_intent = None
-    if prorated_amount > 0:
-        try:
-            stripe_customer = StripeClient.create_customer(
-                email=current_user.email,
-                name=f"{current_user.first_name} {current_user.last_name}",
-                metadata={"account_id": str(account.id)}
-            )
-            
-            stripe_payment_intent = StripeClient.create_payment_intent(
-                amount=int(prorated_amount * 100),
-                currency="usd",
-                metadata={
-                    "account_id": str(account.id),
-                    "subscription_id": str(subscription.id),
-                    "action": "upgrade",
-                    "new_plan_id": new_plan_id
-                }
-            )
-            
-            payment_intent = {
-                "id": stripe_payment_intent["id"],
-                "client_secret": stripe_payment_intent["client_secret"],
-                "status": stripe_payment_intent.get("status"),
-                "amount": float(prorated_amount)
-            }
-        except Exception as e:
-            logger.error(f"Failed to create payment intent for upgrade: {e}")
-            raise HTTPException(
-                status_code=402,
-                detail="Payment required for plan upgrade",
-                headers={"payment_intent": json.dumps(payment_intent) if payment_intent else "{}"}
-            )
-    
-    # Update subscription
-    subscription.plan = new_internal_plan
-    subscription.plan_tier = new_plan_id
-    subscription.billing_cycle = new_billing_cycle
-    subscription.amount = new_amount
-    subscription.current_period_start = now
-    subscription.current_period_end = new_period_end
-    # A plan change clears any pending end-of-period cancellation.
+    # Proration is Stripe's job, not ours. It knows the exact unused time on the
+    # current invoice; a locally-computed daily rate only ever approximates it.
+    if not subscription.stripe_subscription_id:
+        raise BadRequestException(
+            "This subscription predates Stripe billing and cannot be upgraded in place. "
+            "Please cancel and re-subscribe.",
+            code="SUBSCRIPTION_NOT_STRIPE_BACKED",
+        )
+
+    try:
+        new_price_id = resolve_price_id(new_plan_id, new_billing_cycle)
+    except ValueError as e:
+        logger.error(f"Stripe price not configured: {e}")
+        raise HTTPException(status_code=500, detail="Billing is not configured. Contact support.")
+
+    try:
+        stripe_sub = StripeClient.update_subscription_price(
+            subscription.stripe_subscription_id, new_price_id
+        )
+    except Exception as e:
+        logger.error(f"Failed to upgrade Stripe subscription: {e}")
+        raise HTTPException(status_code=502, detail="Could not reach the payment provider. Please try again.")
+
+    latest_invoice = stripe_sub.get("latest_invoice") or {}
+    intent = latest_invoice.get("payment_intent") or {}
+    client_secret = intent.get("client_secret")
+
+    payment_intent = (
+        {
+            "id": intent.get("id"),
+            "client_secret": client_secret,
+            "status": intent.get("status"),
+            "amount": float((Decimal(latest_invoice.get("amount_due") or 0)) / Decimal(100)),
+        }
+        if client_secret
+        else None
+    )
+
+    # Deliberately do NOT mutate plan_tier / amount / period here. Stripe has issued a
+    # proration invoice; customer.subscription.updated syncs local state from the price
+    # metadata once it is paid. Writing the new plan now would grant it before the money
+    # moves — that was the third door into free access.
     subscription.cancel_at_period_end = False
     subscription.cancelled_at = None
 
     await db.commit()
     await db.refresh(subscription)
 
-    # Build response
+    # Reports the CURRENT plan, not the requested one. The requested plan lands via webhook.
+    current_plan_id = get_plan_tier(subscription)
+    current_config = PLANS_CONFIG.get(current_plan_id, PLANS_CONFIG["starter"])
     subscription_response = SubscriptionResponse(
         id=subscription.id,
-        plan_id=new_plan_id,
-        plan_name=new_plan_config["name"],
+        plan_id=current_plan_id,
+        plan_name=current_config["name"],
         status=subscription.status.value,
         amount=subscription.amount,
         currency=subscription.currency,
-        billing_cycle=new_billing_cycle,
+        billing_cycle=get_billing_cycle(subscription),
         current_period_start=subscription.current_period_start,
         current_period_end=subscription.current_period_end,
         cancel_at_period_end=subscription.cancel_at_period_end,
         canceled_at=subscription.cancelled_at,
         created_at=subscription.created_at
     )
-    
+
     requires_action = bool(
         payment_intent and payment_intent.get("status") not in ("succeeded", "processing")
     )
 
-    logger.info(f"Subscription upgraded/downgraded: {subscription.id}")
+    logger.info(f"Subscription upgrade requested (pending payment): {subscription.id} -> {new_plan_id}")
     return {
         "subscription": subscription_response,
         "payment_intent": payment_intent,
         "requires_action": requires_action,
         "client_secret": payment_intent.get("client_secret") if payment_intent else None,
-        "message": "Subscription updated successfully"
+        "pending_plan_id": new_plan_id,
+        "pending_billing_cycle": new_billing_cycle,
+        "message": "Upgrade pending payment confirmation",
     }
 
 
@@ -1013,73 +1075,6 @@ async def get_subscription_history(
         "limit": limit,
         "offset": offset
     }
-
-
-@router.post("/webhook")
-@limiter.exempt
-async def subscription_webhook(
-    request: Request,
-    db: AsyncSession = Depends(get_db)
-):
-    """Handle Stripe subscription webhook events"""
-    payload = await request.body()
-    signature = request.headers.get("Stripe-Signature") or request.headers.get("stripe-signature")
-
-    if not signature:
-        raise HTTPException(status_code=400, detail="Missing signature")
-
-    try:
-        event = StripeClient.verify_webhook_signature(payload, signature)
-        if not event:
-            raise HTTPException(status_code=400, detail="Invalid signature")
-    except Exception as e:
-        logger.error(f"Webhook verification failed: {e}")
-        raise HTTPException(status_code=400, detail="Webhook verification failed")
-
-    event_type = event.get("type")
-    data = event.get("data", {}).get("object", {})
-
-    if event_type == "customer.subscription.updated":
-        subscription_id = data.get("id")
-        result = await db.execute(
-            select(Subscription).where(Subscription.stripe_subscription_id == subscription_id)
-        )
-        subscription = result.scalar_one_or_none()
-
-        if subscription:
-            stripe_status = data.get("status")
-            if stripe_status == "active":
-                subscription.status = SubscriptionStatus.ACTIVE
-            elif stripe_status == "canceled":
-                subscription.status = SubscriptionStatus.CANCELLED
-            elif stripe_status == "past_due":
-                subscription.status = SubscriptionStatus.PAST_DUE
-
-            if data.get("current_period_start"):
-                subscription.current_period_start = datetime.fromtimestamp(
-                    data["current_period_start"], tz=timezone.utc
-                )
-            if data.get("current_period_end"):
-                subscription.current_period_end = datetime.fromtimestamp(
-                    data["current_period_end"], tz=timezone.utc
-                )
-            await db.commit()
-            logger.info(f"Subscription updated via webhook: {subscription.id}")
-
-    elif event_type == "customer.subscription.deleted":
-        subscription_id = data.get("id")
-        result = await db.execute(
-            select(Subscription).where(Subscription.stripe_subscription_id == subscription_id)
-        )
-        subscription = result.scalar_one_or_none()
-
-        if subscription:
-            subscription.status = SubscriptionStatus.CANCELLED
-            subscription.cancelled_at = datetime.now(timezone.utc)
-            await db.commit()
-            logger.info(f"Subscription cancelled via webhook: {subscription.id}")
-
-    return {"status": "success"}
 
 
 @router.get("/permissions")

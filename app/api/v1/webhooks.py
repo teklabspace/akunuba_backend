@@ -16,7 +16,9 @@ from app.database import get_db
 from app.config import settings
 from app.models.kyc import KYCVerification, KYCStatus
 from app.models.banking import LinkedAccount
+from app.models.payment import Subscription, SubscriptionStatus
 from app.integrations.plaid_client import PlaidClient
+from app.integrations.stripe_client import StripeClient, subscription_id_from_invoice
 from app.services.banking_sync_service import sync_linked_account_transactions, refresh_linked_account_balance
 from app.core.metrics import record_webhook_failure
 from app.core.rate_limit import limiter
@@ -180,6 +182,134 @@ async def persona_webhook(
         logger.error(f"Persona webhook error: {e}", exc_info=True)
         await db.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Webhook processing failed")
+
+
+def _period_from_stripe_subscription(sub: dict) -> tuple:
+    """(start, end) as aware UTC datetimes, or (None, None)."""
+    from datetime import timezone as _tz
+
+    def to_dt(ts):
+        return datetime.fromtimestamp(ts, tz=_tz.utc) if ts else None
+
+    return to_dt(sub.get("current_period_start")), to_dt(sub.get("current_period_end"))
+
+
+def _plan_from_stripe_subscription(sub: dict):
+    """(plan_tier, billing_cycle, amount) from the subscription's active price.
+
+    Our Stripe prices carry plan_tier / billing_cycle in metadata (set at catalog
+    creation), so Stripe is the source of truth for which plan the customer actually
+    pays for. This is what lets an upgrade land locally only after its invoice is paid.
+    """
+    from decimal import Decimal
+
+    items = ((sub.get("items") or {}).get("data") or [])
+    if not items:
+        return None, None, None
+    price = items[0].get("price") or {}
+    meta = price.get("metadata") or {}
+    unit_amount = price.get("unit_amount")
+    amount = (Decimal(unit_amount) / Decimal(100)) if unit_amount is not None else None
+    return meta.get("plan_tier"), meta.get("billing_cycle"), amount
+
+
+async def _apply_stripe_subscription_event(db: AsyncSession, event: dict) -> str:
+    """Apply one Stripe event to the local Subscription row. Idempotent by design:
+    Stripe redelivers, and a second invoice.payment_succeeded must not double-apply."""
+    event_type = event.get("type")
+    obj = (event.get("data") or {}).get("object") or {}
+
+    if event_type in ("invoice.payment_succeeded", "invoice.payment_failed"):
+        sub_id = subscription_id_from_invoice(obj)
+        if not sub_id:
+            logger.info(f"Stripe {event_type}: invoice has no subscription; ignoring")
+            return "ignored_no_subscription"
+    elif event_type in ("customer.subscription.updated", "customer.subscription.deleted"):
+        sub_id = obj.get("id")
+    else:
+        return "ignored_unhandled_type"
+
+    if not sub_id:
+        logger.warning(f"Stripe {event_type}: could not resolve subscription id")
+        return "ignored_no_id"
+
+    result = await db.execute(
+        select(Subscription).where(Subscription.stripe_subscription_id == sub_id)
+    )
+    subscription = result.scalar_one_or_none()
+    if not subscription:
+        logger.info(f"Stripe {event_type}: no local subscription for {sub_id}")
+        return "ignored_unknown_subscription"
+
+    if event_type == "invoice.payment_succeeded":
+        if subscription.status == SubscriptionStatus.ACTIVE:
+            return "noop_already_active"
+        subscription.status = SubscriptionStatus.ACTIVE
+    elif event_type == "invoice.payment_failed":
+        subscription.status = SubscriptionStatus.PAST_DUE
+    elif event_type == "customer.subscription.deleted":
+        subscription.status = SubscriptionStatus.CANCELLED
+        subscription.cancelled_at = datetime.utcnow()
+    elif event_type == "customer.subscription.updated":
+        start, end = _period_from_stripe_subscription(obj)
+        if start:
+            subscription.current_period_start = start
+        if end:
+            subscription.current_period_end = end
+
+        tier, cycle, amount = _plan_from_stripe_subscription(obj)
+        if tier:
+            subscription.plan_tier = tier
+        if cycle:
+            subscription.billing_cycle = cycle
+        if amount is not None:
+            subscription.amount = amount
+
+        if obj.get("status") == "canceled":
+            subscription.status = SubscriptionStatus.CANCELLED
+        elif obj.get("status") == "active" and subscription.status != SubscriptionStatus.ACTIVE:
+            subscription.status = SubscriptionStatus.ACTIVE
+
+    await db.commit()
+    logger.info(f"Stripe {event_type}: subscription {subscription.id} -> {subscription.status}")
+    return "applied"
+
+
+@router.post("/stripe")
+@limiter.exempt
+async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
+    """Canonical Stripe webhook. Open router — Stripe cannot authenticate.
+
+    Security rests on HMAC signature verification, exactly as Persona's does. Never
+    mount this under a router carrying an auth or KYC dependency: the previous home
+    (/api/v1/payments/webhook) was KYC-gated and returned 401 to every Stripe event.
+    """
+    body = await request.body()
+    signature = request.headers.get("Stripe-Signature") or request.headers.get("stripe-signature")
+    if not signature:
+        record_webhook_failure("stripe")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing signature")
+
+    if not settings.STRIPE_WEBHOOK_SECRET:
+        logger.error("STRIPE_WEBHOOK_SECRET not set; rejecting webhook (fail closed)")
+        record_webhook_failure("stripe")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid signature")
+
+    event = StripeClient.verify_webhook_signature(body, signature)
+    if not event:
+        record_webhook_failure("stripe")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid signature")
+
+    try:
+        outcome = await _apply_stripe_subscription_event(db, event)
+        return {"received": True, "outcome": outcome}
+    except Exception as e:
+        record_webhook_failure("stripe")
+        logger.error(f"Stripe webhook error: {e}", exc_info=True)
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Webhook processing failed"
+        )
 
 
 def _get_plaid_verification_key(key_id: str) -> dict:

@@ -84,9 +84,30 @@ services:
       - key: PLAID_ENV
         value: sandbox
 
+      # Stripe subscription billing
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false # Signing secret of the endpoint in Stripe > Developers > Webhooks.
+                    # Editing an endpoint's URL keeps this secret; creating a new one does not.
+      - key: STRIPE_PRICE_STARTER_MONTHLY
+        sync: false # lookup_key akunuba_starter_monthly
+      - key: STRIPE_PRICE_STARTER_ANNUAL
+        sync: false # lookup_key akunuba_starter_annual
+      - key: STRIPE_PRICE_PRO_MONTHLY
+        sync: false # lookup_key akunuba_pro_monthly
+      - key: STRIPE_PRICE_PRO_ANNUAL
+        sync: false # lookup_key akunuba_pro_annual
+      - key: STRIPE_PRICE_PREMIUM_MONTHLY
+        sync: false # lookup_key akunuba_premium_monthly
+      - key: STRIPE_PRICE_PREMIUM_ANNUAL
+        sync: false # lookup_key akunuba_premium_annual
+
       # Persona
       - key: PERSONA_API_KEY
         sync: false # Set this manually in Render dashboard
+      - key: PERSONA_USE_REDIRECT_URI
+        sync: false # "true" only after the redirect URI is allowlisted in Persona
+      - key: PERSONA_WEBHOOK_SECRET
+        sync: false # HMAC secret; the Persona webhook fails closed without it
       - key: PERSONA_TEMPLATE_ID
         sync: false # Set this manually in Render dashboard
       - key: PERSONA_ENVIRONMENT_ID
