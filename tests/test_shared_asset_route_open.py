@@ -68,6 +68,37 @@ def test_gone_exception_contract():
     assert exc.code == "SHARE_LINK_EXPIRED"
 
 
+def test_email_verified_check_uses_either_flag():
+    # Regression: User.is_verified is the KYC/investor flag (kyc.py overwrites
+    # it, often to False), NOT email verification. Every real verified-email
+    # account had is_verified=False and got 403 EMAIL_NOT_VERIFIED from
+    # shared-with-me. The canonical check accepts either signal.
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from app.api.v1.subscriptions import is_email_verified
+
+    ts = datetime.now(timezone.utc)
+    assert is_email_verified(SimpleNamespace(is_verified=False, email_verified_at=ts))
+    assert is_email_verified(SimpleNamespace(is_verified=True, email_verified_at=None))
+    assert not is_email_verified(SimpleNamespace(is_verified=False, email_verified_at=None))
+
+
+def test_shared_with_me_gates_on_canonical_email_check():
+    # Pin the endpoint to is_email_verified — reading current_user.is_verified
+    # directly reintroduces the KYC-flag lockout.
+    import inspect
+
+    from app.api.v1.assets import get_assets_shared_with_me
+
+    src = inspect.getsource(get_assets_shared_with_me)
+    assert "is_email_verified(" in src, "shared-with-me must use the canonical email check"
+    assert "current_user.is_verified" not in src, (
+        "current_user.is_verified is the KYC/investor flag; using it locks out "
+        "every email-verified account whose KYC state ever changed"
+    )
+
+
 def _run_standalone():
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failures = 0

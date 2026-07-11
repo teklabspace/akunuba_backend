@@ -3244,7 +3244,13 @@ async def get_assets_shared_with_me(
     KYC-gated (recipients are typically fresh signups), hence public_router +
     explicit get_current_user.
     """
-    if not current_user.is_verified:
+    # Canonical email check (same as the subscriptions purchase gate).
+    # User.is_verified alone is WRONG here: kyc.py overwrites it with the
+    # investor/KYC outcome, so email-verified users routinely carry
+    # is_verified=False — reading it locked every real account out of this
+    # endpoint (regression pin in tests/test_shared_asset_route_open.py).
+    from app.api.v1.subscriptions import is_email_verified
+    if not is_email_verified(current_user):
         raise ForbiddenException(
             "Verify your email address to see assets shared with you.",
             code="EMAIL_NOT_VERIFIED",
