@@ -2653,7 +2653,8 @@ async def admin_marketplace_highlights(
     listings_by_status = {
         s.value: await count_where(MarketplaceListing, MarketplaceListing.status == s)
         for s in (ListingStatus.ACTIVE, ListingStatus.APPROVED,
-                  ListingStatus.PENDING_APPROVAL, ListingStatus.REJECTED, ListingStatus.SOLD)
+                  ListingStatus.PENDING_APPROVAL, ListingStatus.REJECTED,
+                  ListingStatus.SUSPENDED, ListingStatus.SOLD)
     }
     listings_new = await count_where(
         MarketplaceListing, MarketplaceListing.created_at >= period_start

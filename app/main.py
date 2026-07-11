@@ -294,7 +294,9 @@ app.include_router(subscriptions.router, prefix=f"{settings.API_V1_PREFIX}/subsc
 app.include_router(notifications.router, prefix=f"{settings.API_V1_PREFIX}/notifications", tags=["Notifications"])
 
 # --- KYC-gated (dashboard / data) ---
-# Asset category reference data is public (used by the public marketplace filters)
+# assets.public_router is ungated: category reference data (public marketplace
+# filters), share-link resolution (code is the credential; recipients have no
+# account), and shared-with-me (authed via its own dependency, but not KYC-gated).
 app.include_router(assets.public_router, prefix=f"{settings.API_V1_PREFIX}/assets", tags=["Assets"])
 app.include_router(assets.router, prefix=f"{settings.API_V1_PREFIX}/assets", tags=["Assets"], dependencies=_KYC_GATED)
 app.include_router(portfolio.router, prefix=f"{settings.API_V1_PREFIX}/portfolio", tags=["Portfolio"], dependencies=_KYC_GATED)

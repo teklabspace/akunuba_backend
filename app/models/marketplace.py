@@ -13,6 +13,9 @@ class ListingStatus(str, Enum):
     APPROVED = "approved"
     REJECTED = "rejected"
     ACTIVE = "active"
+    # Temporarily pulled from the public marketplace while a human appraisal
+    # is open on the asset. Restored/re-published when the appraisal ends.
+    SUSPENDED = "suspended"
     SOLD = "sold"
     CANCELLED = "cancelled"
 
@@ -51,6 +54,10 @@ class MarketplaceListing(Base):
     approved_at = Column(DateTime(timezone=True))
     # Set when a listing is rejected; shown to the owner, admin, and advisor.
     rejection_reason = Column(Text)
+    # Suspension bookkeeping: status the listing held before an open human
+    # appraisal suspended it (restore target), and when it was suspended.
+    pre_suspension_status = Column(SQLEnum(ListingStatus), nullable=True)
+    suspended_at = Column(DateTime(timezone=True), nullable=True)
     meta_data = Column("metadata", JSONB)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

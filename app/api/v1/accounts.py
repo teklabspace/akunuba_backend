@@ -645,7 +645,7 @@ async def delete_account(
     listing_result = await db.execute(
         select(MarketplaceListing).where(
             MarketplaceListing.account_id == account.id,
-            MarketplaceListing.status.in_([ListingStatus.ACTIVE, ListingStatus.PENDING_APPROVAL])
+            MarketplaceListing.status.in_([ListingStatus.ACTIVE, ListingStatus.PENDING_APPROVAL, ListingStatus.SUSPENDED])
         )
     )
     if listing_result.scalar_one_or_none():

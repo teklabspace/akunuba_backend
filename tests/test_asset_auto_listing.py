@@ -55,10 +55,13 @@ def test_valuation_document_type_constant():
 
 def test_idempotency_status_set():
     # A duplicate is avoided when a listing already exists in any open state.
+    # SUSPENDED counts as open so a post-appraisal publish re-prices/restores
+    # the suspended row instead of shadowing it with a new one.
     assert set(_OPEN_LISTING_STATUSES) == {
         ListingStatus.PENDING_APPROVAL,
         ListingStatus.APPROVED,
         ListingStatus.ACTIVE,
+        ListingStatus.SUSPENDED,
     }
     # Terminal states must NOT block a fresh listing.
     assert ListingStatus.SOLD not in _OPEN_LISTING_STATUSES

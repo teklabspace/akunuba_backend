@@ -29,7 +29,7 @@ from app.schemas.asset_extended import (
     AutomatedAppraisalResult, AIReviewResponse, AIUsageItem, AIUsageResponse
 )
 from app.schemas.common import PaginatedResponse
-from app.core.exceptions import NotFoundException, BadRequestException, ForbiddenException, ValidationException
+from app.core.exceptions import NotFoundException, BadRequestException, ForbiddenException, ValidationException, GoneException
 from app.api.deps import get_account, get_user_subscription_plan
 from app.core.features import get_limit, check_usage_limit
 from app.services import ai_appraisal_service
@@ -1329,7 +1329,7 @@ async def delete_asset(
         select(MarketplaceListing).where(MarketplaceListing.asset_id == asset_id)
     )).scalars().all()
 
-    live_statuses = (ListingStatus.PENDING_APPROVAL, ListingStatus.APPROVED, ListingStatus.ACTIVE)
+    live_statuses = (ListingStatus.PENDING_APPROVAL, ListingStatus.APPROVED, ListingStatus.ACTIVE, ListingStatus.SUSPENDED)
     if not is_admin and any(l.status in live_statuses for l in listings):
         # Owners must delist first; admins may remove a junk asset outright.
         raise BadRequestException("Cannot delete asset that is listed in marketplace")
@@ -2283,6 +2283,11 @@ async def request_asset_appraisal(
     from app.services.appraisal_notifications import dispatch_appraisal_created
     await dispatch_appraisal_created(db, appraisal, asset, current_user)
 
+    # Product rule: the asset is not marketable while a human appraisal is open —
+    # pull any live (approved/active) listing from the public marketplace.
+    from app.services.asset_listing_service import suspend_listing_for_open_appraisal
+    await suspend_listing_for_open_appraisal(db, asset.id, appraisal)
+
     logger.info(f"Appraisal requested for asset {asset_id}: {appraisal.id}")
     return {"data": AppraisalResponse.model_validate(appraisal)}
 
@@ -2921,7 +2926,7 @@ async def transfer_asset_ownership(
         select(MarketplaceListing).where(
             and_(
                 MarketplaceListing.asset_id == asset_id,
-                MarketplaceListing.status.in_([ListingStatus.PENDING_APPROVAL, ListingStatus.APPROVED, ListingStatus.ACTIVE])
+                MarketplaceListing.status.in_([ListingStatus.PENDING_APPROVAL, ListingStatus.APPROVED, ListingStatus.ACTIVE, ListingStatus.SUSPENDED])
             )
         )
     )
@@ -3164,7 +3169,7 @@ async def share_asset_details(
     }
 
 
-@router.get("/{asset_id}/shared", response_model=Dict[str, Any])
+@public_router.get("/{asset_id}/shared", response_model=Dict[str, Any])
 async def get_shared_asset(
     asset_id: UUID,
     code: str = Query(..., description="Share access code from the share link"),
@@ -3172,7 +3177,12 @@ async def get_shared_asset(
 ):
     """Resolve a time-limited share link and return the shared asset details.
 
-    Public endpoint (no auth) — access is gated by the per-share access code.
+    Anonymous by design — the per-share access code is the credential, so this
+    lives on public_router (no auth/KYC gate) and declares no user dependency,
+    which also means a stale/invalid Authorization header is never inspected.
+    Contract: valid code → 200, unknown/deactivated → 404, expired → 410
+    SHARE_LINK_EXPIRED. Regression test: tests/test_shared_asset_route_open.py —
+    this endpoint's entire audience is people without accounts.
     """
     share_result = await db.execute(
         select(AssetShare).where(
@@ -3189,10 +3199,16 @@ async def get_shared_asset(
 
     # Enforce expiry
     if share.expires_at is not None and share.expires_at < datetime.now(timezone.utc):
-        raise HTTPException(status_code=status.HTTP_410_GONE, detail="This share link has expired")
+        raise GoneException("This share link has expired", code="SHARE_LINK_EXPIRED")
 
     asset_result = await db.execute(
-        select(Asset).where(Asset.id == asset_id)
+        select(Asset)
+        .options(
+            selectinload(Asset.category),
+            selectinload(Asset.photos),
+            selectinload(Asset.documents),
+        )
+        .where(Asset.id == asset_id)
     )
     asset = asset_result.scalar_one_or_none()
     if not asset:
@@ -3200,11 +3216,78 @@ async def get_shared_asset(
 
     return {
         "data": {
-            "asset": AssetResponse.model_validate(asset),
+            # Standard asset shape (image/images/category included) — validating
+            # a bare row against AssetResponse failed on the category relationship,
+            # 500ing every authenticated view of a share link.
+            "asset": build_asset_response(asset),
             "permissions": share.permissions or ["view"],
             "expires_at": share.expires_at,
+            # Who the share was addressed to (null for open link-shares);
+            # the signup flow prefills registration with it.
+            "shared_with": share.email,
         }
     }
+
+
+@public_router.get("/shared-with-me", response_model=Dict[str, Any])
+async def get_assets_shared_with_me(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Assets shared to the caller's email address — the "Shared with me" scope.
+
+    Grants are keyed by email on the share row, so proving the email (signup +
+    verification) IS the claim: no explicit claim call is needed, and shares
+    created before or after the account exists appear identically. View access
+    only — the asset remains owned by the sharer, and deactivating or expiring
+    the share removes it from this list. Authenticated but deliberately NOT
+    KYC-gated (recipients are typically fresh signups), hence public_router +
+    explicit get_current_user.
+    """
+    if not current_user.is_verified:
+        raise ForbiddenException(
+            "Verify your email address to see assets shared with you.",
+            code="EMAIL_NOT_VERIFIED",
+        )
+    if not current_user.email:
+        return {"data": [], "count": 0}
+
+    now = datetime.now(timezone.utc)
+    rows = (await db.execute(
+        select(AssetShare, Asset)
+        .join(Asset, Asset.id == AssetShare.asset_id)
+        .options(
+            selectinload(Asset.category),
+            selectinload(Asset.photos),
+            selectinload(Asset.documents),
+        )
+        .where(and_(
+            AssetShare.is_active == True,
+            func.lower(AssetShare.email) == current_user.email.strip().lower(),
+            or_(AssetShare.expires_at.is_(None), AssetShare.expires_at >= now),
+        ))
+        .order_by(desc(AssetShare.created_at))
+    )).all()
+
+    items = []
+    seen_assets = set()
+    for share, asset in rows:
+        # Newest grant per asset wins (rows are ordered newest-first).
+        if asset.id in seen_assets:
+            continue
+        seen_assets.add(asset.id)
+        items.append({
+            "asset": build_asset_response(asset),
+            "permissions": share.permissions or ["view"],
+            "shared_at": share.created_at,
+            "expires_at": share.expires_at,
+            # The recipient's own grant credential — the client opens the asset
+            # through the existing share view, keeping one code-based view path.
+            "access_code": share.access_code,
+            "share_link": share.share_link,
+        })
+
+    return {"data": items, "count": len(items)}
 
 
 @router.post("/{asset_id}/reports", response_model=Dict[str, ReportResponse], status_code=status.HTTP_201_CREATED)

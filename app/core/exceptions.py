@@ -59,6 +59,18 @@ class ConflictException(FullegoException):
         )
 
 
+class GoneException(FullegoException):
+    """The resource existed but is permanently unavailable (e.g. an expired
+    share link) — 410 so clients can distinguish it from a plain 404."""
+
+    def __init__(self, detail: str, code: str = "GONE"):
+        super().__init__(
+            status_code=status.HTTP_410_GONE,
+            detail=detail,
+            code=code,
+        )
+
+
 class BadRequestException(FullegoException):
     def __init__(self, detail: str, code: str = "BAD_REQUEST"):
         super().__init__(

@@ -17,7 +17,7 @@ from app.models.marketplace import (
     MarketplaceListing, Offer, EscrowTransaction, WatchlistItem,
     ListingStatus, OfferStatus, EscrowStatus
 )
-from app.core.exceptions import NotFoundException, BadRequestException, UnauthorizedException, ForbiddenException
+from app.core.exceptions import NotFoundException, BadRequestException, UnauthorizedException, ForbiddenException, ConflictException
 from app.core.permissions import Role, Permission, has_permission
 from app.utils.logger import logger
 from app.utils.helpers import calculate_listing_fee, calculate_commission, generate_reference_id
@@ -346,7 +346,11 @@ async def create_listing(
     
     if not asset:
         raise NotFoundException("Asset", str(listing_data.asset_id))
-    
+
+    # No new listing while the asset is under valuation — otherwise it would
+    # sit unapprovable in the queue until the appraisal ends.
+    await _assert_no_open_human_appraisal(db, asset.id)
+
     # Calculate listing fee (2%)
     listing_fee = calculate_listing_fee(listing_data.asking_price)
     
@@ -579,6 +583,19 @@ async def list_marketplace_categories(
     }
 
 
+async def _assert_no_open_human_appraisal(db: AsyncSession, asset_id) -> None:
+    """Product rule: an asset must not go (or return) live on the marketplace
+    while a human appraisal is open on it. 409 so clients can distinguish this
+    from validation/permission failures."""
+    from app.services.asset_listing_service import has_open_human_appraisal
+    if await has_open_human_appraisal(db, asset_id):
+        raise ConflictException(
+            "This asset has an appraisal in progress. Marketplace publishing is "
+            "blocked until the appraisal is completed or cancelled.",
+            code="ASSET_UNDER_APPRAISAL",
+        )
+
+
 def _require_categorized_asset(asset: Optional[Asset]) -> None:
     """A listing may only go public when its asset has a category — the browse
     UI is category-driven, so an uncategorized listing would be unreachable
@@ -650,11 +667,16 @@ async def approve_listing(
         select(Asset).where(Asset.id == listing.asset_id)
     )).scalar_one_or_none()
     _require_categorized_asset(asset)
+    await _assert_no_open_human_appraisal(db, listing.asset_id)
 
     listing.status = ListingStatus.APPROVED
     listing.approved_by = current_user.id
     listing.approved_at = datetime.utcnow()
     listing.rejection_reason = None
+    # Approving with no open appraisal doubles as a manual restore of a
+    # suspended listing — drop the stale suspension bookkeeping.
+    listing.pre_suspension_status = None
+    listing.suspended_at = None
 
     await db.commit()
     await db.refresh(listing)
@@ -891,7 +913,15 @@ async def accept_offer(
         select(MarketplaceListing).where(MarketplaceListing.id == offer.listing_id)
     )
     listing = listing_result.scalar_one_or_none()
-    
+
+    # Offers are only acceptable while the listing is actually for sale — not
+    # suspended (under appraisal), sold, cancelled, or otherwise off-market.
+    if not listing or listing.status not in (ListingStatus.APPROVED, ListingStatus.ACTIVE):
+        raise ConflictException(
+            "This listing is not open for sale (it may be under appraisal, sold, or cancelled).",
+            code="LISTING_NOT_OPEN",
+        )
+
     if listing.account_id != account.id:
         raise UnauthorizedException("Only listing owner can accept offers")
     
@@ -1378,7 +1408,9 @@ async def activate_listing(
     
     if not listing:
         raise NotFoundException("Listing", str(listing_id))
-    
+
+    await _assert_no_open_human_appraisal(db, listing.asset_id)
+
     if listing.status != ListingStatus.APPROVED:
         raise BadRequestException("Only approved listings can be activated")
     

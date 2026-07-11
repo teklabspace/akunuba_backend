@@ -328,7 +328,26 @@ async def update_appraisal_status(
     
     await db.commit()
     await db.refresh(appraisal)
-    
+
+    # Marketplace side-effects of the transition (best-effort, never raise):
+    # moved to an open state -> suspend the live listing; completed -> publish
+    # at the appraised value once the valuation pair (amount + document) is
+    # ready, staying suspended otherwise; any other terminal state (cancelled /
+    # failed) -> restore the suspended listing at its previous status and price.
+    from app.services.asset_listing_service import (
+        is_open_human_appraisal,
+        maybe_publish_valued_asset,
+        restore_listing_after_appraisal,
+        suspend_listing_for_open_appraisal,
+    )
+    if appraisal.appraisal_type != AppraisalType.API:
+        if is_open_human_appraisal(appraisal.appraisal_type, appraisal.status):
+            await suspend_listing_for_open_appraisal(db, appraisal.asset_id, appraisal)
+        elif appraisal.status == AppraisalStatus.COMPLETED:
+            await maybe_publish_valued_asset(db, appraisal, current_user)
+        else:
+            await restore_listing_after_appraisal(db, appraisal.asset_id, appraisal)
+
     logger.info(f"Appraisal status updated: {appraisal_id} -> {status_data.status.value}")
     
     return {
