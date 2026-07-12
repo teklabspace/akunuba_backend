@@ -32,6 +32,12 @@ services:
       - key: DATABASE_URL
         sync: false # Set this manually in Render dashboard
 
+      # Redis - REQUIRED for real-time WebSocket delivery (chat + notifications).
+      # Without it the app falls back to redis://localhost:6379, which does not
+      # exist on Render, and real-time fan-out silently degrades.
+      - key: REDIS_URL
+        sync: false # Set this manually in Render dashboard (e.g. Redis Cloud URL)
+
       # Supabase Configuration
       - key: SUPABASE_URL
         sync: false # Set this manually in Render dashboard

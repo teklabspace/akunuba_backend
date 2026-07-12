@@ -343,23 +343,64 @@ class PersonaClient:
             raise
 
     @staticmethod
-    def get_verification_url(inquiry_id: str, redirect_uri: Optional[str] = None) -> str:
+    def get_verification_url(
+        inquiry_id: str,
+        redirect_uri: Optional[str] = None,
+        session_token: Optional[str] = None,
+    ) -> str:
         """
         Get the Persona hosted verification URL for an inquiry.
-        
+
         Args:
             inquiry_id: The Persona inquiry ID
             redirect_uri: Optional redirect URI after verification completes
-            
+            session_token: Fresh token from ``resume_inquiry``. Without it, a
+                link to an inquiry whose session lapsed (~24h) lands on
+                Persona's dead-end "Session expired" page.
+
         Returns:
             The verification URL to redirect users to
         """
         base_url = f"https://inquiry.withpersona.com/verify?inquiry-id={inquiry_id}"
-        
+
+        if session_token:
+            base_url += f"&session-token={session_token}"
         if redirect_uri:
             base_url += f"&redirect-uri={redirect_uri}"
-        
+
         return base_url
+
+    @staticmethod
+    def extract_session_token(resume_response: Optional[Dict[str, Any]]) -> Optional[str]:
+        """Pull ``meta.session-token`` out of a resume response (kebab or snake)."""
+        if not isinstance(resume_response, dict):
+            return None
+        meta = resume_response.get("meta") or {}
+        return meta.get("session-token") or meta.get("session_token")
+
+    @staticmethod
+    def resume_inquiry(inquiry_id: str) -> Optional[str]:
+        """Mint a fresh session token for an existing pending/expired inquiry.
+
+        Persona invalidates an inquiry's hosted-flow session ~24h after it was
+        issued; a bare ``?inquiry-id=`` link opened after that shows Persona's
+        "Session expired" page with no way forward. ``POST /inquiries/{id}/resume``
+        reactivates the inquiry and returns ``meta.session-token`` to append to
+        the link. Returns None when the inquiry can't be resumed (completed,
+        redacted, unknown) so callers can fall back to starting over.
+        """
+        try:
+            with httpx.Client() as client:
+                response = client.post(
+                    f"{PersonaClient.BASE_URL}/inquiries/{inquiry_id}/resume",
+                    headers=PersonaClient._get_headers(),
+                    timeout=30.0,
+                )
+                response.raise_for_status()
+                return PersonaClient.extract_session_token(response.json())
+        except Exception as e:
+            logger.warning(f"Failed to resume Persona inquiry {inquiry_id}: {e}")
+            return None
 
     @staticmethod
     def extract_verification_url_from_response(inquiry_response: Dict[str, Any], redirect_uri: Optional[str] = None) -> Optional[str]:

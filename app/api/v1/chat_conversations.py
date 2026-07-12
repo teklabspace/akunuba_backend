@@ -440,8 +440,15 @@ async def send_message(
     
     logger.info(f"Message sent: {message.id} in conversation {conversation_id}")
     
-    # Broadcast new message via WebSocket
+    # Push the message to every participant's open sockets (user-targeted, so
+    # it arrives anywhere in the app — no per-conversation join required).
     try:
+        participants_result = await db.execute(
+            select(ConversationParticipant.user_id).where(
+                ConversationParticipant.conversation_id == conversation_id
+            )
+        )
+        recipient_user_ids = [row[0] for row in participants_result]
         await broadcast_new_message(
             conversation_id=conversation_id,
             message_data={
@@ -453,7 +460,8 @@ async def send_message(
                 "timestamp": message.timestamp.isoformat(),
                 "attachments": [{"id": str(a.id), "type": a.file_type, "url": a.file_url} for a in attachments]
             },
-            exclude_user_id=current_user.id
+            exclude_user_id=current_user.id,
+            recipient_user_ids=recipient_user_ids
         )
     except Exception as e:
         logger.error(f"Error broadcasting new message via WebSocket: {e}")
@@ -546,14 +554,22 @@ async def mark_messages_as_read(
     participant.last_read_at = datetime.utcnow()
     await db.commit()
     
-    # Broadcast read receipts via WebSocket
+    # Broadcast read receipts via WebSocket (user-targeted: reaches senders
+    # anywhere in the app, not just those joined to this conversation room)
     try:
+        participants_result = await db.execute(
+            select(ConversationParticipant.user_id).where(
+                ConversationParticipant.conversation_id == conversation_id
+            )
+        )
+        recipient_user_ids = [row[0] for row in participants_result]
         for message_id, read_at in read_messages:
             await broadcast_read_receipt(
                 conversation_id=conversation_id,
                 message_id=message_id,
                 user_id=current_user.id,
-                read_at=read_at
+                read_at=read_at,
+                recipient_user_ids=recipient_user_ids
             )
     except Exception as e:
         logger.error(f"Error broadcasting read receipts via WebSocket: {e}")

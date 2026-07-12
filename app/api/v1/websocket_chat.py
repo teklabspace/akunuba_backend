@@ -87,10 +87,26 @@ async def websocket_chat_endpoint(
         
         # Main message loop
         while True:
+            # Receive errors MUST terminate the loop. A previous catch-all here
+            # swallowed WebSocketDisconnect, so every dropped client left this
+            # coroutine spinning forever on a dead socket ("Cannot call receive
+            # once a disconnect message has been received"), starving the event
+            # loop — real production real-time outage.
             try:
-                # Receive message from client
                 data = await websocket.receive_json()
-                
+            except WebSocketDisconnect:
+                raise
+            except json.JSONDecodeError:
+                await manager.send_personal_message(websocket, {
+                    "type": "error",
+                    "message": "Invalid JSON format"
+                })
+                continue
+            except Exception as e:
+                logger.warning(f"Chat WS receive failed; closing connection: {e}")
+                raise WebSocketDisconnect(code=1006)
+
+            try:
                 # Validate message format
                 try:
                     message = WebSocketMessage(**data)
@@ -100,23 +116,23 @@ async def websocket_chat_endpoint(
                         "message": f"Invalid message format: {e.errors()}"
                     })
                     continue
-                
+
                 # Handle different message types
                 if message.type == "join":
                     await handle_join_conversation(
                         websocket, user.id, message.conversation_id, db
                     )
-                
+
                 elif message.type == "typing:start":
                     await handle_typing_start(
                         websocket, user.id, message.conversation_id
                     )
-                
+
                 elif message.type == "typing:stop":
                     await handle_typing_stop(
                         websocket, user.id, message.conversation_id
                     )
-                
+
                 elif message.type == "mark:read":
                     await handle_mark_read(
                         websocket, user.id, message.conversation_id,
@@ -128,13 +144,9 @@ async def websocket_chat_endpoint(
                         "type": "error",
                         "message": f"Unknown message type: {message.type}"
                     })
-            
-            except json.JSONDecodeError:
-                await manager.send_personal_message(websocket, {
-                    "type": "error",
-                    "message": "Invalid JSON format"
-                })
-            
+
+            except WebSocketDisconnect:
+                raise
             except Exception as e:
                 logger.error(f"Error processing WebSocket message: {e}")
                 await manager.send_personal_message(websocket, {
@@ -317,12 +329,33 @@ async def handle_mark_read(
 async def broadcast_new_message(
     conversation_id: UUID,
     message_data: dict,
-    exclude_user_id: Optional[UUID] = None
+    exclude_user_id: Optional[UUID] = None,
+    recipient_user_ids: Optional[list] = None,
 ):
     """
-    Broadcast a new message to all users in a conversation.
+    Deliver a new message to conversation participants in real time.
     This is called from the REST API when a new message is created.
+
+    With ``recipient_user_ids`` (the conversation's participants), delivery is
+    USER-targeted via ``manager.send_to_user`` — it reaches every open socket
+    each recipient has, anywhere in the app, and fans out across workers via
+    Redis. Room-only broadcast reached just the users who had sent
+    ``{"type": "join"}`` for this exact conversation, so everyone else had to
+    reload to see new messages (real reported production bug).
     """
+    if recipient_user_ids:
+        event = {
+            "type": "message:new",
+            "conversation_id": str(conversation_id),
+            **message_data,
+        }
+        for uid in recipient_user_ids:
+            if exclude_user_id and uid == exclude_user_id:
+                continue
+            await manager.send_to_user(uid, event)
+        return
+
+    # Legacy fallback when no participant list is supplied: room broadcast.
     await manager.broadcast_to_conversation(
         conversation_id=conversation_id,
         event_type="message:new",
@@ -336,9 +369,28 @@ async def broadcast_read_receipt(
     conversation_id: UUID,
     message_id: UUID,
     user_id: UUID,
-    read_at: datetime
+    read_at: datetime,
+    recipient_user_ids: Optional[list] = None,
 ):
-    """Broadcast read receipt to all users in a conversation"""
+    """Broadcast read receipt to all users in a conversation.
+
+    Same delivery rule as ``broadcast_new_message``: user-targeted when the
+    participant list is provided (works app-wide), room broadcast otherwise.
+    """
+    if recipient_user_ids:
+        event = {
+            "type": "message:read",
+            "conversation_id": str(conversation_id),
+            "message_id": str(message_id),
+            "user_id": str(user_id),
+            "read_at": read_at.isoformat(),
+        }
+        for uid in recipient_user_ids:
+            if uid == user_id:
+                continue
+            await manager.send_to_user(uid, event)
+        return
+
     await manager.broadcast_to_conversation(
         conversation_id=conversation_id,
         event_type="message:read",

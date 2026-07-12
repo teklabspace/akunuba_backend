@@ -118,3 +118,6 @@ docs/
 *.dump
 *.sql.gz
 
+
+# Playwright MCP artifacts (page snapshots, console logs from browser sessions)
+.playwright-mcp/

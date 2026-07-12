@@ -42,11 +42,12 @@ def test_stale_environment_is_rejected():
     assert _hosted_url_matches_config(url, TMPL, ENV) is False
 
 
-def test_api_inquiry_url_is_always_reusable():
-    # An inquiry-id URL points at a concrete inquiry; template/env don't apply.
-    assert _hosted_url_matches_config(API, TMPL, ENV) is True
-    # Even if config somehow differs, an inquiry-id URL is still valid to resume.
-    assert _hosted_url_matches_config(API, OLD_TMPL, OLD_ENV) is True
+def test_api_inquiry_url_is_never_reusable():
+    # A cached inquiry-id URL is session-bound: after ~24h Persona shows its
+    # "Session expired" dead end (real reported bug). Live links must be minted
+    # via PersonaClient.resume_inquiry, so cached ones are never served.
+    assert _hosted_url_matches_config(API, TMPL, ENV) is False
+    assert _hosted_url_matches_config(API, OLD_TMPL, OLD_ENV) is False
 
 
 def test_empty_or_none_url_is_not_reusable():

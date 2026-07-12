@@ -132,7 +132,12 @@ async def persona_webhook(
         elif status_value in ("declined", "failed", "rejected"):
             kyc.status = KYCStatus.REJECTED
             kyc.rejection_reason = attributes.get("rejection-reason") or attributes.get("reason") or "Verification rejected"
-        elif status_value in ("pending", "in-progress", "needs-review", "marked-for-review"):
+        elif status_value in ("pending", "in-progress"):
+            # Persona "pending" = the user started but hasn't finished the flow.
+            # It is NOT "under review" — mapping it there hid the continue link
+            # and stranded users who abandoned mid-flow (real reported bug).
+            kyc.status = KYCStatus.IN_PROGRESS
+        elif status_value in ("needs-review", "marked-for-review", "needs_review", "marked_for_review"):
             kyc.status = KYCStatus.PENDING_REVIEW
         # document-requested: Persona may send when more documents are needed
         if "document" in (event_type or "") or "document-requested" in str(attributes):

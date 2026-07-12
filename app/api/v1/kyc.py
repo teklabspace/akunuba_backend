@@ -26,7 +26,9 @@ def _hosted_url_matches_config(url: Optional[str], template_id: Optional[str], e
     A stored URL can go stale when the Persona template or environment changes (e.g. after
     switching accounts / fixing env vars). Serving such a URL sends users to a dead
     "application misconfigured" page. This guards the status endpoint's cache-reuse path:
-    - API-flow URLs (``inquiry-id=...``) are always reusable — they point at a real inquiry.
+    - API-flow URLs (``inquiry-id=...``) are NEVER reusable — their session token (or lack
+      of one) lapses ~24h in, landing users on Persona's "Session expired" dead end. A live
+      link must be minted via ``PersonaClient.resume_inquiry``.
     - Hosted-template URLs (``inquiry-template-id=...``) are only reusable when their
       template-id and environment-id still match the current settings.
     """
@@ -38,7 +40,7 @@ def _hosted_url_matches_config(url: Optional[str], template_id: Optional[str], e
     except Exception:
         return False
     if q.get("inquiry-id"):
-        return True  # points at a concrete inquiry; never stale
+        return False  # session-bound; must be re-minted via resume, never reused
     tmpl = (q.get("inquiry-template-id") or [None])[0]
     if template_id and tmpl and tmpl != template_id:
         return False
@@ -326,15 +328,30 @@ async def get_kyc_status(
                     if account:
                         account.user.is_verified = False
                 elif status_str == "pending":
-                    logger.info(f"[KYC STATUS SYNC] Status is 'pending'. Setting to PENDING_REVIEW")
-                    kyc.status = KYCStatus.PENDING_REVIEW
+                    # Persona "pending" = user started but hasn't finished the
+                    # flow (their review state is needs_review / completed).
+                    # Keep IN_PROGRESS so the continue link below is served.
+                    logger.info(f"[KYC STATUS SYNC] Status is 'pending'. Keeping as IN_PROGRESS (user mid-flow)")
+                    kyc.status = KYCStatus.IN_PROGRESS
                     # Set user as NOT verified
+                    if account:
+                        account.user.is_verified = False
+                elif status_str in ("needs_review", "needs-review", "marked_for_review", "marked-for-review"):
+                    logger.info(f"[KYC STATUS SYNC] Status is '{status_str}'. Setting to PENDING_REVIEW")
+                    kyc.status = KYCStatus.PENDING_REVIEW
                     if account:
                         account.user.is_verified = False
                 elif status_str in ["processing", "waiting"]:
                     logger.info(f"[KYC STATUS SYNC] Status is '{status_str}'. Keeping as IN_PROGRESS")
                     kyc.status = KYCStatus.IN_PROGRESS
                     # Set user as NOT verified (KYC is still in progress)
+                    if account:
+                        account.user.is_verified = False
+                elif status_str == "expired":
+                    # Persona expired the inquiry session; resume_inquiry below
+                    # revives it, so keep it actionable as IN_PROGRESS.
+                    logger.info("[KYC STATUS SYNC] Status is 'expired'. Keeping as IN_PROGRESS (resumable)")
+                    kyc.status = KYCStatus.IN_PROGRESS
                     if account:
                         account.user.is_verified = False
                 else:
@@ -354,10 +371,20 @@ async def get_kyc_status(
                 await db.commit()
                 logger.info(f"[KYC STATUS SYNC] Database updated successfully")
                 
-                # Get verification URL if inquiry is still in progress
+                # Get verification URL if inquiry is still in progress.
+                # A bare inquiry-id link dies once Persona expires the session
+                # (~24h) — resume first so returning users get a working link
+                # instead of Persona's dead-end "Session expired" page.
                 if kyc.status == KYCStatus.IN_PROGRESS:
                     redirect_uri = PersonaClient.get_redirect_uri()
-                    verification_url = PersonaClient.get_verification_url(kyc.persona_inquiry_id, redirect_uri)
+                    session_token = PersonaClient.resume_inquiry(kyc.persona_inquiry_id)
+                    if session_token:
+                        verification_url = PersonaClient.get_verification_url(
+                            kyc.persona_inquiry_id, redirect_uri, session_token=session_token
+                        )
+                    # Not resumable (completed/redacted/dead) -> leave None so
+                    # the hosted-template fallback below mints a fresh restart
+                    # link rather than serving a link Persona will reject.
         except Exception as e:
             logger.error(f"[KYC STATUS SYNC] Failed to sync Persona status: {e}", exc_info=True)
 
@@ -942,14 +969,26 @@ async def sync_kyc_status(
             # Set user as NOT verified
             account.user.is_verified = False
         elif status_str == "pending":
-            logger.info(f"[KYC SYNC-STATUS] Status is 'pending'. Setting to PENDING_REVIEW")
-            kyc.status = KYCStatus.PENDING_REVIEW
+            # Persona "pending" = user started but hasn't finished the flow;
+            # actual review states are needs_review / completed+pending.
+            logger.info(f"[KYC SYNC-STATUS] Status is 'pending'. Keeping as IN_PROGRESS (user mid-flow)")
+            kyc.status = KYCStatus.IN_PROGRESS
             # Set user as NOT verified
+            account.user.is_verified = False
+        elif status_str in ("needs_review", "needs-review", "marked_for_review", "marked-for-review"):
+            logger.info(f"[KYC SYNC-STATUS] Status is '{status_str}'. Setting to PENDING_REVIEW")
+            kyc.status = KYCStatus.PENDING_REVIEW
             account.user.is_verified = False
         elif status_str in ["processing", "waiting"]:
             logger.info(f"[KYC SYNC-STATUS] Status is '{status_str}'. Keeping as IN_PROGRESS")
             kyc.status = KYCStatus.IN_PROGRESS
             # Set user as NOT verified (KYC is still in progress)
+            account.user.is_verified = False
+        elif status_str == "expired":
+            # Session lapsed on Persona's side; GET /kyc/status resumes it, so
+            # keep the verification actionable instead of stranding the user.
+            logger.info("[KYC SYNC-STATUS] Status is 'expired'. Keeping as IN_PROGRESS (resumable)")
+            kyc.status = KYCStatus.IN_PROGRESS
             account.user.is_verified = False
         else:
             logger.warning(f"[KYC SYNC-STATUS] Unknown status value: '{status_str}'. Keeping current status: {kyc.status}")
