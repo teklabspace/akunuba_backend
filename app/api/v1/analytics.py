@@ -13,6 +13,7 @@ from app.models.asset import Asset, AssetType, AssetValuation
 from app.models.portfolio import Portfolio
 from app.integrations.posthog_client import PosthogClient
 from app.core.exceptions import NotFoundException, BadRequestException
+from app.services.net_worth import compute_net_worth, core_assets, breakdown_dict
 from app.utils.logger import logger
 from pydantic import BaseModel
 
@@ -218,9 +219,13 @@ async def get_portfolio_analytics(
         assets_result = await db.execute(
             select(Asset).where(Asset.account_id == account.id)
         )
-        assets = assets_result.scalars().all()
-        
-        if not assets:
+        all_assets = assets_result.scalars().all()
+        breakdown = compute_net_worth(all_assets)
+        # Invested/returns/allocation math runs over core (owned) assets;
+        # liabilities and record-keeping groups surface via net_worth_breakdown.
+        assets = core_assets(all_assets)
+
+        if not all_assets:
             return {
                 "total_value": 0.0,
                 "total_invested": 0.0,
@@ -228,7 +233,8 @@ async def get_portfolio_analytics(
                 "total_return_percentage": 0.0,
                 "asset_count": 0,
                 "asset_allocation": {},
-                "performance_by_period": {}
+                "performance_by_period": {},
+                "net_worth_breakdown": breakdown_dict(breakdown)
             }
         
         # Calculate current value
@@ -295,13 +301,15 @@ async def get_portfolio_analytics(
                 performance_by_period[period] = float(period_return)
         
         return {
-            "total_value": float(current_value),
+            # Headline is net worth; gross/owned totals live in the breakdown.
+            "total_value": float(breakdown.net_worth),
             "total_invested": float(total_invested),
             "total_return": float(total_return),
             "total_return_percentage": float(total_return_percentage),
             "asset_count": len(assets),
             "asset_allocation": asset_allocation,
-            "performance_by_period": performance_by_period
+            "performance_by_period": performance_by_period,
+            "net_worth_breakdown": breakdown_dict(breakdown)
         }
     except Exception as e:
         logger.error(f"Error getting portfolio analytics: {e}", exc_info=True)
@@ -338,8 +346,9 @@ async def get_performance_analytics(
         assets_result = await db.execute(
             select(Asset).where(Asset.account_id == account.id)
         )
-        assets = assets_result.scalars().all()
-        
+        # Performance is measured over core (owned) assets only.
+        assets = core_assets(assets_result.scalars().all())
+
         if not assets:
             return {
                 "total_return": 0.0,
@@ -476,8 +485,9 @@ async def get_risk_analytics(
         assets_result = await db.execute(
             select(Asset).where(Asset.account_id == account.id)
         )
-        assets = assets_result.scalars().all()
-        
+        # Risk metrics cover core (owned) assets only.
+        assets = core_assets(assets_result.scalars().all())
+
         if not assets:
             return {
                 "volatility": 0.0,

@@ -251,7 +251,12 @@ else:
     production_origins = [
         "https://akunuba.vercel.app",
         "https://akunuba.io",
-        "https://www.akunuba.io"
+        "https://www.akunuba.io",
+        # Cloudflare Pages deployments (the frontend's production/preview hosts).
+        # Missing from this list = preflight 400 = "network error" for every
+        # user browsing via pages.dev (real reported production bug).
+        "https://akunuba-production.pages.dev",
+        "https://akunuba-preview.pages.dev",
     ]
     # Add production origins if not already present
     for prod_origin in production_origins:

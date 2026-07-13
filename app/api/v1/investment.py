@@ -14,6 +14,7 @@ from app.models.portfolio import Portfolio
 from app.models.order import Order, OrderStatus
 from app.models.banking import LinkedAccount, Transaction
 from app.core.exceptions import NotFoundException, BadRequestException
+from app.services.net_worth import core_assets
 from app.utils.logger import logger
 from app.integrations.polygon_client import PolygonClient
 from app.integrations.alpaca_client import AlpacaClient
@@ -82,8 +83,10 @@ async def get_asset_summary_cards(
         assets_result = await db.execute(
             select(Asset).where(Asset.account_id == account.id)
         )
-        assets = assets_result.scalars().all()
-        
+        # Investment overview covers core (owned) assets only — liabilities
+        # and record-keeping groups are not investments.
+        assets = core_assets(assets_result.scalars().all())
+
         # Calculate totals by asset type
         summary_cards = []
         
@@ -465,8 +468,8 @@ async def calculate_performance_metrics(
     assets_result = await db.execute(
         select(Asset).where(Asset.account_id == account_id)
     )
-    assets = assets_result.scalars().all()
-    
+    assets = core_assets(assets_result.scalars().all())
+
     if not assets:
         return PerformanceMetrics(
             total_return=Decimal("0.00"),
@@ -682,8 +685,8 @@ async def get_investment_analytics(
         assets_result = await db.execute(
             select(Asset).where(Asset.account_id == account.id)
         )
-        assets = assets_result.scalars().all()
-        
+        assets = core_assets(assets_result.scalars().all())
+
         if not assets:
             return AnalyticsMetrics(
                 total_invested=Decimal("0.00"),
@@ -841,10 +844,12 @@ async def get_investment_recommendations(
         assets_result = await db.execute(
             select(Asset).where(Asset.account_id == account.id)
         )
-        assets = assets_result.scalars().all()
-        
+        # Recommendations analyze core (owned) assets only — never suggest
+        # "diversifying" out of a mortgage or a record-keeping entry.
+        assets = core_assets(assets_result.scalars().all())
+
         total_value = sum([asset.current_value for asset in assets]) if assets else Decimal("0.00")
-        
+
         recommendations = []
         
         # Analyze portfolio for recommendations

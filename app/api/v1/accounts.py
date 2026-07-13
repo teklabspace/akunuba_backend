@@ -573,11 +573,13 @@ async def get_account_stats(
     )
     total_accounts_linked = linked_accounts_count_result.scalar() or 0
     
-    # Portfolio value
-    assets_result = await db.execute(
-        select(func.sum(Asset.current_value)).where(Asset.account_id == account.id)
+    # Portfolio value = net worth (core assets - liabilities; record-keeping
+    # groups excluded) so it matches the dashboard headline.
+    from app.services.net_worth import compute_net_worth
+    assets_rows_result = await db.execute(
+        select(Asset).where(Asset.account_id == account.id)
     )
-    portfolio_value = assets_result.scalar() or Decimal("0")
+    portfolio_value = compute_net_worth(assets_rows_result.scalars().all()).net_worth
     
     # Last activity (most recent payment or asset update)
     last_payment_result = await db.execute(

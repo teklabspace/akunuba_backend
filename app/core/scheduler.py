@@ -257,21 +257,23 @@ async def recalculate_portfolios():
     from app.models.account import Account
     from app.models.asset import Asset
     from app.models.portfolio import Portfolio
+    from app.services.net_worth import compute_net_worth
     from sqlalchemy import select
     from datetime import datetime
-    
+
     try:
         async with AsyncSessionLocal() as db:
             accounts_result = await db.execute(select(Account))
             accounts = accounts_result.scalars().all()
-            
+
             for account in accounts:
                 assets_result = await db.execute(
                     select(Asset).where(Asset.account_id == account.id)
                 )
                 assets = assets_result.scalars().all()
-                
-                total_value = sum([asset.current_value for asset in assets])
+
+                # Stored snapshot matches the dashboard headline: net worth.
+                total_value = compute_net_worth(assets).net_worth
                 
                 portfolio_result = await db.execute(
                     select(Portfolio).where(Portfolio.account_id == account.id)

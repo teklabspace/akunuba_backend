@@ -16,6 +16,7 @@ class User(Base):
     first_name = Column(String(100))
     last_name = Column(String(100))
     phone = Column(String(20))
+    avatar_url = Column(String(500), nullable=True)  # Public URL from /files/upload (avatar)
     role = Column(SQLEnum(Role), default=Role.INVESTOR, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
     is_verified = Column(Boolean, default=False, nullable=False)

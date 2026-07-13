@@ -33,7 +33,29 @@ def resolve_content_type(filename: str, reported_type: Optional[str]) -> str:
 
 
 def storage_bucket_for_file_type(file_type: str) -> str:
-    return "images" if file_type == "photo" else "documents"
+    return "images" if file_type in ("photo", "avatar") else "documents"
+
+
+def public_storage_prefix(supabase_url: str, bucket: str = "images") -> str:
+    """URL prefix of our own public storage bucket (what /files/upload returns)."""
+    return f"{supabase_url.rstrip('/')}/storage/v1/object/public/{bucket}/"
+
+
+def storage_path_from_public_url(
+    url: Optional[str], supabase_url: str, bucket: str = "images"
+) -> Optional[str]:
+    """Object path inside ``bucket`` if ``url`` is one of OUR public URLs, else None.
+
+    Used both to reject foreign avatar URLs on PUT /users/me and to locate the
+    old storage object when an avatar is replaced/removed.
+    """
+    if not url or not supabase_url:
+        return None
+    prefix = public_storage_prefix(supabase_url, bucket)
+    if not url.startswith(prefix):
+        return None
+    path = url[len(prefix):].split("?", 1)[0]
+    return path or None
 
 
 def validate_image_content_type(filename: str, reported_type: Optional[str]) -> str:

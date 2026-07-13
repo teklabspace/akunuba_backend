@@ -22,6 +22,9 @@ class ReferralResponse(BaseModel):
     id: UUID
     referral_code: str
     referred_email: Optional[str] = None
+    # Filled by an email->user match when the referred person has an account
+    # with a profile picture; None otherwise (frontend shows a placeholder).
+    avatar_url: Optional[str] = None
     status: str
     reward_amount: Decimal
     reward_currency: str
@@ -158,9 +161,28 @@ async def get_referral_list(
     
     result = await db.execute(query)
     referrals = result.scalars().all()
-    
+
+    # Referrals store only an email; match it (case-insensitively, same rule
+    # as shared-with-me) to a user in one batch query to attach avatars.
+    emails = {r.referred_email.lower() for r in referrals if r.referred_email}
+    avatars_by_email = {}
+    if emails:
+        users_result = await db.execute(
+            select(User.email, User.avatar_url).where(func.lower(User.email).in_(emails))
+        )
+        avatars_by_email = {
+            email.lower(): avatar for email, avatar in users_result.all() if avatar
+        }
+
+    data = []
+    for r in referrals:
+        item = ReferralResponse.model_validate(r)
+        if r.referred_email:
+            item.avatar_url = avatars_by_email.get(r.referred_email.lower())
+        data.append(item)
+
     return ReferralListResponse(
-        data=[ReferralResponse.model_validate(r) for r in referrals],
+        data=data,
         total=total,
         page=page,
         limit=limit

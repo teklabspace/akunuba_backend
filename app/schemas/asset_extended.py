@@ -251,8 +251,9 @@ class CategoryGroupSummary(BaseModel):
 
 class AssetsSummaryResponse(BaseModel):
     total_assets: int
-    total_value: Decimal
+    total_value: Decimal  # net worth: core assets - liabilities
     total_estimated_value: Decimal
+    net_worth_breakdown: Optional[Dict[str, Any]] = None
     currency: str
     by_category: List[CategorySummary]
     by_category_group: List[CategoryGroupSummary]

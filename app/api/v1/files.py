@@ -26,19 +26,29 @@ async def upload_file(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """General file upload endpoint"""
+    """General file upload endpoint.
+
+    file_type "avatar" = profile picture: image-only, 5MB cap, stored under
+    avatars/ in the public images bucket; the returned "url" is permanent
+    (Supabase public URL, no expiry) and is what PUT /users/me expects in
+    avatar_url. Avatars create no asset photo/document row.
+    """
     account = await get_account(current_user=current_user, db=db)
-    
+
     # Validate file type
-    if file_type not in ["photo", "document"]:
-        raise BadRequestException("file_type must be 'photo' or 'document'")
-    
+    if file_type not in ["photo", "document", "avatar"]:
+        raise BadRequestException("file_type must be 'photo', 'document' or 'avatar'")
+
     # Read file
     file_data = await file.read()
     file_size = len(file_data)
-    
+
     if file_size > settings.MAX_UPLOAD_SIZE:
         raise BadRequestException(f"File size exceeds maximum allowed size")
+
+    AVATAR_MAX_SIZE = 5 * 1024 * 1024
+    if file_type == "avatar" and file_size > AVATAR_MAX_SIZE:
+        raise BadRequestException("Avatar images must be 5MB or smaller")
     
     # Upload to Supabase - generate unique filename to avoid duplicates
     import uuid
@@ -58,11 +68,14 @@ async def upload_file(
     # Use appropriate bucket based on file type
     # Photos go to 'images' bucket, documents go to 'documents' bucket
     bucket_name = storage_bucket_for_file_type(file_type)
-    folder = "assets" if asset_id else "general"
+    if file_type == "avatar":
+        folder = "avatars"
+    else:
+        folder = "assets" if asset_id else "general"
     file_path = f"{folder}/{account.id}/{unique_filename}"
 
     try:
-        if file_type == "photo":
+        if file_type in ("photo", "avatar"):
             content_type = validate_image_content_type(file.filename or unique_filename, file.content_type)
         else:
             content_type = resolve_content_type(file.filename or unique_filename, file.content_type)
@@ -81,7 +94,7 @@ async def upload_file(
         # Get public URL for the uploaded file from the correct bucket
         url = SupabaseClient.get_file_url(bucket_name, file_path)
         logger.info(f"Generated public URL: {url}")
-        thumbnail_url = url if file_type == "photo" else None
+        thumbnail_url = url if file_type in ("photo", "avatar") else None
     except RuntimeError as e:
         error_msg = str(e)
         if "SUPABASE_URL" in error_msg or "SUPABASE_SERVICE_ROLE_KEY" in error_msg:
@@ -107,7 +120,7 @@ async def upload_file(
                     content_type=content_type,
                 )
                 url = SupabaseClient.get_file_url(bucket_name, file_path)
-                thumbnail_url = url if file_type == "photo" else None
+                thumbnail_url = url if file_type in ("photo", "avatar") else None
             except Exception as retry_error:
                 logger.error(f"Failed to upload file after retry: {retry_error}")
                 raise BadRequestException(f"Failed to upload file: {str(retry_error)}")
@@ -120,7 +133,11 @@ async def upload_file(
     from sqlalchemy import select, and_
     
     file_id = None
-    if file_type == "photo":
+    if file_type == "avatar":
+        # Avatars aren't asset media: no AssetPhoto/AssetDocument row. The
+        # caller just needs the permanent public URL for PUT /users/me.
+        pass
+    elif file_type == "photo":
         photo = AssetPhoto(
             asset_id=asset_id,  # Can be None if asset doesn't exist yet
             file_name=file.filename,

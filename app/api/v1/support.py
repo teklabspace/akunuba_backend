@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Body, File, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_, and_
+from sqlalchemy.orm import selectinload
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone, timedelta
 from app.database import get_db
@@ -286,10 +287,24 @@ class TicketReplyResponse(BaseModel):
     message: str
     is_internal: bool
     user_id: UUID
+    user_name: Optional[str] = None
+    avatar_url: Optional[str] = None
     created_at: datetime
 
     class Config:
         from_attributes = True
+
+
+def _reply_response(reply: TicketReply, author: Optional[User]) -> TicketReplyResponse:
+    return TicketReplyResponse(
+        id=reply.id,
+        message=reply.message,
+        is_internal=reply.is_internal == "true",
+        user_id=reply.user_id,
+        user_name=_display_name(author) if author else None,
+        avatar_url=author.avatar_url if author else None,
+        created_at=reply.created_at,
+    )
 
 
 @router.post("/tickets/{ticket_id}/replies", response_model=TicketReplyResponse, status_code=status.HTTP_201_CREATED)
@@ -343,7 +358,7 @@ async def create_ticket_reply(
     await db.refresh(reply)
     
     logger.info(f"Ticket reply created: {reply.id} for ticket {ticket_id}")
-    return reply
+    return _reply_response(reply, current_user)
 
 
 @router.get("/tickets/{ticket_id}/replies", response_model=List[TicketReplyResponse])
@@ -374,16 +389,22 @@ async def get_ticket_replies(
         if ticket.account_id != account.id:
             raise HTTPException(status_code=403, detail="Access denied")
     
-    query = select(TicketReply).where(TicketReply.ticket_id == ticket_id)
-    
+    # Eager-load authors so each reply can carry name + avatar (async lazy
+    # loading would raise MissingGreenlet).
+    query = (
+        select(TicketReply)
+        .options(selectinload(TicketReply.user))
+        .where(TicketReply.ticket_id == ticket_id)
+    )
+
     # Filter internal notes for non-admins
     if not is_admin or not include_internal:
         query = query.where(TicketReply.is_internal == "false")
-    
+
     result = await db.execute(query.order_by(TicketReply.created_at.asc()))
     replies = result.scalars().all()
-    
-    return replies
+
+    return [_reply_response(reply, reply.user) for reply in replies]
 
 
 class TicketRatingRequest(BaseModel):
@@ -551,7 +572,8 @@ async def assign_ticket(
         "message": "Ticket assigned successfully",
         "ticket_id": str(ticket_id),
         "assigned_to": str(assign_data.user_id),
-        "user_name": assign_data.user_name or user.email
+        "user_name": assign_data.user_name or user.email,
+        "user_avatar": user.avatar_url
     }
 
 

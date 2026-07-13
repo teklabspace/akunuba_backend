@@ -557,6 +557,60 @@ async def create_subscription(
     )
 
 
+async def reconcile_incomplete_with_stripe(db, subscription) -> None:
+    """Self-heal an INCOMPLETE row when Stripe says the customer already paid.
+
+    Activation normally arrives via the invoice.payment_succeeded webhook, but a
+    missed/delayed webhook left paid users stuck on the frontend's "checking
+    payment" screen forever and bounced back to checkout on re-login (real
+    production incident: the Stripe webhook endpoint was disabled). Called from
+    GET /subscriptions so the very poll the frontend is already doing performs
+    the recovery. Best-effort: never raises into the caller.
+    """
+    try:
+        stripe_sub = StripeClient.retrieve_subscription(subscription.stripe_subscription_id)
+    except Exception as e:
+        logger.warning(
+            f"Could not reconcile subscription {subscription.id} with Stripe: {e}"
+        )
+        return
+
+    stripe_status = stripe_sub.get("status")
+    if stripe_status in ("active", "trialing"):
+        # Same field mapping the webhook applies.
+        from app.api.v1.webhooks import (
+            _period_from_stripe_subscription,
+            _plan_from_stripe_subscription,
+        )
+        subscription.status = SubscriptionStatus.ACTIVE
+        start, end = _period_from_stripe_subscription(stripe_sub)
+        if start:
+            subscription.current_period_start = start
+        if end:
+            subscription.current_period_end = end
+        tier, cycle, amount = _plan_from_stripe_subscription(stripe_sub)
+        if tier:
+            subscription.plan_tier = tier
+        if cycle:
+            subscription.billing_cycle = cycle
+        if amount is not None:
+            subscription.amount = amount
+        await db.commit()
+        logger.info(
+            f"Reconciled subscription {subscription.id}: Stripe says {stripe_status}, "
+            f"promoted INCOMPLETE -> ACTIVE (webhook was missed)"
+        )
+    elif stripe_status == "canceled":
+        subscription.status = SubscriptionStatus.CANCELLED
+        subscription.cancelled_at = datetime.utcnow()
+        await db.commit()
+        logger.info(
+            f"Reconciled subscription {subscription.id}: Stripe says canceled"
+        )
+    # incomplete / incomplete_expired / past_due first invoice: leave as-is —
+    # the customer genuinely hasn't paid yet.
+
+
 @router.get("")
 async def get_subscription(
     current_user: User = Depends(get_current_user),
@@ -610,6 +664,14 @@ async def get_subscription(
             data={"subscription": None, **caps},
             message="No active subscription found.",
         )
+
+    # Self-heal a paid-but-stuck row before reporting status: if the activation
+    # webhook was missed, the frontend's own status poll performs the recovery.
+    if (
+        subscription.status == SubscriptionStatus.INCOMPLETE
+        and subscription.stripe_subscription_id
+    ):
+        await reconcile_incomplete_with_stripe(db, subscription)
 
     # Lazily expire an active subscription whose period has lapsed.
     now = datetime.now(timezone.utc)

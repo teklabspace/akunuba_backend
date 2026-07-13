@@ -27,6 +27,7 @@ class UserLogin(BaseModel):
 
 class UserResponse(UserBase):
     id: UUID
+    avatar_url: Optional[str] = None
     role: Role
     is_active: bool
     is_verified: bool
@@ -93,4 +94,7 @@ class UserUpdate(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     phone: Optional[str] = None
+    # Explicit null clears the picture; omitting the field leaves it unchanged
+    # (the endpoint distinguishes the two via model_fields_set).
+    avatar_url: Optional[str] = Field(None, max_length=500)
 

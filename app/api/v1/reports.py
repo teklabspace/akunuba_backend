@@ -19,6 +19,7 @@ from app.models.document import Document
 from app.models.asset import AssetAppraisal, AppraisalStatus
 from app.core.exceptions import NotFoundException, BadRequestException
 from app.core.permissions import Permission, has_permission
+from app.services.net_worth import compute_net_worth, core_assets, breakdown_dict
 from app.utils.logger import logger
 from pydantic import BaseModel
 from uuid import UUID
@@ -29,10 +30,11 @@ router = APIRouter()
 
 
 class PortfolioReport(BaseModel):
-    total_value: Decimal
+    total_value: Decimal  # net worth: core assets - liabilities
     asset_count: int
     asset_allocation: dict
     performance: dict
+    net_worth_breakdown: Optional[dict] = None
 
 
 class PerformanceReport(BaseModel):
@@ -67,10 +69,13 @@ async def generate_portfolio_report(
     assets_result = await db.execute(
         select(Asset).where(Asset.account_id == account.id)
     )
-    assets = assets_result.scalars().all()
-    
-    total_value = sum([asset.current_value for asset in assets])
-    
+    all_assets = assets_result.scalars().all()
+    breakdown = compute_net_worth(all_assets)
+    # Report headline is net worth; allocation covers core (owned) assets.
+    assets = core_assets(all_assets)
+    total_value = breakdown.net_worth
+    allocation_total = breakdown.total_assets
+
     # Asset allocation
     asset_allocation = {}
     for asset in assets:
@@ -84,10 +89,10 @@ async def generate_portfolio_report(
         asset_allocation[asset_type]["count"] += 1
         asset_allocation[asset_type]["value"] += asset.current_value
     
-    if total_value > 0:
+    if allocation_total > 0:
         for asset_type in asset_allocation:
             asset_allocation[asset_type]["percentage"] = (
-                asset_allocation[asset_type]["value"] / total_value * 100
+                asset_allocation[asset_type]["value"] / allocation_total * 100
             )
     
     # Get performance data from portfolio or calculate
@@ -139,6 +144,7 @@ async def generate_portfolio_report(
         asset_count=len(assets),
         asset_allocation=asset_allocation,
         performance=performance_data,
+        net_worth_breakdown=breakdown_dict(breakdown),
     )
 
 
@@ -164,8 +170,8 @@ async def generate_performance_report(
     assets_result = await db.execute(
         select(Asset).where(Asset.account_id == account.id)
     )
-    assets = assets_result.scalars().all()
-    
+    assets = core_assets(assets_result.scalars().all())
+
     current_value = sum([asset.current_value for asset in assets])
     
     # Get historical valuations from AssetValuation records
@@ -439,10 +445,12 @@ async def generate_report(
             assets_result = await db.execute(
                 select(Asset).where(Asset.account_id == account.id)
             )
-            assets = assets_result.scalars().all()
-            
-            total_value = sum([asset.current_value for asset in assets])
-            
+            all_assets = assets_result.scalars().all()
+            breakdown = compute_net_worth(all_assets)
+            assets = core_assets(all_assets)
+            total_value = breakdown.net_worth
+            allocation_total = breakdown.total_assets
+
             asset_allocation = {}
             for asset in assets:
                 asset_type = asset.asset_type.value if asset.asset_type else "other"
@@ -451,18 +459,19 @@ async def generate_report(
                 asset_allocation[asset_type]["count"] += 1
                 asset_allocation[asset_type]["value"] += asset.current_value
             
-            if total_value > 0:
+            if allocation_total > 0:
                 for asset_type in asset_allocation:
                     asset_allocation[asset_type]["percentage"] = (
-                        asset_allocation[asset_type]["value"] / total_value * 100
+                        asset_allocation[asset_type]["value"] / allocation_total * 100
                     )
-            
+
             report_data_dict = {
                 "total_value": float(total_value),
                 "asset_count": len(assets),
-                "asset_allocation": {k: {**v, "value": float(v["value"]), "percentage": float(v["percentage"])} 
+                "asset_allocation": {k: {**v, "value": float(v["value"]), "percentage": float(v["percentage"])}
                                     for k, v in asset_allocation.items()},
-                "performance": {}
+                "performance": {},
+                "net_worth_breakdown": breakdown_dict(breakdown)
             }
         
         elif report_type_enum == ReportType.PERFORMANCE:
@@ -476,8 +485,8 @@ async def generate_report(
             assets_result = await db.execute(
                 select(Asset).where(Asset.account_id == account.id)
             )
-            assets = assets_result.scalars().all()
-            
+            assets = core_assets(assets_result.scalars().all())
+
             current_value = sum([asset.current_value for asset in assets])
             historical_value = current_value * Decimal("0.95")  # Simplified
             

@@ -34,6 +34,7 @@ from app.api.deps import get_account, get_user_subscription_plan
 from app.core.features import get_limit, check_usage_limit
 from app.services import ai_appraisal_service
 from app.services import appraisal_thread
+from app.services.net_worth import compute_net_worth, breakdown_dict
 from app.utils.logger import logger
 from app.integrations.supabase_client import SupabaseClient
 from app.config import settings
@@ -898,8 +899,10 @@ async def get_assets_summary(
             )
         }
     
-    # Calculate summary
-    total_value = sum([asset.current_value for asset in assets])
+    # Calculate summary — headline is net worth (core - liabilities); per-group
+    # totals below stay gross so each group page can show its own number.
+    breakdown = compute_net_worth(assets)
+    total_value = breakdown.net_worth
     total_estimated_value = total_value  # Assuming same for now
     
     # Get pending appraisals
@@ -949,15 +952,30 @@ async def get_assets_summary(
         {"category": k, "count": v["count"], "total_value": v["value"]}
         for k, v in by_category.items()
     ]
-    
+
+    # Group by category group (gross per-group totals)
+    by_group = {}
+    for asset in assets:
+        group_name = asset.category_group.value if asset.category_group else "Ungrouped"
+        if group_name not in by_group:
+            by_group[group_name] = {"count": 0, "value": Decimal("0.00")}
+        by_group[group_name]["count"] += 1
+        by_group[group_name]["value"] += asset.current_value
+
+    group_list = [
+        {"category_group": k, "count": v["count"], "total_value": v["value"]}
+        for k, v in by_group.items()
+    ]
+
     return {
         "data": AssetsSummaryResponse(
             total_assets=len(assets),
             total_value=total_value,
             total_estimated_value=total_estimated_value,
+            net_worth_breakdown=breakdown_dict(breakdown),
             currency=assets[0].currency if assets else "USD",
             by_category=category_list,
-            by_category_group=[],  # Would need category_group implementation
+            by_category_group=group_list,
             recently_added=recently_added,
             pending_appraisals=pending_appraisals,
             pending_sales=pending_sales
@@ -1134,6 +1152,19 @@ async def get_asset(
     return {"data": response_dict}
 
 
+def review_status_after_investor_edit(current: Optional[AIReviewStatus]) -> Optional[AIReviewStatus]:
+    """Review verdict an asset should carry after its owner edits it.
+
+    A rejected/needs-review verdict describes the PRE-edit content — editing is
+    how the investor fixes and resubmits, so the asset returns to the review
+    queue (NOT_REVIEWED). Anything else (not_reviewed, None) is left unchanged;
+    APPROVED never reaches here because the edit lock rejects the PUT first.
+    """
+    if current in (AIReviewStatus.REJECTED, AIReviewStatus.NEEDS_REVIEW):
+        return AIReviewStatus.NOT_REVIEWED
+    return current
+
+
 @router.put("/{asset_id}", response_model=Dict[str, AssetResponse])
 async def update_asset(
     asset_id: UUID,
@@ -1156,10 +1187,19 @@ async def update_asset(
         )
     )
     asset = result.scalar_one_or_none()
-    
+
     if not asset:
         raise NotFoundException("Asset", str(asset_id))
-    
+
+    # Server-side edit lock: once the review verdict is APPROVED the owner can
+    # no longer edit (the frontend hides the button, but client-side gating is
+    # not a restriction). Admins don't hit this route — it is owner-scoped.
+    if asset.ai_review_status == AIReviewStatus.APPROVED:
+        raise ForbiddenException(
+            "This asset has been approved and can no longer be edited.",
+            code="ASSET_LOCKED",
+        )
+
     # Update all provided fields
     if asset_data.category_id is not None:
         asset.category_id = asset_data.category_id
@@ -1261,7 +1301,15 @@ async def update_asset(
         if metadata == "null" or metadata is None:
             metadata = {}
         asset.meta_data = metadata
-    
+
+    # A rejected/needs-review verdict describes the pre-edit content: editing
+    # is the fix-and-resubmit path, so re-queue the asset for review.
+    requeued = review_status_after_investor_edit(asset.ai_review_status)
+    if requeued != asset.ai_review_status:
+        asset.ai_review_status = requeued
+        asset.ai_reviewed_at = None
+        logger.info(f"Asset {asset.id} re-queued for review after owner edit")
+
     await db.commit()
     
     # Reload asset with all relationships using selectinload

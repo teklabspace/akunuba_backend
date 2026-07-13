@@ -75,6 +75,7 @@ async def get_crm_users(
                 "full_name": full_name,
                 "first_name": user.first_name,
                 "last_name": user.last_name,
+                "avatar_url": user.avatar_url,
                 "role": user.role.value if user.role else None,
                 "created_at": user.created_at.isoformat() if user.created_at else None
             })

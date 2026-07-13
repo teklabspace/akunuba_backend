@@ -108,6 +108,7 @@ class UserProfileResponse(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     phone: Optional[str] = None
+    avatar_url: Optional[str] = None
     email_verified: bool
     kyc_status: str
     role: Role
@@ -152,6 +153,7 @@ async def get_current_user_info(
         first_name=current_user.first_name,
         last_name=current_user.last_name,
         phone=current_user.phone,
+        avatar_url=current_user.avatar_url,
         email_verified=email_verified,
         kyc_status=kyc_status,
         role=current_user.role,
@@ -183,10 +185,44 @@ async def update_current_user(
         current_user.last_name = user_data.last_name
     if user_data.phone is not None:
         current_user.phone = user_data.phone
-    
+    # avatar_url: explicit null clears the picture, so check "was the field
+    # sent" rather than "is it non-None".
+    replaced_avatar = None
+    if "avatar_url" in user_data.model_fields_set:
+        from app.config import settings
+        from app.utils.upload_helpers import storage_path_from_public_url
+
+        new_avatar = user_data.avatar_url
+        # Only URLs minted by our own /files/upload are accepted (frontend
+        # contract, confirmed 2026-07-13): this field is rendered in <img>
+        # tags app-wide, so foreign/hostile URLs are rejected outright.
+        if new_avatar and storage_path_from_public_url(new_avatar, settings.SUPABASE_URL) is None:
+            raise BadRequestException(
+                "avatar_url must be a file URL returned by /files/upload"
+            )
+        if current_user.avatar_url and current_user.avatar_url != new_avatar:
+            replaced_avatar = current_user.avatar_url
+        current_user.avatar_url = new_avatar
+
     await db.commit()
     await db.refresh(current_user)
-    
+
+    # Privacy: a replaced/removed avatar must not stay reachable at its public
+    # URL. Best-effort delete AFTER the commit (never fail the profile update),
+    # and only inside avatars/ so a legacy value pointing at asset media can
+    # never delete an asset photo.
+    if replaced_avatar:
+        from app.config import settings
+        from app.integrations.supabase_client import SupabaseClient
+        from app.utils.upload_helpers import storage_path_from_public_url
+
+        old_path = storage_path_from_public_url(replaced_avatar, settings.SUPABASE_URL)
+        if old_path and old_path.startswith("avatars/"):
+            try:
+                SupabaseClient.delete_file("images", old_path)
+            except Exception as e:
+                logger.warning(f"Failed to delete replaced avatar {old_path}: {e}")
+
     logger.info(f"User profile updated: {current_user.id}")
     return current_user
 

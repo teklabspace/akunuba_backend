@@ -16,6 +16,7 @@ from app.models.banking import LinkedAccount, Transaction, AccountType as Bankin
 from app.models.order import Order, OrderStatus, OrderType
 from app.models.notification import Notification, NotificationType
 from app.core.exceptions import NotFoundException, BadRequestException
+from app.services.net_worth import compute_net_worth, core_assets, breakdown_dict
 from app.utils.logger import logger
 from app.integrations.polygon_client import PolygonClient
 from app.integrations.alpaca_client import AlpacaClient
@@ -54,9 +55,10 @@ class PerformanceMetrics(BaseModel):
 
 
 class PortfolioResponse(BaseModel):
-    total_value: Decimal
+    total_value: Decimal  # net worth: core assets - liabilities
     currency: str
     asset_count: int
+    net_worth_breakdown: Optional[Dict[str, Any]] = None
     asset_allocation: List[AssetAllocationItem]
     performance_data: Optional[PerformanceMetrics] = None
     assets: List[Dict[str, Any]]
@@ -85,14 +87,19 @@ async def get_portfolio(
         select(Asset).where(Asset.account_id == account.id)
     )
     assets = assets_result.scalars().all()
-    
-    # Calculate total value
-    total_value = sum([asset.current_value for asset in assets]) if assets else Decimal("0.00")
-    currency = assets[0].currency if assets and len(assets) > 0 else "USD"
-    
+
+    # Group-aware totals: the headline value is NET WORTH (core assets minus
+    # liabilities); allocation runs over core (owned) assets only so debts and
+    # record-keeping groups don't appear as wealth.
+    breakdown = compute_net_worth(assets)
+    portfolio_assets = core_assets(assets)
+    total_value = breakdown.net_worth
+    allocation_total = breakdown.total_assets
+    currency = portfolio_assets[0].currency if portfolio_assets else "USD"
+
     # Calculate asset allocation by type
     allocation_by_type = {}
-    for asset in assets:
+    for asset in portfolio_assets:
         asset_type = asset.asset_type.value
         if asset_type not in allocation_by_type:
             allocation_by_type[asset_type] = {
@@ -110,10 +117,10 @@ async def get_portfolio(
             "currency": asset.currency
         })
     
-    # Format allocation with percentages
+    # Format allocation with percentages (of gross owned assets, so they sum to 100)
     allocation_items = []
     for asset_type, data in allocation_by_type.items():
-        percentage = (data["value"] / total_value * 100) if total_value > 0 else Decimal("0.00")
+        percentage = (data["value"] / allocation_total * 100) if allocation_total > 0 else Decimal("0.00")
         allocation_items.append(AssetAllocationItem(
             asset_type=asset_type,
             count=data["count"],
@@ -121,10 +128,10 @@ async def get_portfolio(
             percentage=percentage,
             assets=data["assets"]
         ))
-    
+
     # Sort by value descending
     allocation_items.sort(key=lambda x: x.value, reverse=True)
-    
+
     # Calculate performance data
     performance_data = None
     if include_performance:
@@ -191,13 +198,14 @@ async def get_portfolio(
             "currency": asset.currency,
             "description": asset.description,
         }
-        for asset in sorted(assets, key=lambda x: x.current_value, reverse=True)
+        for asset in sorted(portfolio_assets, key=lambda x: x.current_value, reverse=True)
     ]
-    
+
     return PortfolioResponse(
         total_value=total_value,
         currency=currency,
-        asset_count=len(assets),
+        asset_count=len(portfolio_assets),
+        net_worth_breakdown=breakdown_dict(breakdown),
         asset_allocation=allocation_items,
         performance_data=performance_data,
         assets=assets_data,
@@ -220,15 +228,16 @@ async def calculate_performance(
     now = datetime.now(timezone.utc)
     period_start = now - timedelta(days=days)
     
-    # Get all assets for the account
+    # Get all assets for the account — performance is measured over core
+    # (owned) assets only; liabilities and record-keeping groups are excluded.
     assets_result = await db.execute(
         select(Asset).where(Asset.account_id == account_id)
     )
-    assets = assets_result.scalars().all()
-    
+    assets = core_assets(assets_result.scalars().all())
+
     if not assets:
         return None
-    
+
     # Calculate current total value
     current_value = sum([asset.current_value for asset in assets])
     currency = assets[0].currency if assets else "USD"
@@ -346,12 +355,11 @@ async def calculate_performance(
 
 
 async def calculate_risk_metrics(account_id: UUID, db: AsyncSession) -> Dict[str, Any]:
-    """Calculate risk metrics for the portfolio"""
-    # Get all assets
+    """Calculate risk metrics for the portfolio (core/owned assets only)"""
     assets_result = await db.execute(
         select(Asset).where(Asset.account_id == account_id)
     )
-    assets = assets_result.scalars().all()
+    assets = core_assets(assets_result.scalars().all())
     
     if not assets:
         return {}
@@ -476,12 +484,12 @@ async def get_portfolio_history(
         if not account:
             raise NotFoundException("Account", str(current_user.id))
         
-        # Get all assets
+        # History tracks core (owned) assets so it matches the headline total.
         assets_result = await db.execute(
             select(Asset).where(Asset.account_id == account.id)
         )
-        assets = assets_result.scalars().all()
-        
+        assets = core_assets(assets_result.scalars().all())
+
         if not assets:
             return PortfolioHistoryResponse(data=[])
         
@@ -580,15 +588,16 @@ async def get_allocation(
     if not account:
         raise NotFoundException("Account", str(current_user.id))
     
-    # Get all assets
+    # Allocation covers core (owned) assets only — liabilities and
+    # record-keeping groups aren't part of the wealth being allocated.
     assets_result = await db.execute(
         select(Asset).where(Asset.account_id == account.id)
     )
-    assets = assets_result.scalars().all()
-    
+    assets = core_assets(assets_result.scalars().all())
+
     if not assets:
         return []
-    
+
     # Calculate total value
     total_value = sum([asset.current_value for asset in assets])
     
@@ -704,6 +713,7 @@ class PortfolioSummaryResponse(BaseModel):
     return_percentage: Decimal
     today_change: Decimal
     today_change_percentage: Decimal
+    net_worth_breakdown: Optional[Dict[str, Any]] = None
 
 
 @router.get("/summary")
@@ -721,14 +731,16 @@ async def get_portfolio_summary(
     if not account:
         raise NotFoundException("Account", str(current_user.id))
     
-    # Get all assets
+    # Get all assets; returns/change math runs over core (owned) assets only,
+    # while liabilities feed total_debts below.
     assets_result = await db.execute(
         select(Asset).where(Asset.account_id == account.id)
     )
-    assets = assets_result.scalars().all()
-    
-    # Calculate total assets value
-    total_assets = sum([asset.current_value for asset in assets]) if assets else Decimal("0.00")
+    all_assets = assets_result.scalars().all()
+    breakdown = compute_net_worth(all_assets)
+    assets = core_assets(all_assets)
+
+    total_assets = breakdown.total_assets
     
     # Calculate total invested (sum of initial values or cost basis)
     total_invested = Decimal("0.00")
@@ -792,13 +804,12 @@ async def get_portfolio_summary(
         if linked_account.balance:
             cash_available += linked_account.balance
     
-    # Calculate total debts (simplified - could be from loans, credit cards, etc.)
-    # For now, set to 0 or calculate from debt assets if any
-    total_debts = Decimal("0.00")
-    
+    # Debts = the Liabilities category group (amount owed stored as positive value)
+    total_debts = breakdown.total_liabilities
+
     # Total portfolio value = assets + cash - debts
     total_portfolio_value = total_assets + cash_available - total_debts
-    
+
     return PortfolioSummaryResponse(
         total_portfolio_value=total_portfolio_value,
         total_assets=total_assets,
@@ -807,7 +818,8 @@ async def get_portfolio_summary(
         total_returns=total_returns,
         return_percentage=return_percentage,
         today_change=today_change,
-        today_change_percentage=today_change_percentage
+        today_change_percentage=today_change_percentage,
+        net_worth_breakdown=breakdown_dict(breakdown)
     )
 
 
@@ -828,12 +840,12 @@ async def get_top_holdings(
     if not account:
         raise NotFoundException("Account", str(current_user.id))
     
-    # Get all assets
+    # Top holdings = core (owned) assets only; a mortgage is not a holding.
     assets_result = await db.execute(
         select(Asset).where(Asset.account_id == account.id)
     )
-    assets = assets_result.scalars().all()
-    
+    assets = core_assets(assets_result.scalars().all())
+
     holdings = []
     for asset in assets:
         # Get current price from Polygon if available

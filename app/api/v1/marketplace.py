@@ -782,14 +782,15 @@ async def listing_approval_queue(
         data.append({
             "id": str(listing.id),
             "title": listing.title,
-            "owner": {"id": str(owner.id), "name": owner_name, "email": owner.email},
+            "owner": {"id": str(owner.id), "name": owner_name, "email": owner.email, "avatar_url": owner.avatar_url},
             "asking_price": float(listing.asking_price) if listing.asking_price is not None else None,
             "currency": listing.currency,
             "status": listing.status.value,
             "submitted_at": listing.created_at.isoformat() if listing.created_at else None,
             "assigned_advisor": (
                 {"id": str(advisor_user.id),
-                 "name": (f"{advisor_user.first_name or ''} {advisor_user.last_name or ''}".strip() or advisor_user.email)}
+                 "name": (f"{advisor_user.first_name or ''} {advisor_user.last_name or ''}".strip() or advisor_user.email),
+                 "avatar_url": advisor_user.avatar_url}
                 if advisor_user else None
             ),
         })

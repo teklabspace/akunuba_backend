@@ -1333,6 +1333,7 @@ async def list_all_subscriptions(
             "user_id": str(usr.id),
             "user_email": usr.email,
             "user_name": f"{usr.first_name or ''} {usr.last_name or ''}".strip() or None,
+            "user_avatar": usr.avatar_url,
             # Real product tier the customer bought (fixes "$49 shows Free").
             "plan_id": plan_id,
             "plan_name": plan_config["name"],
@@ -1516,9 +1517,10 @@ def _asset_request_row(req_type: str, req, asset, usr, assignee=None) -> Dict[st
         "type": req_type,  # "appraisal" | "sale"
         "status": status_val,
         "asset": {"id": str(asset.id), "name": asset.name},
-        "requested_by": {"id": str(usr.id), "name": _full_name(usr), "email": usr.email},
+        "requested_by": {"id": str(usr.id), "name": _full_name(usr), "email": usr.email, "avatar_url": usr.avatar_url},
         "assigned_advisor": (
-            {"id": str(assignee.id), "name": _full_name(assignee)} if assignee else None
+            {"id": str(assignee.id), "name": _full_name(assignee), "avatar_url": assignee.avatar_url}
+            if assignee else None
         ),
         "created_at": created.isoformat() if created else None,
     }
@@ -1568,8 +1570,10 @@ async def admin_list_tickets(
             "category": ticket.category,
             "user_name": _full_name(requester),
             "user_email": requester.email if requester else None,
+            "user_avatar": requester.avatar_url if requester else None,
             "assigned_advisor": (
-                {"id": str(assignee.id), "name": _full_name(assignee)} if assignee else None
+                {"id": str(assignee.id), "name": _full_name(assignee), "avatar_url": assignee.avatar_url}
+                if assignee else None
             ),
             "created_at": ticket.created_at.isoformat() if ticket.created_at else None,
             "updated_at": ticket.updated_at.isoformat() if ticket.updated_at else None,
@@ -1708,7 +1712,7 @@ async def admin_assign_asset_request(
         "data": {
             "id": str(req.id),
             "type": rt,
-            "assigned_advisor": {"id": str(advisor.id), "name": _full_name(advisor)},
+            "assigned_advisor": {"id": str(advisor.id), "name": _full_name(advisor), "avatar_url": advisor.avatar_url},
         },
     }
 
@@ -1743,6 +1747,7 @@ async def _build_conversation_row(db: AsyncSession, conv, viewer_id) -> Dict[str
             "content": (last.content or "")[:200],
             "sender_id": str(last.sender_id),
             "sender_name": _full_name(sender),
+            "sender_avatar": sender.avatar_url if sender else None,
             "timestamp": last.timestamp.isoformat() if last.timestamp else None,
         }
 
@@ -1837,6 +1842,7 @@ async def admin_get_conversation_messages(
             "conversation_id": str(m.conversation_id),
             "sender_id": str(m.sender_id),
             "sender_name": _full_name(sender),
+            "sender_avatar": sender.avatar_url if sender else None,
             "sender_role": sender.role.value if sender else None,
             "content": m.content,
             "timestamp": m.timestamp.isoformat() if m.timestamp else None,
@@ -2160,6 +2166,7 @@ async def list_all_verifications(
                 "user_id": str(usr.id),
                 "user_email": usr.email,
                 "user_name": f"{usr.first_name or ''} {usr.last_name or ''}".strip() or None,
+                "user_avatar": usr.avatar_url,
                 "status": kyc.status.value,
                 "documents_submitted": kyc.documents_submitted,
                 "persona_inquiry_id": kyc.persona_inquiry_id,
@@ -2196,6 +2203,7 @@ async def list_all_verifications(
                 "user_id": str(usr.id),
                 "user_email": usr.email,
                 "user_name": f"{usr.first_name or ''} {usr.last_name or ''}".strip() or None,
+                "user_avatar": usr.avatar_url,
                 "status": kyb.status.value,
                 "documents_submitted": kyb.documents_submitted,
                 "business_name": kyb.business_name,
@@ -2426,6 +2434,7 @@ def _admin_asset_payload(asset: Asset) -> Dict[str, Any]:
                 # Never null: fall back to email for legacy users without a name.
                 "name": full_name or user.email,
                 "email": user.email,
+                "avatar_url": user.avatar_url,
             }
     payload["owner"] = owner
     return payload
