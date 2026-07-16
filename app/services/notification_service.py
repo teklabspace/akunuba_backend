@@ -108,39 +108,40 @@ class NotificationService:
         metadata: str = None,
         send_email: bool = False,
     ) -> int:
-        """Create a notification for every admin user's account.
+        """Create a notification for every active admin user.
 
         Used for platform events that admins need to act on (new support
-        tickets, disputes, KYC submissions, etc.). Notifications are scoped by
-        ``account_id``, so this fans the event out to each admin's account.
+        tickets, disputes, KYC submissions, etc.). Notifications are
+        user-addressed — admins typically have NO Account row, and the feed
+        endpoint queries by ``user_id`` — so the Account is attached only when
+        one happens to exist (it is required for the optional email leg).
 
-        Returns the number of notifications created. Admins without an Account
-        record are skipped (they cannot view notifications anyway).
+        Returns the number of notifications created.
         """
         from app.core.permissions import Role
 
         result = await db.execute(
-            select(Account)
-            .join(User, Account.user_id == User.id)
-            .where(User.role == Role.ADMIN)
+            select(User.id, Account.id)
+            .outerjoin(Account, Account.user_id == User.id)
+            .where(User.role == Role.ADMIN, User.is_active == True)  # noqa: E712
         )
-        accounts = result.scalars().all()
+        admin_rows = result.all()
 
         created = []
-        for account in accounts:
+        for admin_user_id, account_id in admin_rows:
             notification = Notification(
-                user_id=account.user_id,  # user-addressable so the bell/WS pick it up
-                account_id=account.id,
+                user_id=admin_user_id,  # user-addressable so the bell/WS pick it up
+                account_id=account_id,
                 notification_type=notification_type,
                 title=title,
                 message=message,
                 meta_data=metadata,
             )
             db.add(notification)
-            created.append((notification, account.user_id))
+            created.append((notification, admin_user_id))
 
         if not created:
-            logger.warning(f"notify_admins: no admin accounts found for '{title}'")
+            logger.warning(f"notify_admins: no active admin users found for '{title}'")
             return 0
 
         await db.commit()

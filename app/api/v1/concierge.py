@@ -348,8 +348,32 @@ async def update_appraisal_status(
         else:
             await restore_listing_after_appraisal(db, appraisal.asset_id, appraisal)
 
+    # Notify the asset owner (bell + email) that their appraisal moved forward.
+    try:
+        asset = (await db.execute(select(Asset).where(Asset.id == appraisal.asset_id))).scalar_one_or_none()
+        if asset is not None and asset.account_id is not None:
+            from app.models.notification import NotificationType
+            from app.services.notification_service import NotificationService
+
+            status_label = status_data.status.value.replace("_", " ")
+            message = (
+                f"The appraisal for your asset '{asset.name}' is now: {status_label}."
+            )
+            if status_data.notes:
+                message += f" Note from our team: {status_data.notes}"
+            await NotificationService.create_notification(
+                db=db,
+                account_id=asset.account_id,
+                notification_type=NotificationType.APPRAISAL_MESSAGE,
+                title="Appraisal update",
+                message=message,
+                send_email=True,
+            )
+    except Exception as e:  # noqa: BLE001 — never break the status update
+        logger.error(f"Failed to notify owner of appraisal status change {appraisal_id}: {e}")
+
     logger.info(f"Appraisal status updated: {appraisal_id} -> {status_data.status.value}")
-    
+
     return {
         "data": {
             "id": appraisal.id,
@@ -786,7 +810,27 @@ async def update_appraisal_valuation(
     # auto-publishes the asset to the marketplace (idempotent, never raises).
     from app.services.asset_listing_service import maybe_publish_valued_asset
     await maybe_publish_valued_asset(db, appraisal, current_user)
-    
+
+    # Notify the asset owner (bell + email) that their appraisal completed.
+    try:
+        if appraisal.asset is not None and appraisal.asset.account_id is not None:
+            from app.models.notification import NotificationType
+            from app.services.notification_service import NotificationService
+
+            await NotificationService.create_notification(
+                db=db,
+                account_id=appraisal.asset.account_id,
+                notification_type=NotificationType.APPRAISAL_MESSAGE,
+                title="Appraisal completed",
+                message=(
+                    f"The appraisal for your asset '{appraisal.asset.name}' is complete. "
+                    f"Appraised value: {valuation_data.appraised_value:,.2f} {valuation_data.currency}."
+                ),
+                send_email=True,
+            )
+    except Exception as e:  # noqa: BLE001 — never break the valuation update
+        logger.error(f"Failed to notify owner of appraisal valuation {appraisal_id}: {e}")
+
     asset_name = None
     if appraisal.asset:
         asset_name = appraisal.asset.name

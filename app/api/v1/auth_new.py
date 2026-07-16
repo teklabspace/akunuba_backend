@@ -529,10 +529,10 @@ async def register(request: Request, user_data: UserCreate, db: AsyncSession = D
     user.refresh_token = refresh_token
     await db.commit()
     await db.refresh(user)
-    user_name = f"{user_data.first_name or ''} {user_data.last_name or ''}".strip() or "User"
-    await EmailService.send_verification_email(
-        to_email=user.email, to_name=user_name, verification_token=verification_token
-    )
+    # Single email on signup: the OTP is the verification credential. The
+    # link-based verification email is intentionally NOT sent here (it made
+    # signup deliver multiple emails); /auth/resend-verification still exists
+    # for the link flow if a client explicitly asks for it.
     otp_delivery = await _send_otp_and_build_response(user, otp_code)
     logger.info(f"User registered: {user.email}, email_sent={otp_delivery['email_sent']}")
     

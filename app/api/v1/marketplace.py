@@ -632,15 +632,20 @@ async def _assert_can_moderate_listing(db: AsyncSession, user: User, listing: Ma
     )
 
 
-async def _notify_listing_owner(db, listing, ntype, title, message):
+async def _notify_account(db, account_id, ntype, title, message, send_email=False):
+    """Best-effort bell + optional email notification; never breaks the request."""
     from app.services.notification_service import NotificationService
     try:
         await NotificationService.create_notification(
-            db=db, account_id=listing.account_id, notification_type=ntype,
-            title=title, message=message, send_email=False,
+            db=db, account_id=account_id, notification_type=ntype,
+            title=title, message=message, send_email=send_email,
         )
     except Exception as e:
-        logger.error(f"Failed to notify listing owner for {listing.id}: {e}")
+        logger.error(f"Failed to notify account {account_id}: {e}")
+
+
+async def _notify_listing_owner(db, listing, ntype, title, message, send_email=False):
+    await _notify_account(db, listing.account_id, ntype, title, message, send_email=send_email)
 
 
 @router.post("/listings/{listing_id}/approve", response_model=ListingResponse)
@@ -686,6 +691,7 @@ async def approve_listing(
         db, listing, NotificationType.LISTING_APPROVED,
         "Listing approved",
         f"Your listing '{listing.title}' has been approved and is now live in the marketplace.",
+        send_email=True,
     )
 
     logger.info(f"Listing approved: {listing_id} by {current_user.id}")
@@ -728,6 +734,7 @@ async def reject_listing(
         db, listing, NotificationType.GENERAL,
         "Listing rejected",
         f"Your listing '{listing.title}' was rejected. Reason: {listing.rejection_reason}",
+        send_email=True,
     )
 
     logger.info(f"Listing rejected: {listing_id} by {current_user.id}")
@@ -882,7 +889,16 @@ async def create_offer(
     db.add(offer)
     await db.commit()
     await db.refresh(offer)
-    
+
+    from app.models.notification import NotificationType
+    await _notify_listing_owner(
+        db, listing, NotificationType.OFFER_RECEIVED,
+        "New offer received",
+        f"You received an offer of {offer.offer_amount:,.2f} {offer.currency} "
+        f"on your listing '{listing.title}'.",
+        send_email=True,
+    )
+
     logger.info(f"Offer created: {offer.id} on listing {listing_id}")
     return offer
 
@@ -967,7 +983,16 @@ async def accept_offer(
     db.add(escrow)
     await db.commit()
     await db.refresh(escrow)
-    
+
+    from app.models.notification import NotificationType
+    await _notify_account(
+        db, offer.account_id, NotificationType.OFFER_ACCEPTED,
+        "Offer accepted",
+        f"Your offer of {offer.offer_amount:,.2f} {offer.currency} on "
+        f"'{listing.title}' was accepted. Complete the payment to proceed.",
+        send_email=True,
+    )
+
     logger.info(f"Offer accepted: {offer_id}, escrow created: {escrow.id}")
     return {
         "escrow_id": escrow.id,
@@ -1647,7 +1672,16 @@ async def reject_offer(
     
     offer.status = OfferStatus.REJECTED
     await db.commit()
-    
+
+    from app.models.notification import NotificationType
+    await _notify_account(
+        db, offer.account_id, NotificationType.GENERAL,
+        "Offer rejected",
+        f"Your offer of {offer.offer_amount:,.2f} {offer.currency} on "
+        f"'{listing.title}' was rejected by the seller.",
+        send_email=True,
+    )
+
     logger.info(f"Offer rejected: {offer_id}")
     return {"message": "Offer rejected successfully"}
 
@@ -1705,7 +1739,17 @@ async def counter_offer(
     db.add(counter_offer)
     await db.commit()
     await db.refresh(counter_offer)
-    
+
+    from app.models.notification import NotificationType
+    await _notify_account(
+        db, original_offer.account_id, NotificationType.GENERAL,
+        "Counter offer received",
+        f"The seller countered your offer of {original_offer.offer_amount:,.2f} "
+        f"{original_offer.currency} on '{listing.title}' with "
+        f"{counter_offer.offer_amount:,.2f} {counter_offer.currency}.",
+        send_email=True,
+    )
+
     logger.info(f"Counter offer created: {counter_offer.id}")
     return {"message": "Counter offer created", "offer_id": counter_offer.id}
 

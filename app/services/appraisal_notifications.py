@@ -18,6 +18,7 @@ Note on "assigned advisor": there is currently no per-appraisal assignment field
 admins + advisors. Add an `assigned_to` column to target a single advisor.
 """
 import json
+from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 from uuid import UUID
 
@@ -72,6 +73,7 @@ async def _persist_and_push(
     title: str,
     preview: str,
     created_iso: Optional[str],
+    send_email: bool = False,
 ) -> None:
     if not recipients:
         return
@@ -116,6 +118,32 @@ async def _persist_and_push(
             "preview": preview,
             "created_at": created_iso or (notif.created_at.isoformat() if notif.created_at else None),
         })
+
+    if send_email:
+        from app.services.email_service import EmailService
+
+        user_ids = [user_id for _, user_id, _ in notifs]
+        users = (await db.execute(select(User).where(User.id.in_(user_ids)))).scalars().all()
+        users_by_id = {u.id: u for u in users}
+        emailed = False
+        for notif, user_id, _ in notifs:
+            recipient = users_by_id.get(user_id)
+            if not recipient or not recipient.email:
+                continue
+            to_name = f"{recipient.first_name or ''} {recipient.last_name or ''}".strip() or "User"
+            sent = await EmailService.send_notification_email(
+                to_email=recipient.email,
+                to_name=to_name,
+                notification_title=notif.title,
+                notification_message=notif.message,
+                notification_type=notif.notification_type.value,
+            )
+            if sent:
+                notif.email_sent = True
+                notif.email_sent_at = datetime.now(timezone.utc)
+                emailed = True
+        if emailed:
+            await db.commit()
 
     logger.info(f"Dispatched {event_type} for appraisal {appraisal.id} to {len(notifs)} user(s)")
 
@@ -180,6 +208,9 @@ async def dispatch_appraisal_message(
             title=f"New message on {asset.asset_code or 'appraisal'}",
             preview=_preview(comment.body),
             created_iso=comment.created_at.isoformat() if comment.created_at else None,
+            # Staff replies email the asset owner; investor messages stay
+            # bell-only for staff (avoid mailing every admin/advisor).
+            send_email=(kind != "investor"),
         )
     except Exception as e:  # noqa: BLE001
         logger.error(f"Failed to dispatch appraisal_message notification: {e}", exc_info=True)
