@@ -130,7 +130,7 @@ class PlaidClient:
                 "user": {
                     "client_user_id": user_id,
                 },
-                "client_name": "Fullego",
+                "client_name": "Akunuba",
                 "products": ["transactions", "auth"],
                 "country_codes": ["US"],
                 "language": "en",

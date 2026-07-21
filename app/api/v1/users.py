@@ -576,7 +576,7 @@ async def setup_2fa(
     totp = pyotp.TOTP(secret)
     totp_uri = totp.provisioning_uri(
         name=current_user.email,
-        issuer_name="Fullego"
+        issuer_name="Akunuba"
     )
     
     # Generate QR code

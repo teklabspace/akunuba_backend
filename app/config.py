@@ -4,7 +4,7 @@ from pydantic import field_validator
 
 
 class Settings(BaseSettings):
-    APP_NAME: str = "Fullego Backend"
+    APP_NAME: str = "Akunuba Backend"
     APP_ENV: str = "development"
     APP_DEBUG: bool = True
     APP_VERSION: str = "1.0.0"
@@ -105,8 +105,8 @@ class Settings(BaseSettings):
     MAILPIT_API_BASE_URL: str = ""
     MAILPIT_API_USERNAME: str = ""
     MAILPIT_API_PASSWORD: str = ""
-    EMAIL_FROM_ADDRESS: str = "noreply@fullego.local"
-    EMAIL_FROM_NAME: str = "Fullego"
+    EMAIL_FROM_ADDRESS: str = "noreply@akunuba.local"
+    EMAIL_FROM_NAME: str = "Akunuba"
     EMAIL_ENABLED: bool = True
     RESEND_API_KEY: str = ""
     

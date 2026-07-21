@@ -44,14 +44,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build Docker image
-        run: docker build -t fullego-backend .
+        run: docker build -t akunuba-backend .
       - name: Run container
         run: |
           docker run -d -e DATABASE_URL=postgresql://u:p@host/db \
             -e SUPABASE_URL=x -e SUPABASE_ANON_KEY=x -e SUPABASE_SERVICE_ROLE_KEY=x \
             -e SUPABASE_JWT_SECRET=x -e STRIPE_SECRET_KEY=x -e STRIPE_PUBLISHABLE_KEY=x \
             -e STRIPE_WEBHOOK_SECRET=x -e PERSONA_API_KEY=x -e SENDBIRD_APP_ID=x \
-            -e SENDBIRD_API_TOKEN=x -e SECRET_KEY=secret -p 8000:8000 --name api fullego-backend
+            -e SENDBIRD_API_TOKEN=x -e SECRET_KEY=secret -p 8000:8000 --name api akunuba-backend
           sleep 5
           curl -sf http://localhost:8000/health || true
           docker stop api

@@ -1,4 +1,4 @@
-# Fullego Backend - Local / staging with Redis
+# Akunuba Backend - Local / staging with Redis
 version: "3.9"
 
 services:

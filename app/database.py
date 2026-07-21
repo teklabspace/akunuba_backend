@@ -48,7 +48,7 @@ ssl_context.verify_mode = ssl.CERT_NONE
 # Build connect_args for asyncpg
 connect_args = {
     "server_settings": {
-        "application_name": "fullego_backend"
+        "application_name": "akunuba_backend"
     },
     "command_timeout": 60,  # Increased timeout for cloud connections
     "timeout": 90,           # Increased connection timeout to 90 seconds

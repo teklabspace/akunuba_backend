@@ -1,8 +1,8 @@
 {
 	"info": {
-		"_postman_id": "fullego-backend-api",
-		"name": "Fullego Backend API",
-		"description": "Complete API collection for Fullego Wealth Management Platform",
+		"_postman_id": "akunuba-backend-api",
+		"name": "Akunuba Backend API",
+		"description": "Complete API collection for Akunuba Wealth Management Platform",
 		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
 	},
 	"item": [
@@ -6181,7 +6181,7 @@
 								}
 							],
 							"cookie": [],
-							"body": "{\n    \"notifications\": [\n        {\n            \"id\": \"12345678-90ab-cdef-ghij-klmnopqrstuv\",\n            \"title\": \"Welcome to Fullego\",\n            \"message\": \"Thank you for joining!\",\n            \"notification_type\": \"general\",\n            \"is_read\": false,\n            \"created_at\": \"2024-01-15T10:30:00Z\"\n        }\n    ],\n    \"total\": 1,\n    \"unread_count\": 1\n}"
+							"body": "{\n    \"notifications\": [\n        {\n            \"id\": \"12345678-90ab-cdef-ghij-klmnopqrstuv\",\n            \"title\": \"Welcome to Akunuba\",\n            \"message\": \"Thank you for joining!\",\n            \"notification_type\": \"general\",\n            \"is_read\": false,\n            \"created_at\": \"2024-01-15T10:30:00Z\"\n        }\n    ],\n    \"total\": 1,\n    \"unread_count\": 1\n}"
 						}
 					],
 					"event": [
@@ -6229,7 +6229,7 @@
 						],
 						"body": {
 							"mode": "raw",
-							"raw": "{\n    \"account_id\": \"\",\n    \"notification_type\": \"general\",\n    \"title\": \"Welcome to Fullego\",\n    \"message\": \"Thank you for joining!\"\n}",
+							"raw": "{\n    \"account_id\": \"\",\n    \"notification_type\": \"general\",\n    \"title\": \"Welcome to Akunuba\",\n    \"message\": \"Thank you for joining!\"\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -6265,7 +6265,7 @@
 								],
 								"body": {
 									"mode": "raw",
-									"raw": "{\n    \"account_id\": \"\",\n    \"notification_type\": \"general\",\n    \"title\": \"Welcome to Fullego\",\n    \"message\": \"Thank you for joining!\"\n}",
+									"raw": "{\n    \"account_id\": \"\",\n    \"notification_type\": \"general\",\n    \"title\": \"Welcome to Akunuba\",\n    \"message\": \"Thank you for joining!\"\n}",
 									"options": {
 										"raw": {
 											"language": "json"
@@ -6575,7 +6575,7 @@
 								}
 							],
 							"cookie": [],
-							"body": "{\n    \"notifications\": [\n        {\n            \"id\": \"12345678-90ab-cdef-ghij-klmnopqrstuv\",\n            \"title\": \"Welcome to Fullego\",\n            \"message\": \"Thank you for joining!\",\n            \"notification_type\": \"general\",\n            \"is_read\": false,\n            \"created_at\": \"2024-01-15T10:30:00Z\"\n        }\n    ],\n    \"total\": 1,\n    \"unread_count\": 1\n}"
+							"body": "{\n    \"notifications\": [\n        {\n            \"id\": \"12345678-90ab-cdef-ghij-klmnopqrstuv\",\n            \"title\": \"Welcome to Akunuba\",\n            \"message\": \"Thank you for joining!\",\n            \"notification_type\": \"general\",\n            \"is_read\": false,\n            \"created_at\": \"2024-01-15T10:30:00Z\"\n        }\n    ],\n    \"total\": 1,\n    \"unread_count\": 1\n}"
 						}
 					],
 					"event": [

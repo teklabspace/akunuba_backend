@@ -32,15 +32,18 @@ class CategoryGroupResponse(BaseModel):
 
 # Photo Schemas
 class PhotoResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
     id: UUID
     url: str
     thumbnail_url: Optional[str] = None
     file_name: str
     file_size: Optional[int] = None
-    uploaded_at: datetime
-
-    class Config:
-        from_attributes = True
+    # The ORM column is created_at; the API contract exposes it as uploaded_at.
+    uploaded_at: Optional[datetime] = Field(
+        default=None,
+        validation_alias=AliasChoices("uploaded_at", "created_at"),
+    )
 
 
 class PhotoUploadResponse(BaseModel):
@@ -49,16 +52,19 @@ class PhotoUploadResponse(BaseModel):
 
 # Document Schemas
 class DocumentResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
     id: UUID
     name: str
     document_type: Optional[str] = None
     url: str
     date: Optional[datetime] = None
     file_size: Optional[int] = None
-    uploaded_at: datetime
-
-    class Config:
-        from_attributes = True
+    # The ORM column is created_at; the API contract exposes it as uploaded_at.
+    uploaded_at: Optional[datetime] = Field(
+        default=None,
+        validation_alias=AliasChoices("uploaded_at", "created_at"),
+    )
 
 
 class DocumentListResponse(BaseModel):

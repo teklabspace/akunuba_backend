@@ -34,7 +34,7 @@ def _configure_logging():
     root.setLevel(level)
     if not root.handlers:
         root.addHandler(handler)
-    return logging.getLogger("fullego")
+    return logging.getLogger("akunuba")
 
 
 logger = _configure_logging()

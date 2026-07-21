@@ -1,4 +1,4 @@
-# Fullego Backend - Production Dockerfile
+# Akunuba Backend - Production Dockerfile
 FROM python:3.11-slim
 
 WORKDIR /app

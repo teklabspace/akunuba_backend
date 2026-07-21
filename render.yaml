@@ -1,7 +1,7 @@
 services:
   # Web Service (FastAPI Backend)
   - type: web
-    name: fullego-backend
+    name: akunuba-backend
     env: python
     region: oregon # Options: oregon, frankfurt, singapore, mumbai, tokyo
     plan: starter # Options: free, starter, standard, pro
@@ -11,7 +11,7 @@ services:
     envVars:
       # Application Settings
       - key: APP_NAME
-        value: Fullego Backend
+        value: Akunuba Backend
       - key: APP_ENV
         value: production
       - key: APP_DEBUG
@@ -142,6 +142,9 @@ services:
         value: https://us.i.posthog.com
 
   # PostgreSQL Database (Optional - if you want to use Render's managed PostgreSQL)
+  # NOTE: resource names kept as "fullego" on purpose — renaming them in a
+  # blueprint makes Render provision a NEW empty database instead of reusing
+  # the existing one. Rename only via the Render dashboard, if ever.
   - type: pg
     name: fullego-database
     plan: starter # Options: starter, standard, pro

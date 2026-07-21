@@ -165,16 +165,16 @@ class EmailService:
         <body>
             <div class="container">
                 <div class="header">
-                    <h1>Fullego</h1>
+                    <h1>Akunuba</h1>
                 </div>
                 <div class="content">
                     <h2>{{ title }}</h2>
                     <p>Hi {{ name }},</p>
                     <p>{{ message }}</p>
-                    <p>Best regards,<br>The Fullego Team</p>
+                    <p>Best regards,<br>The Akunuba Team</p>
                 </div>
                 <div class="footer">
-                    <p>This is an automated notification from Fullego. Please do not reply to this email.</p>
+                    <p>This is an automated notification from Akunuba. Please do not reply to this email.</p>
                 </div>
             </div>
         </body>
@@ -189,10 +189,10 @@ class EmailService:
         {{ message }}
         
         Best regards,
-        The Fullego Team
+        The Akunuba Team
         
         ---
-        This is an automated notification from Fullego. Please do not reply to this email.
+        This is an automated notification from Akunuba. Please do not reply to this email.
         """
         
         try:
@@ -246,12 +246,12 @@ class EmailService:
         <body>
             <div class="container">
                 <div class="header">
-                    <h1>Fullego</h1>
+                    <h1>Akunuba</h1>
                 </div>
                 <div class="content">
                     <h2>Verify Your Email Address</h2>
                     <p>Hi {{ name }},</p>
-                    <p>Thank you for signing up for Fullego! Please verify your email address by clicking the button below:</p>
+                    <p>Thank you for signing up for Akunuba! Please verify your email address by clicking the button below:</p>
                     <a href="{{ verification_url }}" class="button">Verify Email</a>
                     <p>Or copy and paste this link into your browser:</p>
                     <p style="word-break: break-all; color: #4F46E5;">{{ verification_url }}</p>
@@ -259,7 +259,7 @@ class EmailService:
                     <p>If you didn't create an account, please ignore this email.</p>
                 </div>
                 <div class="footer">
-                    <p>This is an automated email from Fullego. Please do not reply to this email.</p>
+                    <p>This is an automated email from Akunuba. Please do not reply to this email.</p>
                 </div>
             </div>
         </body>
@@ -274,7 +274,7 @@ class EmailService:
             
             return await cls.send_email(
                 to_email=to_email,
-                subject="Verify Your Email Address - Fullego",
+                subject="Verify Your Email Address - Akunuba",
                 html_content=html_content
             )
         except Exception as e:
@@ -310,7 +310,7 @@ class EmailService:
         <body>
             <div class="container">
                 <div class="header">
-                    <h1>Fullego</h1>
+                    <h1>Akunuba</h1>
                 </div>
                 <div class="content">
                     <h2>Reset Your Password</h2>
@@ -324,7 +324,7 @@ class EmailService:
                     </div>
                 </div>
                 <div class="footer">
-                    <p>This is an automated email from Fullego. Please do not reply to this email.</p>
+                    <p>This is an automated email from Akunuba. Please do not reply to this email.</p>
                 </div>
             </div>
         </body>
@@ -339,7 +339,7 @@ class EmailService:
 
             return await cls.send_email(
                 to_email=to_email,
-                subject="Reset Your Password - Fullego",
+                subject="Reset Your Password - Akunuba",
                 html_content=html_content
             )
         except Exception as e:
@@ -381,12 +381,12 @@ class EmailService:
         <body>
             <div class="container">
                 <div class="header">
-                    <h1>Fullego</h1>
+                    <h1>Akunuba</h1>
                 </div>
                 <div class="content">
                     <h2>You've been invited as an Advisor</h2>
                     <p>Hi {{ name }},</p>
-                    <p>An administrator created an advisor account for you on Fullego. Click the button below to set your password and activate your account:</p>
+                    <p>An administrator created an advisor account for you on Akunuba. Click the button below to set your password and activate your account:</p>
                     <a href="{{ invite_url }}" class="button">Set Your Password</a>
                     <p>Or copy and paste this link into your browser:</p>
                     <p style="word-break: break-all; color: #4F46E5;">{{ invite_url }}</p>
@@ -395,7 +395,7 @@ class EmailService:
                     </div>
                 </div>
                 <div class="footer">
-                    <p>This is an automated email from Fullego. Please do not reply to this email.</p>
+                    <p>This is an automated email from Akunuba. Please do not reply to this email.</p>
                 </div>
             </div>
         </body>
@@ -406,7 +406,7 @@ class EmailService:
             html_content = Template(html_template).render(name=to_name, invite_url=invite_url)
             return await cls.send_email(
                 to_email=to_email,
-                subject="You're invited to Fullego — set your password",
+                subject="You're invited to Akunuba — set your password",
                 html_content=html_content,
             )
         except Exception as e:
@@ -439,7 +439,7 @@ class EmailService:
         <body>
             <div class="container">
                 <div class="header">
-                    <h1>Fullego</h1>
+                    <h1>Akunuba</h1>
                 </div>
                 <div class="content">
                     <h2>Your Verification Code</h2>
@@ -455,7 +455,7 @@ class EmailService:
                     <p>If you didn't request this code, please ignore this email.</p>
                 </div>
                 <div class="footer">
-                    <p>This is an automated email from Fullego. Please do not reply to this email.</p>
+                    <p>This is an automated email from Akunuba. Please do not reply to this email.</p>
                 </div>
             </div>
         </body>
@@ -463,7 +463,7 @@ class EmailService:
         """
         
         text_template = """
-        Your Verification Code - Fullego
+        Your Verification Code - Akunuba
         
         Hi {{ name }},
         
@@ -476,7 +476,7 @@ class EmailService:
         If you didn't request this code, please ignore this email.
         
         ---
-        This is an automated email from Fullego. Please do not reply to this email.
+        This is an automated email from Akunuba. Please do not reply to this email.
         """
         
         try:
@@ -492,7 +492,7 @@ class EmailService:
             
             return await cls.send_email(
                 to_email=to_email,
-                subject="Your Verification Code - Fullego",
+                subject="Your Verification Code - Akunuba",
                 html_content=html_content,
                 text_content=text_content
             )

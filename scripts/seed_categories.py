@@ -1,6 +1,13 @@
 """
 Seed all asset categories into the asset_categories table.
 
+The CATEGORIES list is the canonical mirror of the frontend's
+src/config/assetConfig.js (90 sub-categories across 7 groups) — keep the two
+in sync so fresh environments never rely on POST /assets auto-creation.
+
+Idempotent: inserts missing categories and backfills form_fields/card_fields
+on rows that were auto-created without them.
+
 Run from project root:
     python -m scripts.seed_categories
 """
@@ -15,7 +22,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import app.models  # noqa: F401
 
 from sqlalchemy import select
-from app.database import AsyncSessionLocal
 from app.models.asset import AssetCategory, CategoryGroup
 
 
@@ -74,6 +80,45 @@ SHADOW_WEALTH_FORM_FIELDS = [
 SHADOW_WEALTH_CARD_FIELDS = [
     "name", "category", "estimated_value", "currency",
     "specifications.source", "specifications.expected_date", "status",
+]
+
+PHILANTHROPY_FORM_FIELDS = [
+    "name", "category", "category_group", "description",
+    "current_value", "estimated_value", "currency",
+    "specifications.institution", "specifications.cause",
+    "specifications.beneficiary", "specifications.contribution_schedule",
+    "documents",
+]
+
+PHILANTHROPY_CARD_FIELDS = [
+    "name", "category", "current_value", "currency",
+    "specifications.institution", "specifications.cause", "status",
+]
+
+LIFESTYLE_FORM_FIELDS = [
+    "name", "category", "category_group", "description",
+    "current_value", "currency",
+    "specifications.provider", "specifications.membership_tier",
+    "specifications.renewal_date", "specifications.annual_cost",
+    "documents",
+]
+
+LIFESTYLE_CARD_FIELDS = [
+    "name", "category", "current_value", "currency",
+    "specifications.provider", "specifications.renewal_date", "status",
+]
+
+# Governance entries are record-keeping only — no monetary value fields.
+GOVERNANCE_FORM_FIELDS = [
+    "name", "category", "category_group", "description",
+    "specifications.record_type", "specifications.jurisdiction",
+    "specifications.effective_date", "specifications.expiry_date",
+    "documents",
+]
+
+GOVERNANCE_CARD_FIELDS = [
+    "name", "category", "specifications.record_type",
+    "specifications.effective_date", "status",
 ]
 
 
@@ -156,23 +201,62 @@ CATEGORIES = [
     ("Lease Agreements",   CategoryGroup.LIABILITIES, LIABILITIES_FORM_FIELDS, LIABILITIES_CARD_FIELDS),
 
     # ── Shadow Wealth ────────────────────────────────────────────────────────
-    ("Pending Inheritance",     CategoryGroup.SHADOW_WEALTH, SHADOW_WEALTH_FORM_FIELDS, SHADOW_WEALTH_CARD_FIELDS),
-    ("Unvested Stock / RSUs",   CategoryGroup.SHADOW_WEALTH, SHADOW_WEALTH_FORM_FIELDS, SHADOW_WEALTH_CARD_FIELDS),
-    ("Deferred Compensation",   CategoryGroup.SHADOW_WEALTH, SHADOW_WEALTH_FORM_FIELDS, SHADOW_WEALTH_CARD_FIELDS),
+    ("Pending Inheritance",         CategoryGroup.SHADOW_WEALTH, SHADOW_WEALTH_FORM_FIELDS, SHADOW_WEALTH_CARD_FIELDS),
+    ("Unvested Stock / RSUs",       CategoryGroup.SHADOW_WEALTH, SHADOW_WEALTH_FORM_FIELDS, SHADOW_WEALTH_CARD_FIELDS),
+    ("Deferred Compensation",       CategoryGroup.SHADOW_WEALTH, SHADOW_WEALTH_FORM_FIELDS, SHADOW_WEALTH_CARD_FIELDS),
+    ("Anticipated Exit Proceeds",   CategoryGroup.SHADOW_WEALTH, SHADOW_WEALTH_FORM_FIELDS, SHADOW_WEALTH_CARD_FIELDS),
+    ("Brand / IP Equity",           CategoryGroup.SHADOW_WEALTH, SHADOW_WEALTH_FORM_FIELDS, SHADOW_WEALTH_CARD_FIELDS),
+    ("Legal Settlements",           CategoryGroup.SHADOW_WEALTH, SHADOW_WEALTH_FORM_FIELDS, SHADOW_WEALTH_CARD_FIELDS),
+    ("Marital / Shared Assets",     CategoryGroup.SHADOW_WEALTH, SHADOW_WEALTH_FORM_FIELDS, SHADOW_WEALTH_CARD_FIELDS),
+    ("Trust Allocations",           CategoryGroup.SHADOW_WEALTH, SHADOW_WEALTH_FORM_FIELDS, SHADOW_WEALTH_CARD_FIELDS),
+
+    # ── Philanthropy ─────────────────────────────────────────────────────────
+    ("Donor-Advised Funds",  CategoryGroup.PHILANTHROPY, PHILANTHROPY_FORM_FIELDS, PHILANTHROPY_CARD_FIELDS),
+    ("Endowments",           CategoryGroup.PHILANTHROPY, PHILANTHROPY_FORM_FIELDS, PHILANTHROPY_CARD_FIELDS),
+    ("Foundations",          CategoryGroup.PHILANTHROPY, PHILANTHROPY_FORM_FIELDS, PHILANTHROPY_CARD_FIELDS),
+    ("Impact Investments",   CategoryGroup.PHILANTHROPY, PHILANTHROPY_FORM_FIELDS, PHILANTHROPY_CARD_FIELDS),
+    ("Scholarship Trusts",   CategoryGroup.PHILANTHROPY, PHILANTHROPY_FORM_FIELDS, PHILANTHROPY_CARD_FIELDS),
+
+    # ── Lifestyle ────────────────────────────────────────────────────────────
+    ("Club Memberships",        CategoryGroup.LIFESTYLE, LIFESTYLE_FORM_FIELDS, LIFESTYLE_CARD_FIELDS),
+    ("Event & Auction Access",  CategoryGroup.LIFESTYLE, LIFESTYLE_FORM_FIELDS, LIFESTYLE_CARD_FIELDS),
+    ("Family Office Services",  CategoryGroup.LIFESTYLE, LIFESTYLE_FORM_FIELDS, LIFESTYLE_CARD_FIELDS),
+    ("Insurance Management",    CategoryGroup.LIFESTYLE, LIFESTYLE_FORM_FIELDS, LIFESTYLE_CARD_FIELDS),
+    ("Property Maintenance",    CategoryGroup.LIFESTYLE, LIFESTYLE_FORM_FIELDS, LIFESTYLE_CARD_FIELDS),
+    ("Travel Concierge",        CategoryGroup.LIFESTYLE, LIFESTYLE_FORM_FIELDS, LIFESTYLE_CARD_FIELDS),
+
+    # ── Governance ───────────────────────────────────────────────────────────
+    ("Audit Logs",          CategoryGroup.GOVERNANCE, GOVERNANCE_FORM_FIELDS, GOVERNANCE_CARD_FIELDS),
+    ("KYC & AML Records",   CategoryGroup.GOVERNANCE, GOVERNANCE_FORM_FIELDS, GOVERNANCE_CARD_FIELDS),
+    ("Legal Agreements",    CategoryGroup.GOVERNANCE, GOVERNANCE_FORM_FIELDS, GOVERNANCE_CARD_FIELDS),
+    ("Regulatory Filings",  CategoryGroup.GOVERNANCE, GOVERNANCE_FORM_FIELDS, GOVERNANCE_CARD_FIELDS),
 ]
 
 
 async def seed():
+    # Imported here (not module level) so tests can import CATEGORIES without
+    # requiring a configured database engine.
+    from app.database import AsyncSessionLocal
+
     async with AsyncSessionLocal() as db:
-        existing_result = await db.execute(select(AssetCategory.name))
-        existing_names = {row[0] for row in existing_result.fetchall()}
+        existing_result = await db.execute(select(AssetCategory))
+        existing_by_name = {row.name: row for row in existing_result.scalars().all()}
 
         inserted = 0
+        backfilled = 0
         skipped = 0
 
         for name, group, form_fields, card_fields in CATEGORIES:
-            if name in existing_names:
-                skipped += 1
+            existing = existing_by_name.get(name)
+            if existing is not None:
+                # Rows auto-created by POST /assets have no field metadata.
+                if not existing.form_fields or not existing.card_fields:
+                    existing.form_fields = existing.form_fields or form_fields
+                    existing.card_fields = existing.card_fields or card_fields
+                    backfilled += 1
+                    print(f"  ~ {name}  (backfilled form/card fields)")
+                else:
+                    skipped += 1
                 continue
 
             category = AssetCategory(
@@ -187,7 +271,10 @@ async def seed():
             print(f"  + {name}  ({group.value})")
 
         await db.commit()
-        print(f"\nDone. Inserted: {inserted}  |  Already existed: {skipped}")
+        print(
+            f"\nDone. Inserted: {inserted}  |  Backfilled fields: {backfilled}"
+            f"  |  Already complete: {skipped}"
+        )
 
 
 if __name__ == "__main__":

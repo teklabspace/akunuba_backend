@@ -1,6 +1,8 @@
+import re
+
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional, Dict, Any, List
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from uuid import UUID
 from decimal import Decimal
 from app.models.asset import (
@@ -13,22 +15,41 @@ from app.models.asset import (
 # by UTC's reckoning; anything beyond a day is a genuine data-entry error.
 ACQUISITION_DATE_FUTURE_TOLERANCE = timedelta(days=1)
 
+_DATE_ONLY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
 
 class _AcquisitionDateGuard(BaseModel):
-    """Rejects acquisition dates in the future. Shared by AssetCreate/AssetUpdate."""
+    """Normalizes acquisition_date and rejects future dates. Shared by
+    AssetCreate/AssetUpdate."""
 
     # check_fields=False: the field is declared on the subclasses, not here.
+    @field_validator("acquisition_date", mode="before", check_fields=False)
+    @classmethod
+    def _date_only_is_utc_midnight(cls, value: Any) -> Any:
+        # A bare "2021-07-15" must not pick up the server's local timezone on
+        # its way into a timestamptz column (it was persisting as
+        # 2021-07-15 07:00:00+00 from a UTC-7 host): pin date-only input to
+        # UTC midnight so the calendar date survives any later comparison.
+        if isinstance(value, str) and _DATE_ONLY_RE.fullmatch(value.strip()):
+            return datetime.strptime(value.strip(), "%Y-%m-%d").replace(
+                tzinfo=timezone.utc
+            )
+        if isinstance(value, date) and not isinstance(value, datetime):
+            return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+        return value
+
     @field_validator("acquisition_date", check_fields=False)
     @classmethod
     def _reject_future_acquisition_date(cls, value: Optional[datetime]) -> Optional[datetime]:
         if value is None:
             return value
         # Legacy clients may send naive datetimes; treat them as UTC so the
-        # comparison below can never raise on naive-vs-aware.
+        # comparison below can never raise on naive-vs-aware — and persist the
+        # aware value so the DB never re-interprets it in a local timezone.
         as_aware = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
         if as_aware > datetime.now(timezone.utc) + ACQUISITION_DATE_FUTURE_TOLERANCE:
             raise ValueError("Acquisition date cannot be in the future.")
-        return value
+        return as_aware
 
 
 class AssetCreate(_AcquisitionDateGuard):

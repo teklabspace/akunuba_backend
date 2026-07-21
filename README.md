@@ -1,6 +1,6 @@
-# Fullego Backend
+# Akunuba Backend
 
-FastAPI backend for the Fullego / Akunuba wealth‑management platform. It powers
+FastAPI backend for the Akunuba / Akunuba wealth‑management platform. It powers
 asset tracking, AI and concierge (human) appraisals, portfolios, a private
 marketplace, payments/subscriptions, KYC/KYB compliance, and real‑time
 notifications.
@@ -146,4 +146,4 @@ docker compose up --build
 ## API reference
 
 - Interactive: `/docs` (Swagger UI) and `/redoc`.
-- A Postman collection is included: `Fullego_Backend_API.postman_collection.json`.
+- A Postman collection is included: `Akunuba_Backend_API.postman_collection.json`.

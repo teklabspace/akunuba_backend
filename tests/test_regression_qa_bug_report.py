@@ -247,12 +247,18 @@ def test_bug_adm16_rejection_reason_endpoint_exists():
 
 
 # ADM-BUG-18 — incomplete asset cannot be deleted by admin --------------------
+# The admin delete-any-asset branch from this fix was later REMOVED on purpose:
+# business rule 2026-07-19/20 makes asset writes (incl. delete) investor-only
+# (see tests/test_asset_role_enforcement.py). What survives from ADM-18 is the
+# crash fix itself: media-independent deletion + the 409 transaction guard.
 
-def test_bug_adm18_admin_can_delete_regardless_of_media():
+def test_bug_adm18_delete_survives_incomplete_media_and_guards_transactions():
     from app.api.v1.assets import delete_asset
 
     src = inspect.getsource(delete_asset)
-    assert "is_admin" in src, "admin delete branch removed"
+    assert "ensure_investor_can_write_assets" in src, (
+        "delete must enforce the investor-only rule that replaced admin delete"
+    )
     assert 'code="ASSET_HAS_TRANSACTIONS"' in src, (
         "transaction guard must refuse with 409, not crash"
     )

@@ -263,7 +263,7 @@ def build_asset_response(asset: Asset, db: Optional[AsyncSession] = None) -> Dic
         "description": asset.description,
         "location": asset.location,
         "current_value": float(asset.current_value),
-        "estimated_value": float(asset.estimated_value) if asset.estimated_value else None,
+        "estimated_value": float(asset.estimated_value) if asset.estimated_value is not None else None,
         "currency": asset.currency,
         "status": asset.status.value if asset.status else None,
         "condition": asset.condition.value if asset.condition else None,
@@ -283,6 +283,37 @@ def build_asset_response(asset: Asset, db: Optional[AsyncSession] = None) -> Dic
         "last_updated": format_time_ago(asset.updated_at) if asset.updated_at else format_time_ago(asset.created_at) if asset.created_at else "Never"
     }
     return response_data
+
+
+def resolve_initial_values(
+    current_value: Optional[Decimal],
+    estimated_value: Optional[Decimal],
+) -> tuple[Decimal, Optional[Decimal]]:
+    """Resolve the (current_value, estimated_value) pair stored at creation.
+
+    Convention (QA 2026-07-18): an asset created with no monetary value stores
+    0.00 in BOTH columns — never NULL-estimated + 0-current, which made "has
+    this asset been valued?" checks ambiguous. current_value is NOT NULL in the
+    DB and raw-summed by net-worth/portfolio code, so "both NULL" is not an
+    option.
+    """
+    if not current_value and not estimated_value:
+        zero = Decimal("0.00")
+        return zero, zero
+    return current_value or estimated_value or Decimal("0.00"), estimated_value
+
+
+def ensure_investor_can_write_assets(user: User) -> None:
+    """Business rule (2026-07-19): only the investor role may create or edit
+    assets. The frontend hides the add/edit wizard for advisors and admins,
+    but client-side gating is not a restriction — QA confirmed an advisor
+    token could still hit POST /assets directly.
+    """
+    if user.role != Role.INVESTOR:
+        raise ForbiddenException(
+            "Only investor accounts can create or edit assets.",
+            code="INVESTOR_ROLE_REQUIRED",
+        )
 
 
 class ValuationResponse(BaseModel):
@@ -367,20 +398,21 @@ async def create_asset(
     db: AsyncSession = Depends(get_db)
 ):
     """Create a new asset with category-based fields"""
+    ensure_investor_can_write_assets(current_user)
     try:
         # Get user's account
         account = await get_account(current_user=current_user, db=db)
         plan = await get_user_subscription_plan(account=account, db=db)
-        
-        # Check usage limit — admins are exempt
-        if current_user.role.value != "admin":
-            assets_count = await db.execute(
-                select(func.count(Asset.id)).where(Asset.account_id == account.id)
-            )
-            current_count = assets_count.scalar() or 0
-            if not check_usage_limit(plan, "assets", current_count):
-                limit = get_limit(plan, "assets")
-                raise ForbiddenException(f"Asset limit reached. Maximum {limit} assets allowed for your plan.")
+
+        # Check usage limit (the role gate above guarantees an investor here,
+        # so the former admin exemption is moot)
+        assets_count = await db.execute(
+            select(func.count(Asset.id)).where(Asset.account_id == account.id)
+        )
+        current_count = assets_count.scalar() or 0
+        if not check_usage_limit(plan, "assets", current_count):
+            limit = get_limit(plan, "assets")
+            raise ForbiddenException(f"Asset limit reached. Maximum {limit} assets allowed for your plan.")
         
         # Resolve category if category name provided
         category_id = asset_data.category_id
@@ -493,8 +525,10 @@ async def create_asset(
                 except KeyError:
                     asset_type = AssetType.OTHER  # Default fallback
         
-        # Ensure current_value is set
-        current_value = asset_data.current_value or asset_data.estimated_value or Decimal("0.00")
+        # Ensure current_value is set (0.00 in BOTH columns when no value supplied)
+        current_value, estimated_value = resolve_initial_values(
+            asset_data.current_value, asset_data.estimated_value
+        )
         
         # Handle enum fields - ensure correct case for database
         # Database expects: status="active" (lowercase), condition="Excellent" (title case), etc.
@@ -594,7 +628,7 @@ async def create_asset(
             description=asset_data.description,
             location=asset_data.location,
             current_value=current_value,
-            estimated_value=asset_data.estimated_value,
+            estimated_value=estimated_value,
             currency=asset_data.currency,
             status=status_enum,
             condition=condition_enum,
@@ -1039,6 +1073,7 @@ async def get_asset(
     # Ensure images array has absolute URLs (CRITICAL for frontend)
     # Photos are loaded via selectinload, so we can safely access them
     images_array = []
+    photos_array = []
     if asset.photos:
         for photo in asset.photos:
             if photo and hasattr(photo, 'url') and photo.url:
@@ -1055,9 +1090,19 @@ async def get_asset(
                     else:
                         continue  # Skip if no valid URL
                 images_array.append(url)
-    
+                # Object form with the id — the edit wizard needs it to offer
+                # per-photo delete (the bare URL list can't address a photo).
+                photos_array.append({
+                    "id": str(photo.id),
+                    "url": url,
+                    "thumbnail_url": photo.thumbnail_url,
+                    "file_name": photo.file_name,
+                    "is_primary": photo.is_primary,
+                })
+
     # Set images array (frontend expects this)
     response_dict["images"] = images_array
+    response_dict["photos"] = photos_array
     
     # Set single image field (fallback for frontend)
     response_dict["image"] = images_array[0] if images_array else None
@@ -1173,6 +1218,7 @@ async def update_asset(
     db: AsyncSession = Depends(get_db)
 ):
     """Update an asset - all fields are optional"""
+    ensure_investor_can_write_assets(current_user)
     account_result = await db.execute(
         select(Account).where(Account.user_id == current_user.id)
     )
@@ -1342,32 +1388,28 @@ async def delete_asset(
 ):
     """Delete an asset and its related data.
 
-    Owners delete their own assets. Admins may delete ANY asset (cleanup of
-    orphaned/incomplete records) — admins have no account row, so the asset
-    is looked up without ownership scoping for them. Assets whose listings
+    Investor-owner only (business rule 2026-07-19 — the former admin
+    delete-any-asset cleanup path was removed with it). Assets whose listings
     have offers/escrow history are never hard-deleted (409)."""
+    ensure_investor_can_write_assets(current_user)
     from sqlalchemy import delete as sa_delete
     from app.models.marketplace import (
         MarketplaceListing, ListingStatus, Offer, EscrowTransaction, WatchlistItem,
     )
 
-    is_admin = current_user.role == Role.ADMIN
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
 
-    asset_query = select(Asset).options(
-        selectinload(Asset.valuations),
-        selectinload(Asset.ownerships),
-    ).where(Asset.id == asset_id)
-
-    if not is_admin:
-        account_result = await db.execute(
-            select(Account).where(Account.user_id == current_user.id)
-        )
-        account = account_result.scalar_one_or_none()
-        if not account:
-            raise NotFoundException("Account", str(current_user.id))
-        asset_query = asset_query.where(Asset.account_id == account.id)
-
-    asset = (await db.execute(asset_query)).scalar_one_or_none()
+    asset = (await db.execute(
+        select(Asset).options(
+            selectinload(Asset.valuations),
+            selectinload(Asset.ownerships),
+        ).where(Asset.id == asset_id, Asset.account_id == account.id)
+    )).scalar_one_or_none()
     if not asset:
         raise NotFoundException("Asset", str(asset_id))
 
@@ -1378,8 +1420,8 @@ async def delete_asset(
     )).scalars().all()
 
     live_statuses = (ListingStatus.PENDING_APPROVAL, ListingStatus.APPROVED, ListingStatus.ACTIVE, ListingStatus.SUSPENDED)
-    if not is_admin and any(l.status in live_statuses for l in listings):
-        # Owners must delist first; admins may remove a junk asset outright.
+    if any(l.status in live_statuses for l in listings):
+        # Owners must delist first.
         raise BadRequestException("Cannot delete asset that is listed in marketplace")
 
     if listings:
@@ -1418,7 +1460,7 @@ async def delete_asset(
     await db.delete(asset)
     await db.commit()
 
-    logger.info(f"Asset deleted: {asset_id} by {'admin' if is_admin else 'owner'} {current_user.id}")
+    logger.info(f"Asset deleted: {asset_id} by owner {current_user.id}")
     return None
 
 
@@ -1437,6 +1479,7 @@ async def create_valuation(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
+    ensure_investor_can_write_assets(current_user)
     account_result = await db.execute(
         select(Account).where(Account.user_id == current_user.id)
     )
@@ -1806,6 +1849,7 @@ async def upload_asset_photo(
     db: AsyncSession = Depends(get_db)
 ):
     """Upload a photo for an asset"""
+    ensure_investor_can_write_assets(current_user)
     account = await get_account(current_user=current_user, db=db)
     
     # Verify asset belongs to account
@@ -1871,6 +1915,7 @@ async def delete_asset_photo(
     db: AsyncSession = Depends(get_db)
 ):
     """Delete a photo from an asset"""
+    ensure_investor_can_write_assets(current_user)
     account = await get_account(current_user=current_user, db=db)
     
     # Verify asset belongs to account
@@ -1920,6 +1965,7 @@ async def upload_asset_document(
     db: AsyncSession = Depends(get_db)
 ):
     """Upload a document for an asset"""
+    ensure_investor_can_write_assets(current_user)
     account = await get_account(current_user=current_user, db=db)
     
     # Verify asset belongs to account
@@ -2007,6 +2053,7 @@ async def delete_asset_document(
     db: AsyncSession = Depends(get_db)
 ):
     """Delete a document from an asset"""
+    ensure_investor_can_write_assets(current_user)
     account = await get_account(current_user=current_user, db=db)
     
     # Verify asset belongs to account
@@ -2729,6 +2776,7 @@ async def update_asset_valuation(
     db: AsyncSession = Depends(get_db)
 ):
     """Update asset valuation"""
+    ensure_investor_can_write_assets(current_user)
     account = await get_account(current_user=current_user, db=db)
     
     # Verify asset belongs to account
@@ -3492,6 +3540,7 @@ async def upload_file_assets(
     db: AsyncSession = Depends(get_db)
 ):
     """General file upload endpoint (assets-specific)"""
+    ensure_investor_can_write_assets(current_user)
     account = await get_account(current_user=current_user, db=db)
     
     # Validate file type

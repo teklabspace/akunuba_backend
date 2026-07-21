@@ -1,7 +1,7 @@
 from fastapi import HTTPException, status
 
 
-class FullegoException(HTTPException):
+class AkunubaException(HTTPException):
     """Base API exception.
 
     Carries a stable, machine-readable ``code`` (surfaced as ``error.code`` in the
@@ -14,7 +14,7 @@ class FullegoException(HTTPException):
         self.code = code
 
 
-class NotFoundException(FullegoException):
+class NotFoundException(AkunubaException):
     def __init__(self, resource: str, identifier: str, code: str = "NOT_FOUND"):
         super().__init__(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -23,7 +23,7 @@ class NotFoundException(FullegoException):
         )
 
 
-class UnauthorizedException(FullegoException):
+class UnauthorizedException(AkunubaException):
     def __init__(self, detail: str = "Unauthorized", code: str = "UNAUTHORIZED"):
         super().__init__(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -32,7 +32,7 @@ class UnauthorizedException(FullegoException):
         )
 
 
-class ForbiddenException(FullegoException):
+class ForbiddenException(AkunubaException):
     def __init__(self, detail: str = "Forbidden", code: str = "FORBIDDEN"):
         super().__init__(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -41,7 +41,7 @@ class ForbiddenException(FullegoException):
         )
 
 
-class ValidationException(FullegoException):
+class ValidationException(AkunubaException):
     def __init__(self, detail: str, code: str = "VALIDATION_ERROR"):
         super().__init__(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -50,7 +50,7 @@ class ValidationException(FullegoException):
         )
 
 
-class ConflictException(FullegoException):
+class ConflictException(AkunubaException):
     def __init__(self, detail: str, code: str = "CONFLICT"):
         super().__init__(
             status_code=status.HTTP_409_CONFLICT,
@@ -59,7 +59,7 @@ class ConflictException(FullegoException):
         )
 
 
-class GoneException(FullegoException):
+class GoneException(AkunubaException):
     """The resource existed but is permanently unavailable (e.g. an expired
     share link) — 410 so clients can distinguish it from a plain 404."""
 
@@ -71,7 +71,7 @@ class GoneException(FullegoException):
         )
 
 
-class BadRequestException(FullegoException):
+class BadRequestException(AkunubaException):
     def __init__(self, detail: str, code: str = "BAD_REQUEST"):
         super().__init__(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -80,7 +80,7 @@ class BadRequestException(FullegoException):
         )
 
 
-class ServiceUnavailableException(FullegoException):
+class ServiceUnavailableException(AkunubaException):
     def __init__(
         self,
         detail: str = "Service temporarily unavailable",

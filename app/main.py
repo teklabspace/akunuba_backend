@@ -375,7 +375,7 @@ def _apply_cors_headers(request: Request, response: JSONResponse, allow_dev_fall
 
 
 def _http_exception_to_envelope(exc: HTTPException) -> JSONResponse:
-    # FullegoException subclasses carry a stable ``code``; raw HTTPExceptions fall
+    # AkunubaException subclasses carry a stable ``code``; raw HTTPExceptions fall
     # back to a status-derived code. ``detail`` is the user-facing message when it
     # is a plain string.
     code = getattr(exc, "code", None) or error_code_for(exc.status_code)
@@ -470,7 +470,7 @@ async def options_handler(full_path: str, request: Request):
 @limiter.exempt
 async def root():
     return {
-        "message": "Fullego Backend API",
+        "message": "Akunuba Backend API",
         "version": settings.APP_VERSION,
         "status": "running"
     }

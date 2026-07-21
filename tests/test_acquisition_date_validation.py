@@ -61,10 +61,15 @@ def test_far_future_acquisition_date_is_rejected_on_update():
         AssetUpdate(acquisition_date=datetime(2029, 2, 1, tzinfo=timezone.utc))
 
 
-def test_naive_past_datetime_is_accepted():
-    """Legacy/naive payloads must not raise TypeError on naive-vs-aware compare."""
+def test_naive_past_datetime_is_accepted_as_utc():
+    """Legacy/naive payloads must not raise TypeError on naive-vs-aware compare.
+
+    Since the 2026-07-18 QA fix the value is persisted UTC-aware, so the DB
+    driver can never re-interpret it in the server's local timezone.
+    """
     naive_past = (_now() - timedelta(days=10)).replace(tzinfo=None)
-    assert AssetCreate(name="Rolex", acquisition_date=naive_past).acquisition_date == naive_past
+    parsed = AssetCreate(name="Rolex", acquisition_date=naive_past).acquisition_date
+    assert parsed == naive_past.replace(tzinfo=timezone.utc)
 
 
 def test_naive_future_datetime_is_rejected():
