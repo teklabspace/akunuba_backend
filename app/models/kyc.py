@@ -43,6 +43,11 @@ class KYCVerification(Base):
     # Manual admin override audit (who last approved/rejected by hand).
     reviewed_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
     reviewed_at = Column(DateTime(timezone=True))
+    # Manual verification fallback: admin-sent tokenized link (the token is the
+    # credential for the public selfie+ID submission endpoints). Cleared on use.
+    manual_token = Column(String(255), unique=True, index=True)
+    manual_token_expires_at = Column(DateTime(timezone=True))
+    manual_submitted_at = Column(DateTime(timezone=True))
     verified_at = Column(DateTime(timezone=True))
     expires_at = Column(DateTime(timezone=True))
     rejection_reason = Column(Text)

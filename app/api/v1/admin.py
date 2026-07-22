@@ -988,6 +988,7 @@ async def approve_user_kyc(
         kyc.status = KYCStatus.APPROVED
         kyc.verified_at = datetime.utcnow()
         kyc.rejection_reason = None
+    user.is_verified = True  # the app-wide KYC flag; approval must flip it
     await db.commit()
     await db.refresh(kyc)
 
@@ -1003,6 +1004,12 @@ async def approve_user_kyc(
         )
     except Exception as e:
         logger.warning(f"Failed to send KYC approval notification: {e}")
+
+    try:
+        approved_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "there"
+        await EmailService.send_kyc_approved_email(to_email=user.email, to_name=approved_name)
+    except Exception as e:
+        logger.warning(f"Failed to send KYC approval email: {e}")
 
     kyc.reviewed_by = current_user.id
     kyc.reviewed_at = datetime.utcnow()
@@ -1170,6 +1177,84 @@ async def recapture_user_kyc(
         "message": "Re-capture started",
         "data": {"user_id": str(user.id), "kyc_id": str(kyc.id), "capture_status": KYCCaptureStatus.PENDING.value},
     }
+
+
+@router.post("/users/{user_id}/kyc/send-verification-link", response_model=Dict[str, Any])
+async def send_manual_verification_link(
+    user_id: UUID,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Email a failed-KYC user a tokenized manual-verification link — admin only.
+
+    Only rejected/expired verifications are eligible (anything still moving
+    through Persona keeps its normal flow). The link lands on the frontend
+    manual-verification page where the user uploads a selfie + ID document via
+    the public /kyc/manual-verification/{token} endpoints. Re-sending
+    regenerates the token (the previous link stops working).
+    """
+    from app.services.manual_kyc import (
+        MANUAL_LINK_TTL_DAYS,
+        can_send_manual_link,
+        issue_manual_token,
+        manual_verification_url,
+    )
+
+    user, account, kyc = await _load_user_account_kyc(db, user_id)
+    if user.role == Role.ADMIN:
+        raise BadRequestException("Admins do not require KYC verification.")
+    if not account or not kyc:
+        raise BadRequestException(
+            "This user has no failed verification to recover — a manual link can "
+            "only be sent after a verification has failed."
+        )
+    if not can_send_manual_link(kyc.status):
+        raise BadRequestException(
+            f"A manual verification link can only be sent for rejected or expired "
+            f"verifications (current status: {kyc.status.value})."
+        )
+
+    token, expires_at = issue_manual_token()
+    kyc.manual_token = token
+    kyc.manual_token_expires_at = expires_at
+    kyc.manual_submitted_at = None
+    await db.commit()
+
+    link = manual_verification_url(token)
+    user_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "there"
+    email_sent = await EmailService.send_manual_verification_email(
+        to_email=user.email,
+        to_name=user_name,
+        verification_url=link,
+    )
+    if not email_sent:
+        logger.error(f"Manual verification email failed to send for {user.email}")
+
+    try:
+        from app.services.notification_service import NotificationService, NotificationType
+        await NotificationService.create_notification(
+            db=db,
+            account_id=account.id,
+            notification_type=NotificationType.GENERAL,
+            title="Complete Your Identity Verification",
+            message="We've sent you an email with a link to verify your identity manually. Please check your inbox.",
+            send_email=False,  # the dedicated link email above is the email leg
+        )
+    except Exception as e:
+        logger.warning(f"Failed to create manual-verification notification: {e}")
+
+    logger.info(f"Admin {current_user.id} sent manual verification link to user {user_id}")
+    data = {
+        "user_id": str(user.id),
+        "kyc_id": str(kyc.id),
+        "email_sent": email_sent,
+        "expires_at": expires_at.isoformat(),
+        "expires_in_days": MANUAL_LINK_TTL_DAYS,
+    }
+    # Surface the link in development to ease testing (mirrors the invite flow).
+    if settings.APP_ENV == "development":
+        data["verification_url"] = link
+    return {"message": "Verification link sent", "data": data}
 
 
 @router.patch("/users/{user_id}/deactivate", response_model=Dict[str, Any])
@@ -2129,6 +2214,7 @@ async def list_all_verifications(
     verification_type: Optional[str] = Query(None, description="Filter: kyc | kyb | all (default all)"),
     ver_status: Optional[str] = Query(None, alias="status", description="Filter by status: not_started | in_progress | pending_review | approved | rejected | expired"),
     search: Optional[str] = Query(None, description="Search by user email or name"),
+    method: Optional[str] = Query(None, description="KYC verification method filter: manual (link sent or docs uploaded) | persona. Excludes KYB rows when set."),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=1000),
     current_user: User = Depends(require_admin),
@@ -2137,6 +2223,7 @@ async def list_all_verifications(
     """Combined KYC + KYB verification queue — admin only"""
     from sqlalchemy import or_, union_all, literal
     from app.models.kyb import KYBVerification, KYBStatus
+    from app.services.manual_kyc import can_send_manual_link, manual_token_state
 
     results = []
 
@@ -2149,6 +2236,17 @@ async def list_all_verifications(
         )
         if ver_status:
             kyc_query = kyc_query.where(KYCVerification.status == ver_status)
+        if method == "manual":
+            # Any manual-fallback activity: link currently issued OR docs uploaded
+            # (the token is cleared on submission, so check both).
+            kyc_query = kyc_query.where(
+                or_(
+                    KYCVerification.manual_token.isnot(None),
+                    KYCVerification.manual_submitted_at.isnot(None),
+                )
+            )
+        elif method == "persona":
+            kyc_query = kyc_query.where(KYCVerification.persona_inquiry_id.isnot(None))
         if search:
             kyc_query = kyc_query.where(
                 or_(
@@ -2174,10 +2272,18 @@ async def list_all_verifications(
                 "verified_at": kyc.verified_at.isoformat() if kyc.verified_at else None,
                 "created_at": kyc.created_at.isoformat() if kyc.created_at else None,
                 "updated_at": kyc.updated_at.isoformat() if kyc.updated_at else None,
+                # Manual verification fallback state (send-link button + review badge)
+                "can_send_manual_link": can_send_manual_link(kyc.status),
+                "manual_link_active": bool(kyc.manual_token)
+                and manual_token_state(kyc.manual_token_expires_at) == "ok",
+                "manual_link_expires_at": kyc.manual_token_expires_at.isoformat()
+                if kyc.manual_token_expires_at else None,
+                "manual_submitted_at": kyc.manual_submitted_at.isoformat()
+                if kyc.manual_submitted_at else None,
             })
 
-    # ---- KYB ----
-    if verification_type in (None, "all", "kyb"):
+    # ---- KYB ---- (method is a KYC-only concept, so any method filter excludes KYB)
+    if verification_type in (None, "all", "kyb") and not method:
         from app.models.kyb import KYBVerification
         kyb_query = (
             select(KYBVerification, Account, User)
@@ -2253,6 +2359,19 @@ async def approve_kyc(
     kyc.status = KYCStatus.APPROVED
     kyc.verified_at = datetime.utcnow()
     kyc.rejection_reason = None
+
+    # Flip the user's KYC flag too — load the user explicitly (no lazy account.user
+    # here; the user isn't in the session identity map on this admin request).
+    approved_user = None
+    account = (await db.execute(
+        select(Account).where(Account.id == kyc.account_id)
+    )).scalar_one_or_none()
+    if account:
+        approved_user = (await db.execute(
+            select(User).where(User.id == account.user_id)
+        )).scalar_one_or_none()
+        if approved_user:
+            approved_user.is_verified = True
     await db.commit()
 
     # Notify the user
@@ -2267,6 +2386,17 @@ async def approve_kyc(
         )
     except Exception as e:
         logger.warning(f"Failed to send KYC approval notification: {e}")
+
+    if approved_user:
+        try:
+            approved_name = (
+                f"{approved_user.first_name or ''} {approved_user.last_name or ''}".strip() or "there"
+            )
+            await EmailService.send_kyc_approved_email(
+                to_email=approved_user.email, to_name=approved_name
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send KYC approval email: {e}")
 
     logger.info(f"Admin {current_user.id} approved KYC {kyc_id}")
     return {

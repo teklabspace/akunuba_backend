@@ -10,7 +10,13 @@ from app.models.account import Account, AccountType
 from app.models.kyc import KYCVerification, KYCStatus
 from app.integrations.persona_client import PersonaClient
 from app.config import settings
-from app.core.exceptions import NotFoundException, BadRequestException, UnauthorizedException
+from app.core.exceptions import (
+    NotFoundException,
+    BadRequestException,
+    UnauthorizedException,
+    GoneException,
+    ValidationException,
+)
 from app.core.permissions import Role, Permission, has_permission
 from app.utils.logger import logger
 from uuid import UUID
@@ -1139,10 +1145,165 @@ async def reject_kyc_manual(
     
     kyc.status = KYCStatus.REJECTED
     kyc.rejection_reason = reason
-    
+
     await db.commit()
     await db.refresh(kyc)
-    
+
     logger.info(f"KYC manually rejected: {kyc_id} by {current_user.id}")
     return kyc
+
+
+# ==================== MANUAL VERIFICATION (tokenized link) ====================
+# Fallback for users whose Persona verification failed: an admin emails them a
+# tokenized link (POST /admin/users/{id}/kyc/send-verification-link) and these
+# PUBLIC endpoints let them submit a selfie + ID document without logging in.
+# The token is the credential — no auth dependency on purpose.
+
+async def _load_kyc_by_manual_token(db: AsyncSession, token: str):
+    """Resolve (kyc, account, user) for a manual-verification token.
+
+    Unknown/cleared token -> 404; known but past expiry -> 410 so the frontend
+    can show a "link expired, contact support" page instead of a generic error.
+    """
+    from app.services.manual_kyc import manual_token_state
+
+    kyc = (await db.execute(
+        select(KYCVerification).where(KYCVerification.manual_token == token)
+    )).scalar_one_or_none()
+    if not kyc:
+        raise NotFoundException("Verification link", "provided token")
+    if manual_token_state(kyc.manual_token_expires_at) == "expired":
+        raise GoneException(
+            "This verification link has expired. Please contact support to request a new one.",
+            code="VERIFICATION_LINK_EXPIRED",
+        )
+    # Load the user explicitly — there is no auth dependency on these routes,
+    # so account.user would lazy-load (MissingGreenlet under async SQLAlchemy).
+    account = (await db.execute(
+        select(Account).where(Account.id == kyc.account_id)
+    )).scalar_one_or_none()
+    user = None
+    if account:
+        user = (await db.execute(
+            select(User).where(User.id == account.user_id)
+        )).scalar_one_or_none()
+    return kyc, account, user
+
+
+@router.get("/manual-verification/{token}")
+async def get_manual_verification(
+    token: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Public: validate a manual-verification link and describe what to upload."""
+    kyc, account, user = await _load_kyc_by_manual_token(db, token)
+    return {
+        "first_name": user.first_name if user else None,
+        "status": kyc.status.value,
+        "already_submitted": kyc.manual_submitted_at is not None,
+        "requirements": {
+            "selfie": "required",
+            "id_front": "required",
+            "id_back": "optional",
+        },
+        "max_file_size_mb": 10,
+        "accepted_types": {
+            "selfie": ["image/jpeg", "image/png", "image/webp"],
+            "documents": ["image/jpeg", "image/png", "image/webp", "application/pdf"],
+        },
+    }
+
+
+@router.post("/manual-verification/{token}", status_code=status.HTTP_201_CREATED)
+async def submit_manual_verification(
+    token: str,
+    selfie: UploadFile = File(...),
+    id_front: UploadFile = File(...),
+    id_back: Optional[UploadFile] = File(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Public: submit selfie + ID document for manual identity verification.
+
+    Files are stored in the private KYC bucket as KYCDocument rows (same review
+    surface the admin already uses for Persona captures), the KYC moves to
+    PENDING_REVIEW, and the one-time token is invalidated.
+    """
+    import asyncio
+    import uuid as uuid_module
+    from app.integrations.supabase_client import SupabaseClient
+    from app.services.manual_kyc import MANUAL_DOC_TYPES, validate_manual_upload
+    from app.models.kyc import KYCDocument
+
+    kyc, account, user = await _load_kyc_by_manual_token(db, token)
+
+    # Read + validate everything BEFORE any upload so a bad second file can't
+    # leave a half-stored submission.
+    uploads = []  # (document_type, data, content_type)
+    for field, upload in (("selfie", selfie), ("id_front", id_front), ("id_back", id_back)):
+        if upload is None:
+            continue
+        data = await upload.read()
+        try:
+            content_type = validate_manual_upload(
+                field, upload.filename or "", upload.content_type, len(data)
+            )
+        except ValueError as e:
+            raise ValidationException(str(e))
+        uploads.append((MANUAL_DOC_TYPES[field], data, content_type))
+
+    bucket = settings.KYC_DOCUMENTS_BUCKET
+    try:
+        await asyncio.to_thread(SupabaseClient.ensure_bucket, bucket, False)
+        for document_type, data, content_type in uploads:
+            ext = (content_type.rsplit("/", 1)[-1]).replace("jpeg", "jpg")
+            if content_type == "application/pdf":
+                ext = "pdf"
+            path = f"manual/{account.id}/{uuid_module.uuid4().hex}_{document_type}.{ext}"
+            await asyncio.to_thread(
+                SupabaseClient.upload_file, bucket, path, data, content_type, True
+            )
+            db.add(KYCDocument(
+                kyc_id=kyc.id,
+                account_id=account.id,
+                persona_inquiry_id=None,
+                document_type=document_type,
+                bucket=bucket,
+                file_path=path,
+                mime_type=content_type,
+                file_size=len(data),
+            ))
+    except Exception as e:
+        logger.error(f"Manual KYC upload failed for account {account.id}: {e}", exc_info=True)
+        raise BadRequestException("Failed to store your documents. Please try again.")
+
+    kyc.status = KYCStatus.PENDING_REVIEW
+    kyc.verification_level = "manual"
+    kyc.documents_submitted = True
+    kyc.rejection_reason = None
+    kyc.manual_submitted_at = datetime.utcnow()
+    kyc.manual_token = None  # one-time use
+    kyc.manual_token_expires_at = None
+    if user:
+        user.is_verified = False  # verified only on admin approval
+    await db.commit()
+
+    try:
+        from app.services.notification_service import NotificationService
+        from app.models.notification import NotificationType
+        await NotificationService.notify_admins(
+            db=db,
+            notification_type=NotificationType.GENERAL,
+            title="Manual KYC Submission",
+            message=f"{user.email if user else 'A user'} submitted documents for manual identity verification and is awaiting review.",
+            metadata=f'{{"account_id": "{account.id}", "event": "manual_kyc_submitted"}}',
+        )
+    except Exception as e:
+        logger.error(f"Failed to notify admins of manual KYC submission for account {account.id}: {e}")
+
+    logger.info(f"Manual KYC submission stored for account {account.id} ({len(uploads)} file(s))")
+    return {
+        "message": "Documents submitted successfully. Our team will review your verification.",
+        "status": KYCStatus.PENDING_REVIEW.value,
+        "files_received": len(uploads),
+    }
 

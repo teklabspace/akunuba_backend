@@ -414,6 +414,127 @@ class EmailService:
             return False
 
     @classmethod
+    async def send_manual_verification_email(
+        cls,
+        to_email: str,
+        to_name: str,
+        verification_url: str,
+    ) -> bool:
+        """Invite a user whose Persona verification failed to verify manually.
+
+        The link lands on the frontend manual-verification page carrying the
+        token; that page uploads the selfie + ID document via the public
+        /kyc/manual-verification/{token} endpoints.
+        """
+        html_template = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+                .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+                .header { background-color: #4F46E5; color: white; padding: 20px; text-align: center; border-radius: 5px 5px 0 0; }
+                .content { background-color: #f9fafb; padding: 30px; border-radius: 0 0 5px 5px; }
+                .button { display: inline-block; padding: 12px 24px; background-color: #4F46E5; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px; }
+                .footer { text-align: center; margin-top: 20px; color: #6b7280; font-size: 12px; }
+                .warning { background-color: #fef3c7; border-left: 4px solid #f59e0b; padding: 12px; margin: 20px 0; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>Akunuba</h1>
+                </div>
+                <div class="content">
+                    <h2>Complete Your Identity Verification</h2>
+                    <p>Hi {{ name }},</p>
+                    <p>We couldn't verify your identity automatically, but you can complete verification manually. Click the button below to upload a selfie and a photo of your government-issued ID. Our team will review your submission.</p>
+                    <a href="{{ verification_url }}" class="button">Verify My Identity</a>
+                    <p>Or copy and paste this link into your browser:</p>
+                    <p style="word-break: break-all; color: #4F46E5;">{{ verification_url }}</p>
+                    <div class="warning">
+                        <p><strong>Security Notice:</strong> This link will expire in 7 days and can only be used once. If you weren't expecting this email, please ignore it.</p>
+                    </div>
+                </div>
+                <div class="footer">
+                    <p>This is an automated email from Akunuba. Please do not reply to this email.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        try:
+            html_content = Template(html_template).render(
+                name=to_name, verification_url=verification_url
+            )
+            return await cls.send_email(
+                to_email=to_email,
+                subject="Complete your identity verification - Akunuba",
+                html_content=html_content,
+            )
+        except Exception as e:
+            logger.error(f"Error sending manual verification email: {e}")
+            return False
+
+    @classmethod
+    async def send_kyc_approved_email(
+        cls,
+        to_email: str,
+        to_name: str,
+        login_url: Optional[str] = None,
+    ) -> bool:
+        """Tell a user their identity verification was approved, with a login button."""
+        if not login_url:
+            base = settings.CORS_ORIGINS[0] if settings.CORS_ORIGINS else "http://localhost:3000"
+            login_url = f"{base.rstrip('/')}/login"
+
+        html_template = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+                .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+                .header { background-color: #4F46E5; color: white; padding: 20px; text-align: center; border-radius: 5px 5px 0 0; }
+                .content { background-color: #f9fafb; padding: 30px; border-radius: 0 0 5px 5px; }
+                .button { display: inline-block; padding: 12px 24px; background-color: #4F46E5; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px; }
+                .footer { text-align: center; margin-top: 20px; color: #6b7280; font-size: 12px; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>Akunuba</h1>
+                </div>
+                <div class="content">
+                    <h2>Your Identity Verification Was Approved</h2>
+                    <p>Hi {{ name }},</p>
+                    <p>Great news — your identity verification has been approved. You now have full access to your Akunuba account.</p>
+                    <a href="{{ login_url }}" class="button">Log In to Akunuba</a>
+                    <p>Or copy and paste this link into your browser:</p>
+                    <p style="word-break: break-all; color: #4F46E5;">{{ login_url }}</p>
+                </div>
+                <div class="footer">
+                    <p>This is an automated email from Akunuba. Please do not reply to this email.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        try:
+            html_content = Template(html_template).render(name=to_name, login_url=login_url)
+            return await cls.send_email(
+                to_email=to_email,
+                subject="Your identity verification was approved - Akunuba",
+                html_content=html_content,
+            )
+        except Exception as e:
+            logger.error(f"Error sending KYC approved email: {e}")
+            return False
+
+    @classmethod
     async def send_otp_email(
         cls,
         to_email: str,
