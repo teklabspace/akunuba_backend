@@ -51,7 +51,15 @@ async def get_market_benchmarks(
     default_benchmarks = ["SPY", "DIA", "TSLA"]
 
     if benchmarks:
-        benchmark_list = [b.strip().upper() for b in benchmarks if b.strip()]
+        # Accept both repeated params (?benchmarks=SPY&benchmarks=DIA) and a
+        # single comma-separated value (?benchmarks=SPY,DIA) — the frontend
+        # sends the latter.
+        benchmark_list = [
+            part.strip().upper()
+            for b in benchmarks
+            for part in b.split(",")
+            if part.strip()
+        ]
         if len(benchmark_list) > 10:
             raise BadRequestException("Maximum 10 benchmarks allowed per request")
     else:
@@ -87,16 +95,38 @@ async def get_market_benchmarks(
 
     for symbol in benchmark_list:
         try:
-            # Get current price
-            current_price = PolygonClient.get_current_price(symbol)
-            if not current_price:
+            # One prev-close call gives price AND change data — important on
+            # free-tier Polygon keys, which allow only 5 requests/minute.
+            prev_bar = None
+            prev = PolygonClient.get_previous_close(symbol)
+            if prev and prev.get("results"):
+                prev_bar = prev["results"][0]
+
+            current_price = None
+            snapshot = PolygonClient.get_snapshot(symbol)  # no-op on free-tier keys
+            if snapshot and snapshot.get("ticker"):
+                ticker_data = snapshot["ticker"]
+                current_price = (
+                    ticker_data.get("lastTrade", {}).get("p")
+                    or ticker_data.get("day", {}).get("c")
+                    or ticker_data.get("prevDay", {}).get("c")
+                )
+
+            if current_price and prev_bar:
+                prev_price = prev_bar.get("c") or current_price
+            elif prev_bar:
+                # Previous close is the freshest price a free-tier key can get;
+                # report the previous session's open→close move so change
+                # isn't always zero.
+                current_price = prev_bar.get("c")
+                prev_price = prev_bar.get("o") or current_price
+            else:
                 logger.warning(f"Could not get price for {symbol}")
                 continue
 
-            # Get previous day for change calculation
-            yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
-            prev_data = PolygonClient.get_daily_open_close(symbol, yesterday)
-            prev_price = prev_data.get("close") if prev_data else current_price
+            if not current_price:
+                logger.warning(f"Could not get price for {symbol}")
+                continue
 
             change = current_price - prev_price
             change_percentage = (change / prev_price * 100) if prev_price > 0 else 0
@@ -135,11 +165,13 @@ async def get_market_benchmarks(
                             )
                         )
 
-            # Get symbol name
-            ticker_details = PolygonClient.get_ticker_details(symbol)
+            # Get symbol name (skip the extra request on free-tier keys —
+            # the rate budget is better spent on prices)
             name = symbol
-            if ticker_details and ticker_details.get("results"):
-                name = ticker_details["results"].get("name", symbol)
+            if not PolygonClient.snapshot_unavailable():
+                ticker_details = PolygonClient.get_ticker_details(symbol)
+                if ticker_details and ticker_details.get("results"):
+                    name = ticker_details["results"].get("name", symbol)
 
             benchmark_responses.append(
                 BenchmarkResponse(

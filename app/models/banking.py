@@ -20,7 +20,9 @@ class LinkedAccount(Base):
     account_id = Column(UUID(as_uuid=True), ForeignKey("accounts.id"), nullable=False)
     plaid_item_id = Column(String(255))
     plaid_access_token = Column(String(500))
-    account_type = Column(SQLEnum(AccountType), nullable=False)
+    # The PG enum is named linkedaccounttype — "accounttype" belongs to the
+    # accounts table (INDIVIDUAL/CORPORATE/TRUST) and is a different type.
+    account_type = Column(SQLEnum(AccountType, name="linkedaccounttype"), nullable=False)
     institution_name = Column(String(255))
     account_name = Column(String(255))
     account_number = Column(String(100))

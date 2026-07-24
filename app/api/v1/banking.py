@@ -24,6 +24,10 @@ class LinkTokenResponse(BaseModel):
     link_token: str
 
 
+class LinkAccountRequest(BaseModel):
+    public_token: str
+
+
 class LinkedAccountResponse(BaseModel):
     id: UUID
     institution_name: str
@@ -62,7 +66,14 @@ async def create_link_token(
     
     if not account:
         raise NotFoundException("Account", str(current_user.id))
-    
+
+    # Gate before the Plaid widget ever opens — /banking/link enforces the
+    # same rule, but failing only there means the user completes the whole
+    # bank-selection flow and is rejected at the final step.
+    plan = await get_user_subscription_plan(account=account, db=db)
+    if not has_feature(plan, Feature.BANKING):
+        raise ForbiddenException("Banking integration requires Annual subscription")
+
     try:
         link_token = PlaidClient.create_link_token(
             user_id=str(current_user.id),
@@ -82,11 +93,12 @@ async def create_link_token(
 
 @router.post("/link")
 async def link_account(
-    public_token: str,
+    payload: LinkAccountRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """Link bank account using Plaid public token"""
+    public_token = payload.public_token
     account = await get_account(current_user=current_user, db=db)
     plan = await get_user_subscription_plan(account=account, db=db)
     

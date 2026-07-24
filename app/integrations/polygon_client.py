@@ -8,6 +8,15 @@ from datetime import datetime, timedelta
 class PolygonClient:
     BASE_URL = "https://api.polygon.io"
 
+    # Free-tier keys get 403 on snapshot endpoints. Remember the first 403 so
+    # we stop wasting rate-limit budget (5 req/min on free tier) on calls that
+    # can never succeed for this key.
+    _snapshot_unavailable = False
+
+    @classmethod
+    def snapshot_unavailable(cls) -> bool:
+        return cls._snapshot_unavailable
+
     @staticmethod
     def _get_params() -> Dict[str, str]:
         if not settings.POLYGON_API_KEY:
@@ -95,6 +104,8 @@ class PolygonClient:
         if not settings.POLYGON_API_KEY:
             logger.warning("Polygon API key not configured - skipping request")
             return None
+        if PolygonClient._snapshot_unavailable:
+            return None
         try:
             with httpx.Client() as client:
                 response = client.get(
@@ -104,6 +115,13 @@ class PolygonClient:
                 )
                 response.raise_for_status()
                 return response.json()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 403:
+                PolygonClient._snapshot_unavailable = True
+                logger.warning("Polygon snapshot endpoint forbidden (free-tier key) - disabling snapshot calls")
+            else:
+                logger.error(f"Failed to get Polygon snapshot: {e}")
+            return None
         except Exception as e:
             logger.error(f"Failed to get Polygon snapshot: {e}")
             return None
@@ -176,6 +194,25 @@ class PolygonClient:
             return None
 
     @staticmethod
+    def get_previous_close(ticker: str) -> Optional[Dict[str, Any]]:
+        """Get previous-day bar for a ticker (available on free-tier keys)"""
+        if not settings.POLYGON_API_KEY:
+            logger.warning("Polygon API key not configured - skipping request")
+            return None
+        try:
+            with httpx.Client() as client:
+                response = client.get(
+                    f"{PolygonClient.BASE_URL}/v2/aggs/ticker/{ticker}/prev",
+                    params=PolygonClient._get_params(),
+                    timeout=30.0
+                )
+                response.raise_for_status()
+                return response.json()
+        except Exception as e:
+            logger.error(f"Failed to get Polygon previous close: {e}")
+            return None
+
+    @staticmethod
     def get_current_price(ticker: str) -> Optional[float]:
         """Get current price for a ticker (simplified)"""
         snapshot = PolygonClient.get_snapshot(ticker)
@@ -187,7 +224,14 @@ class PolygonClient:
                 ticker_data.get("day", {}).get("c") or
                 ticker_data.get("prevDay", {}).get("c")
             )
-            return float(price) if price else None
+            if price:
+                return float(price)
+        # Snapshot requires a paid Polygon plan (403 on free-tier keys) —
+        # fall back to the previous-day close, which free keys can access.
+        prev = PolygonClient.get_previous_close(ticker)
+        if prev and prev.get("results"):
+            close = prev["results"][0].get("c")
+            return float(close) if close else None
         return None
 
     @staticmethod
