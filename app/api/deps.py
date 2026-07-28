@@ -56,11 +56,12 @@ async def get_current_user(
         raise UnauthorizedException("User not found")
     
     if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User account is inactive"
+        # Stable code so the frontend can force-logout the stale session
+        raise ForbiddenException(
+            "Your account has been deactivated. Please contact support.",
+            code="ACCOUNT_DEACTIVATED",
         )
-    
+
     return user
 
 

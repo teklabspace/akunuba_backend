@@ -318,7 +318,13 @@ async def get_payment_methods(
         # Get payment methods
         payment_methods_data = StripeClient.list_payment_methods(customer["id"])
         methods_list = payment_methods_data.get("data", [])
-        
+
+        # The default lives on the Stripe customer, not the payment method.
+        default_pm_id = (customer.get("invoice_settings") or {}).get("default_payment_method")
+        # Older customers may predate invoice_settings — treat a sole method as default.
+        if not default_pm_id and len(methods_list) == 1:
+            default_pm_id = methods_list[0].get("id")
+
         # Format response
         formatted_methods = []
         for method in methods_list:
@@ -331,14 +337,14 @@ async def get_payment_methods(
                     exp_month=card_data.get("exp_month"),
                     exp_year=card_data.get("exp_year")
                 )
-            
+
             formatted_methods.append(PaymentMethodItemResponse(
                 id=method.get("id", ""),
                 type=method.get("type", "card"),
                 card=card_info,
-                is_default=False  # TODO: Track default payment method
+                is_default=method.get("id") == default_pm_id
             ))
-        
+
         return PaymentMethodsResponse(data=formatted_methods)
     except Exception as e:
         logger.error(f"Failed to get payment methods: {e}")
@@ -376,7 +382,10 @@ async def add_payment_method(
             payment_method_data.payment_method_id,
             customer["id"]
         )
-        
+
+        if payment_method_data.is_default:
+            StripeClient.set_default_payment_method(customer["id"], payment_method.get("id"))
+
         # Format response
         card_info = None
         if payment_method.get("type") == "card" and payment_method.get("card"):
@@ -423,22 +432,174 @@ async def remove_payment_method(
         # Get payment methods to check if it's default
         payment_methods_data = StripeClient.list_payment_methods(customer["id"])
         methods_list = payment_methods_data.get("data", [])
-        
+
         # Check if method exists
         method_exists = any(m.get("id") == method_id for m in methods_list)
         if not method_exists:
             raise NotFoundException("Payment method", method_id)
-        
-        # TODO: Check if it's default and prevent deletion if it is
-        # For now, allow deletion
-        
+
+        # The last remaining payment method cannot be removed — subscriptions
+        # would have nothing left to charge. Add a replacement first.
+        if len(methods_list) <= 1:
+            raise BadRequestException(
+                "You cannot remove your only payment method. Add another card first, then remove this one."
+            )
+
+        was_default = (customer.get("invoice_settings") or {}).get("default_payment_method") == method_id
+
         StripeClient.detach_payment_method(method_id)
+
+        # Never leave the customer without a default: promote the first survivor.
+        if was_default:
+            remaining = [m for m in methods_list if m.get("id") != method_id]
+            if remaining:
+                StripeClient.set_default_payment_method(customer["id"], remaining[0].get("id"))
+
         return {"message": "Payment method removed successfully"}
     except NotFoundException:
+        raise
+    except BadRequestException:
         raise
     except Exception as e:
         logger.error(f"Failed to remove payment method: {e}")
         raise BadRequestException("Failed to remove payment method")
+
+
+@router.put("/payment-methods/{method_id}/default")
+async def set_default_payment_method(
+    method_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Make an already-saved payment method the default (switch cards)"""
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+
+    try:
+        customer = StripeClient.get_or_create_customer(
+            email=current_user.email,
+            name=f"{current_user.first_name} {current_user.last_name}",
+            metadata={"account_id": str(account.id)}
+        )
+
+        payment_methods_data = StripeClient.list_payment_methods(customer["id"])
+        methods_list = payment_methods_data.get("data", [])
+        if not any(m.get("id") == method_id for m in methods_list):
+            raise NotFoundException("Payment method", method_id)
+
+        StripeClient.set_default_payment_method(customer["id"], method_id)
+        return {"message": "Default payment method updated"}
+    except NotFoundException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to set default payment method: {e}")
+        raise BadRequestException("Failed to set default payment method")
+
+
+class BillingAddress(BaseModel):
+    line1: Optional[str] = None
+    line2: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    postal_code: Optional[str] = None
+    country: Optional[str] = None
+
+
+class BillingInfoUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[BillingAddress] = None
+
+
+@router.get("/billing-info")
+async def get_billing_info(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Billing contact details as stored on the Stripe customer"""
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+
+    try:
+        customer = StripeClient.get_or_create_customer(
+            email=current_user.email,
+            name=f"{current_user.first_name} {current_user.last_name}",
+            metadata={"account_id": str(account.id)}
+        )
+        address = customer.get("address") or {}
+        return {
+            "data": {
+                "name": customer.get("name"),
+                "email": customer.get("email"),
+                "phone": customer.get("phone"),
+                "address": {
+                    "line1": address.get("line1"),
+                    "line2": address.get("line2"),
+                    "city": address.get("city"),
+                    "state": address.get("state"),
+                    "postal_code": address.get("postal_code"),
+                    "country": address.get("country"),
+                },
+            }
+        }
+    except Exception as e:
+        logger.error(f"Failed to get billing info: {e}")
+        raise BadRequestException("Failed to retrieve billing info")
+
+
+@router.put("/billing-info")
+async def update_billing_info(
+    billing: BillingInfoUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Update billing contact details on the Stripe customer"""
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+
+    try:
+        customer = StripeClient.get_or_create_customer(
+            email=current_user.email,
+            name=f"{current_user.first_name} {current_user.last_name}",
+            metadata={"account_id": str(account.id)}
+        )
+
+        fields = {}
+        if billing.name is not None:
+            fields["name"] = billing.name
+        if billing.email is not None:
+            fields["email"] = billing.email
+        if billing.phone is not None:
+            fields["phone"] = billing.phone
+        if billing.address is not None:
+            fields["address"] = {k: v for k, v in billing.address.dict().items() if v is not None}
+
+        if not fields:
+            raise BadRequestException("No billing fields to update")
+
+        StripeClient.update_customer_billing(customer["id"], **fields)
+        return {"message": "Billing info updated"}
+    except BadRequestException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update billing info: {e}")
+        raise BadRequestException("Failed to update billing info")
 
 
 class RefundCreateResponse(BaseModel):

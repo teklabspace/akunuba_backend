@@ -163,6 +163,8 @@ async def persona_webhook(
                         send_email=False,
                     )
                 elif kyc.status == KYCStatus.REJECTED:
+                    # Rejections also go out by email: the user may not be logged
+                    # in to see the bell, and they need the reason to retry.
                     await NotificationService.create_notification(
                         db=db, account_id=kyc.account_id,
                         notification_type=NotificationType.GENERAL,
@@ -173,7 +175,7 @@ async def persona_webhook(
                             f"You can restart verification from your account."
                         ),
                         metadata=f'{{"event": "kyc_rejected", "inquiry_id": "{inquiry_id}"}}',
-                        send_email=False,
+                        send_email=True,
                     )
             except Exception as e:
                 logger.error(f"Persona webhook: failed to notify user for KYC {kyc.id}: {e}")

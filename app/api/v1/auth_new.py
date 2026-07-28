@@ -28,7 +28,7 @@ try:
 except ImportError:
     TOTP_AVAILABLE = False
     pyotp = None
-from app.core.exceptions import UnauthorizedException, ConflictException, NotFoundException, BadRequestException
+from app.core.exceptions import UnauthorizedException, ConflictException, NotFoundException, BadRequestException, ForbiddenException
 from app.core.rate_limit import limiter, LOGIN_RATE_LIMIT, AUTH_RATE_LIMIT
 from app.schemas.user import UserCreate, UserLogin, TokenResponse, LoginUserResponse, OTPRequest, OTPVerify, PasswordResetRequest, PasswordReset, RefreshTokenRequest, EmailVerificationRequest
 from app.utils.logger import logger
@@ -582,7 +582,10 @@ async def login(request: Request, credentials: UserLogin, db: AsyncSession = Dep
     if not user or not verify_password(credentials.password, user.hashed_password):
         raise UnauthorizedException("Incorrect email or password")
     if not user.is_active:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User account is inactive")
+        raise ForbiddenException(
+            "Your account has been deactivated. Please contact support.",
+            code="ACCOUNT_DEACTIVATED",
+        )
     
     # Check if 2FA is enabled and verified
     if user.two_factor_auth_enabled and user.two_factor_auth_verified:
@@ -677,6 +680,9 @@ async def refresh_token_endpoint(request: Request, body: RefreshTokenRequest, db
     user = result.scalar_one_or_none()
     if not user or user.refresh_token != body.refresh_token:
         raise UnauthorizedException("Invalid refresh token")
+    if not user.is_active:
+        # A deactivated user must not be able to mint fresh tokens
+        raise UnauthorizedException("Account deactivated", code="ACCOUNT_DEACTIVATED")
     access_token = create_access_token(data={"sub": str(user.id)})
     new_refresh_token = create_refresh_token(data={"sub": str(user.id)})
     user.refresh_token = new_refresh_token

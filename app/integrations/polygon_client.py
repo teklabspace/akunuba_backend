@@ -1,3 +1,4 @@
+import time
 import httpx
 from app.config import settings
 from app.utils.logger import logger
@@ -13,6 +14,11 @@ class PolygonClient:
     # can never succeed for this key.
     _snapshot_unavailable = False
 
+    # In-process TTL cache. The free key allows 5 req/min and one trade-engine
+    # page load fires several calls, so every repeated request MUST be served
+    # from memory. On errors (usually 429) a stale entry is better than none.
+    _cache: Dict[str, tuple] = {}
+
     @classmethod
     def snapshot_unavailable(cls) -> bool:
         return cls._snapshot_unavailable
@@ -25,19 +31,42 @@ class PolygonClient:
         return {"apiKey": settings.POLYGON_API_KEY}
 
     @staticmethod
+    def _cached_get(url: str, params: Dict[str, str], ttl: int) -> Optional[Dict[str, Any]]:
+        """GET with TTL cache; serves a stale entry when the live call fails."""
+        key = url + "?" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        now = time.time()
+        hit = PolygonClient._cache.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+        try:
+            with httpx.Client() as client:
+                response = client.get(url, params=params, timeout=30.0)
+                response.raise_for_status()
+                data = response.json()
+        except Exception:
+            if hit:
+                logger.warning(f"Polygon request failed, serving stale cache: {url}")
+                return hit[1]
+            raise
+        if len(PolygonClient._cache) > 500:
+            expired = [k for k, v in PolygonClient._cache.items() if v[0] <= now]
+            for k in expired:
+                PolygonClient._cache.pop(k, None)
+        PolygonClient._cache[key] = (now + ttl, data)
+        return data
+
+    @staticmethod
     def get_ticker_details(ticker: str) -> Optional[Dict[str, Any]]:
         if not settings.POLYGON_API_KEY:
             logger.warning("Polygon API key not configured - skipping request")
             return None
         try:
-            with httpx.Client() as client:
-                response = client.get(
-                    f"{PolygonClient.BASE_URL}/v2/reference/tickers/{ticker}",
-                    params=PolygonClient._get_params(),
-                    timeout=30.0
-                )
-                response.raise_for_status()
-                return response.json()
+            # Reference data barely changes — cache for a day.
+            return PolygonClient._cached_get(
+                f"{PolygonClient.BASE_URL}/v2/reference/tickers/{ticker}",
+                PolygonClient._get_params(),
+                ttl=86400,
+            )
         except Exception as e:
             logger.error(f"Failed to get Polygon ticker details: {e}")
             return None
@@ -48,14 +77,16 @@ class PolygonClient:
             logger.warning("Polygon API key not configured - skipping request")
             return None
         try:
-            with httpx.Client() as client:
-                response = client.get(
-                    f"{PolygonClient.BASE_URL}/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{from_date}/{to_date}",
-                    params=PolygonClient._get_params(),
-                    timeout=30.0
-                )
-                response.raise_for_status()
-                return response.json()
+            # Free-tier bars are end-of-day anyway — 5 minutes of cache costs
+            # nothing in freshness and saves the rate limit. limit=50000 (the
+            # max) so long hourly ranges are never silently truncated.
+            params = PolygonClient._get_params()
+            params["limit"] = "50000"
+            return PolygonClient._cached_get(
+                f"{PolygonClient.BASE_URL}/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{from_date}/{to_date}",
+                params,
+                ttl=300,
+            )
         except Exception as e:
             logger.error(f"Failed to get Polygon aggregates: {e}")
             return None
@@ -151,25 +182,31 @@ class PolygonClient:
             return None
 
     @staticmethod
-    def search_tickers(query: str, limit: int = 10) -> Optional[List[Dict[str, Any]]]:
-        """Search for tickers by name or symbol"""
+    def search_tickers(query: str, limit: int = 10, market: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+        """Search for tickers by name or symbol.
+
+        market: Polygon market filter — "stocks", "crypto", "fx" — or None for all.
+        """
         if not settings.POLYGON_API_KEY:
             logger.warning("Polygon API key not configured - skipping request")
             return None
         try:
             params = PolygonClient._get_params()
-            params["search"] = query
+            if query:
+                params["search"] = query
             params["limit"] = str(limit)
-            
-            with httpx.Client() as client:
-                response = client.get(
-                    f"{PolygonClient.BASE_URL}/v3/reference/tickers",
-                    params=params,
-                    timeout=30.0
-                )
-                response.raise_for_status()
-                data = response.json()
-                return data.get("results", [])
+            params["active"] = "true"
+            if market:
+                params["market"] = market
+
+            # 10-minute cache: the browse list (empty query) is requested on
+            # every trade-engine page load and never changes intraday.
+            data = PolygonClient._cached_get(
+                f"{PolygonClient.BASE_URL}/v3/reference/tickers",
+                params,
+                ttl=600,
+            )
+            return (data or {}).get("results", [])
         except Exception as e:
             logger.error(f"Failed to search Polygon tickers: {e}")
             return None
@@ -200,14 +237,11 @@ class PolygonClient:
             logger.warning("Polygon API key not configured - skipping request")
             return None
         try:
-            with httpx.Client() as client:
-                response = client.get(
-                    f"{PolygonClient.BASE_URL}/v2/aggs/ticker/{ticker}/prev",
-                    params=PolygonClient._get_params(),
-                    timeout=30.0
-                )
-                response.raise_for_status()
-                return response.json()
+            return PolygonClient._cached_get(
+                f"{PolygonClient.BASE_URL}/v2/aggs/ticker/{ticker}/prev",
+                PolygonClient._get_params(),
+                ttl=300,
+            )
         except Exception as e:
             logger.error(f"Failed to get Polygon previous close: {e}")
             return None

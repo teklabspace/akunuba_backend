@@ -298,6 +298,27 @@ class StripeClient:
             raise
 
     @staticmethod
+    def set_default_payment_method(customer_id: str, payment_method_id: str) -> Dict[str, Any]:
+        """Set the customer's default payment method (used for invoices/subscriptions)"""
+        try:
+            return stripe.Customer.modify(
+                customer_id,
+                invoice_settings={"default_payment_method": payment_method_id},
+            )
+        except Exception as e:
+            logger.error(f"Failed to set default Stripe payment method: {e}")
+            raise
+
+    @staticmethod
+    def update_customer_billing(customer_id: str, **fields) -> Dict[str, Any]:
+        """Update billing contact fields (name, email, phone, address) on a customer"""
+        try:
+            return stripe.Customer.modify(customer_id, **fields)
+        except Exception as e:
+            logger.error(f"Failed to update Stripe customer billing info: {e}")
+            raise
+
+    @staticmethod
     def retrieve_charge(charge_id: str) -> Dict[str, Any]:
         """Retrieve charge details"""
         try:

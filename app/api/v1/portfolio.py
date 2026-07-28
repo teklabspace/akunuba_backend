@@ -595,12 +595,16 @@ async def get_allocation(
     )
     assets = core_assets(assets_result.scalars().all())
 
-    if not assets:
+    # Live positions at the linked brokerage (Alpaca) join the allocation.
+    alpaca_positions = _get_alpaca_positions()
+
+    if not assets and not alpaca_positions:
         return []
 
-    # Calculate total value
-    total_value = sum([asset.current_value for asset in assets])
-    
+    # Calculate total value (manual core assets + brokerage positions)
+    total_value = sum([asset.current_value for asset in assets], Decimal("0.00"))
+    total_value += Decimal(str(sum(p["market_value"] for p in alpaca_positions)))
+
     # Group by asset type
     allocation_by_type = {}
     for asset in assets:
@@ -619,6 +623,24 @@ async def get_allocation(
             "symbol": asset.symbol,
             "value": float(asset.current_value),
             "currency": asset.currency
+        })
+
+    for pos in alpaca_positions:
+        asset_type = "crypto" if pos["asset_class"] == "crypto" else "stock"
+        if asset_type not in allocation_by_type:
+            allocation_by_type[asset_type] = {
+                "count": 0,
+                "value": Decimal("0.00"),
+                "assets": []
+            }
+        allocation_by_type[asset_type]["count"] += 1
+        allocation_by_type[asset_type]["value"] += Decimal(str(pos["market_value"]))
+        allocation_by_type[asset_type]["assets"].append({
+            "id": f"alpaca_{pos['symbol']}",
+            "name": f"{pos['symbol']} (Brokerage)",
+            "symbol": pos["symbol"],
+            "value": pos["market_value"],
+            "currency": "USD"
         })
     
     # Format allocation with percentages
@@ -887,6 +909,23 @@ async def get_top_holdings(
             "currency": asset.currency
         })
     
+    # Live positions at the linked brokerage (Alpaca) are holdings too.
+    for pos in _get_alpaca_positions():
+        qty = pos["qty"]
+        avg_price = (pos["cost_basis"] / qty) if qty else pos["current_price"]
+        holdings.append({
+            "symbol": pos["symbol"],
+            "name": f"{pos['symbol']} (Brokerage)",
+            "type": "Crypto" if pos["asset_class"] == "crypto" else "Stock",
+            "shares": qty,
+            "avg_price": avg_price,
+            "current_price": pos["current_price"],
+            "value": pos["market_value"],
+            "change": pos["market_value"] - pos["cost_basis"],
+            "change_percentage": pos["unrealized_plpc"] * 100,
+            "currency": "USD"
+        })
+
     # Sort holdings
     reverse_order = order.lower() == "desc"
     if sort_by == "value":
@@ -1132,6 +1171,44 @@ async def get_portfolio_alerts(
 # CRYPTO PORTFOLIO SECTION
 # ============================================================================
 
+def _get_alpaca_positions(asset_class: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Live positions from the linked Alpaca brokerage, normalized to floats.
+
+    asset_class: 'crypto' or 'us_equity' to filter, None for all.
+    Returns [] when no brokerage is linked or the call fails — portfolio
+    endpoints degrade to manual assets only.
+    """
+    try:
+        raw = AlpacaClient.get_positions() or []
+    except Exception:
+        return []
+
+    def _field(pos, key, default=None):
+        if isinstance(pos, dict):
+            return pos.get(key, default)
+        return getattr(pos, key, default)
+
+    positions = []
+    for pos in raw:
+        cls = str(_field(pos, "asset_class", "") or "")
+        if asset_class and cls != asset_class:
+            continue
+        try:
+            positions.append({
+                "symbol": str(_field(pos, "symbol", "") or ""),
+                "qty": float(_field(pos, "qty", 0) or 0),
+                "market_value": float(_field(pos, "market_value", 0) or 0),
+                "current_price": float(_field(pos, "current_price", 0) or 0),
+                "cost_basis": float(_field(pos, "cost_basis", 0) or 0),
+                "unrealized_plpc": float(_field(pos, "unrealized_plpc", 0) or 0),
+                "change_today": float(_field(pos, "change_today", 0) or 0),
+                "asset_class": cls,
+            })
+        except (TypeError, ValueError):
+            continue
+    return positions
+
+
 @router.get("/crypto/summary", response_model=Dict[str, Dict[str, Any]])
 async def get_crypto_portfolio_summary(
     current_user: User = Depends(get_current_user),
@@ -1174,9 +1251,14 @@ async def get_crypto_portfolio_summary(
         else:
             total_invested += asset.current_value
     
+    # Crypto held at the linked brokerage (Alpaca) is part of the portfolio.
+    alpaca_crypto = _get_alpaca_positions("crypto")
+    total_value += Decimal(str(sum(p["market_value"] for p in alpaca_crypto)))
+    total_invested += Decimal(str(sum(p["cost_basis"] for p in alpaca_crypto)))
+
     total_return = total_value - total_invested
     return_percentage = (total_return / total_invested * 100) if total_invested > 0 else Decimal("0.00")
-    
+
     # Calculate volatility (simplified)
     risk_metrics = await calculate_risk_metrics(account.id, db)
     volatility_score = risk_metrics.get("volatility", 0.0)
@@ -1235,43 +1317,62 @@ async def get_crypto_performance(
     )
     crypto_assets = assets_result.scalars().all()
     
-    # Map time range to days
-    time_range_map = {
-        "1h": 0.04, "6h": 0.25, "12h": 0.5, "24h": 1,
-        "7d": 7, "30d": 30, "1y": 365
-    }
-    days = int(time_range_map.get(time_range, 30))
-    
-    # Get historical data points
-    data_points = []
-    for i in range(days, 0, -1):
-        snapshot_date = datetime.utcnow() - timedelta(days=i)
-        snapshot_value = Decimal("0.00")
-        
+    # Prefetch valuations once — the old per-point-per-asset queries hammered
+    # the remote DB, and int(0.04) days meant intraday ranges produced ZERO
+    # points (24h produced exactly one — the "just 1 dot" chart).
+    valuations_by_asset: Dict[Any, List[Any]] = {}
+    if crypto_assets:
+        valuations_result = await db.execute(
+            select(AssetValuation)
+            .where(AssetValuation.asset_id.in_([a.id for a in crypto_assets]))
+            .order_by(AssetValuation.valuation_date)
+        )
+        for valuation in valuations_result.scalars().all():
+            valuations_by_asset.setdefault(valuation.asset_id, []).append(valuation)
+
+    # Brokerage-held crypto has no local history — contributes its live value.
+    alpaca_value = Decimal(str(sum(
+        p["market_value"] for p in _get_alpaca_positions("crypto")
+    )))
+
+    def value_at(snapshot_date: datetime) -> Decimal:
+        total = Decimal("0.00")
         for asset in crypto_assets:
-            valuation_result = await db.execute(
-                select(AssetValuation)
-                .where(
-                    and_(
-                        AssetValuation.asset_id == asset.id,
-                        AssetValuation.valuation_date <= snapshot_date
-                    )
-                )
-                .order_by(desc(AssetValuation.valuation_date))
-                .limit(1)
-            )
-            valuation = valuation_result.scalar_one_or_none()
-            if valuation:
-                snapshot_value += valuation.value
-            else:
-                snapshot_value += asset.current_value
-        
-        time_str = snapshot_date.strftime("%H:%M") if time_range in ["1h", "6h", "12h", "24h"] else snapshot_date.strftime("%Y-%m-%d")
-        data_points.append({
-            "time": time_str,
-            "value": float(snapshot_value)
-        })
-    
+            chosen = None
+            for valuation in valuations_by_asset.get(asset.id, []):
+                # DB dates are tz-aware, snapshots are naive UTC — strip tz
+                # before comparing (mixing raises TypeError).
+                v_date = valuation.valuation_date
+                if v_date.tzinfo is not None:
+                    v_date = v_date.replace(tzinfo=None)
+                if v_date <= snapshot_date:
+                    chosen = valuation
+                else:
+                    break
+            total += chosen.value if chosen else asset.current_value
+        return total + alpaca_value
+
+    data_points = []
+    intraday_hours = {"1h": 1, "6h": 6, "12h": 12, "24h": 24}
+    if time_range in intraday_hours:
+        hours = intraday_hours[time_range]
+        n_points = max(6, min(24, hours * 2))
+        step_seconds = hours * 3600 / n_points
+        for i in range(n_points, -1, -1):
+            snapshot_date = datetime.utcnow() - timedelta(seconds=step_seconds * i)
+            data_points.append({
+                "time": snapshot_date.strftime("%H:%M"),
+                "value": float(value_at(snapshot_date)),
+            })
+    else:
+        days = int({"7d": 7, "30d": 30, "1y": 365}.get(time_range, 30))
+        for i in range(days, 0, -1):
+            snapshot_date = datetime.utcnow() - timedelta(days=i)
+            data_points.append({
+                "time": snapshot_date.strftime("%Y-%m-%d"),
+                "value": float(value_at(snapshot_date)),
+            })
+
     return {"data": data_points}
 
 
@@ -1300,9 +1401,7 @@ async def get_crypto_breakdown(
         )
     )
     crypto_assets = assets_result.scalars().all()
-    
-    total_value = sum([asset.current_value for asset in crypto_assets]) if crypto_assets else Decimal("0.00")
-    
+
     # Group by symbol
     crypto_groups = {}
     for asset in crypto_assets:
@@ -1314,7 +1413,15 @@ async def get_crypto_breakdown(
             }
         crypto_groups[symbol]["value"] += asset.current_value
         crypto_groups[symbol]["assets"].append(asset)
-    
+
+    # Brokerage-held crypto (Alpaca) joins the breakdown by symbol.
+    for pos in _get_alpaca_positions("crypto"):
+        symbol = pos["symbol"].replace("/USD", "").replace("USD", "") or pos["symbol"]
+        group = crypto_groups.setdefault(symbol, {"value": Decimal("0.00"), "assets": []})
+        group["value"] += Decimal(str(pos["market_value"]))
+
+    total_value = sum(g["value"] for g in crypto_groups.values()) if crypto_groups else Decimal("0.00")
+
     breakdown = []
     crypto_colors = {
         "BTC": "#F7931A",
@@ -1391,9 +1498,13 @@ async def get_crypto_holdings(
         )
     )
     crypto_assets = assets_result.scalars().all()
-    
-    total_value = sum([asset.current_value for asset in crypto_assets]) if crypto_assets else Decimal("0.00")
-    
+
+    # Brokerage-held crypto (Alpaca) counts toward the total and gets rows.
+    alpaca_crypto = _get_alpaca_positions("crypto")
+    alpaca_total = Decimal(str(sum(p["market_value"] for p in alpaca_crypto)))
+
+    total_value = (sum([asset.current_value for asset in crypto_assets]) if crypto_assets else Decimal("0.00")) + alpaca_total
+
     holdings = []
     crypto_icons = {
         "BTC": "₿",
@@ -1451,6 +1562,24 @@ async def get_crypto_holdings(
             "currency": asset.currency
         })
     
+    for pos in alpaca_crypto:
+        plain_symbol = pos["symbol"].replace("/USD", "").replace("USD", "") or pos["symbol"]
+        weight = (Decimal(str(pos["market_value"])) / total_value * 100) if total_value > 0 else Decimal("0.00")
+        holdings.append({
+            "id": f"alpaca_{pos['symbol']}",
+            "name": f"{plain_symbol} (Brokerage)",
+            "symbol": plain_symbol,
+            "icon": crypto_icons.get(plain_symbol, "●"),
+            "icon_bg": crypto_colors.get(plain_symbol, "#00D4AA"),
+            "quantity": pos["qty"],
+            "current_price": pos["current_price"],
+            "change_24h": pos["change_today"] * 100,
+            "change_7d": 0.0,
+            "market_value": pos["market_value"],
+            "portfolio_weight": float(weight),
+            "currency": "USD"
+        })
+
     # Sort
     reverse_order = order.lower() == "desc"
     if sort_by == "value":
@@ -1885,66 +2014,54 @@ async def get_transfer_status(
 
 @router.get("/trade-engine/search", response_model=Dict[str, List[Dict[str, Any]]])
 async def search_assets(
-    query: str = Query(..., description="Search query"),
-    asset_class: str = Query("all", description="stocks, crypto, bonds, etf, all"),
+    query: str = Query("", description="Search query — empty lists available instruments (browse mode)"),
+    asset_class: str = Query("all", description="stocks, crypto, all"),
     limit: int = Query(20, ge=1, le=100),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Search assets for trading"""
+    """Search assets for trading.
+
+    Exactly ONE Polygon call per search: the free-tier key allows 5 req/min,
+    so per-result price lookups (2 extra calls each) made search return empty
+    after the first couple of rows. Prices load when a result is selected
+    (the details endpoint), not per search row. An empty query returns the
+    market's instrument list so the UI can offer browseable options.
+    """
     results = []
-    
-    # Use Polygon API for search
+
+    # Polygon market filter beats client-side type filtering: crypto tickers
+    # often carry no "type" at all, so the old type check dropped all of them.
+    market_map = {"stocks": "stocks", "stock": "stocks", "etf": "stocks", "crypto": "crypto"}
+    market = market_map.get(asset_class.lower()) if asset_class else None
+
     try:
-        tickers = PolygonClient.search_tickers(query, limit=limit)
+        tickers = PolygonClient.search_tickers(query, limit=limit, market=market)
         if tickers:
+            asset_type_map = {"cs": "Stock", "etp": "ETF", "bond": "Bond"}
             for ticker in tickers:
                 ticker_symbol = ticker.get("ticker", "")
-                ticker_name = ticker.get("name", "")
-                ticker_type = ticker.get("type", "").lower()
-                
-                # Filter by asset class
-                if asset_class != "all":
-                    if asset_class == "stocks" and ticker_type not in ["cs", "etp"]:
-                        continue
-                    elif asset_class == "crypto" and "crypto" not in ticker_type:
-                        continue
-                    elif asset_class == "bonds" and "bond" not in ticker_type:
-                        continue
-                    elif asset_class == "etf" and "etp" not in ticker_type:
-                        continue
-                
-                # Get current price
-                current_price = PolygonClient.get_current_price(ticker_symbol)
-                if not current_price:
-                    continue
-                
-                # Get previous day for change calculation
-                yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
-                prev_data = PolygonClient.get_daily_open_close(ticker_symbol, yesterday)
-                prev_price = prev_data.get("close") if prev_data else current_price
-                change = current_price - prev_price if prev_price else 0
-                change_pct = (change / prev_price * 100) if prev_price > 0 else 0
-                
-                asset_type_map = {
-                    "cs": "Stock",
-                    "etp": "ETF",
-                    "crypto": "Crypto",
-                    "bond": "Bond"
-                }
-                
+                ticker_market = (ticker.get("market") or "").lower()
+                ticker_type = (ticker.get("type") or "").lower()
+
+                if ticker_market == "crypto":
+                    # Polygon prefixes crypto pairs (X:BTCUSD); brokerage and
+                    # UI use the plain pair (BTCUSD).
+                    display_symbol = ticker_symbol[2:] if ticker_symbol.startswith("X:") else ticker_symbol
+                    display_type = "Crypto"
+                else:
+                    display_symbol = ticker_symbol
+                    display_type = asset_type_map.get(ticker_type, "Stock")
+
                 results.append({
-                    "symbol": ticker_symbol,
-                    "name": ticker_name,
-                    "type": asset_type_map.get(ticker_type, "Stock"),
-                    "current_price": round(current_price, 2),
-                    "change": round(change, 2),
-                    "change_percentage": round(change_pct, 2),
+                    "symbol": display_symbol,
+                    "name": ticker.get("name", ""),
+                    "type": display_type,
                     "currency": "USD"
                 })
     except Exception as e:
         logger.error(f"Failed to search assets: {e}")
-    
+
     return {"data": results[:limit]}
 
 
@@ -1975,20 +2092,32 @@ async def get_asset_details(
             if current_price:
                 current_price = float(current_price)
         
+        # Crypto pairs arrive plain (BTCUSD) but Polygon wants the X: prefix —
+        # retry before giving up so selecting a crypto search result works.
+        if not current_price and not symbol_upper.startswith("X:"):
+            crypto_ticker = f"X:{symbol_upper}"
+            current_price = PolygonClient.get_current_price(crypto_ticker)
+            if current_price:
+                symbol_upper = crypto_ticker
+                ticker_details = PolygonClient.get_ticker_details(crypto_ticker)
+
         if not current_price:
             raise NotFoundException("Asset", f"Symbol '{symbol}' not found or price unavailable")
         
-        # Get previous day for change calculation
-        yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
-        prev_data = PolygonClient.get_daily_open_close(symbol_upper, yesterday)
-        prev_price = prev_data.get("close") if prev_data else current_price
+        # The previous-day bar (cached, and already fetched inside
+        # get_current_price on free-tier keys) has open+close — enough for the
+        # day change. The old extra /v1/open-close call burned rate budget.
+        prev_bar = PolygonClient.get_previous_close(symbol_upper)
+        prev_results = (prev_bar or {}).get("results") or []
+        day_open = prev_results[0].get("o") if prev_results else None
+        prev_price = float(day_open) if day_open else current_price
         change = current_price - prev_price if prev_price else 0
         change_pct = (change / prev_price * 100) if prev_price > 0 else 0
-        
+
         # Get additional data from snapshot
         bid = current_price
         ask = current_price
-        volume = 0
+        volume = float(prev_results[0].get("v") or 0) if prev_results else 0
         market_cap = 0
         exchange = "NASDAQ"
         asset_class = "stock"
@@ -2017,13 +2146,15 @@ async def get_asset_details(
                 high_52_week = prev_day.get("h")
                 low_52_week = prev_day.get("l")
         
-        # Get asset name from ticker details
-        asset_name = symbol_upper
+        # Get asset name from ticker details (fallback never shows the X: prefix)
+        asset_name = symbol_upper[2:] if symbol_upper.startswith("X:") else symbol_upper
         if ticker_details and ticker_details.get("results"):
-            asset_name = ticker_details["results"].get("name", symbol_upper)
+            asset_name = ticker_details["results"].get("name", asset_name)
         
         # Determine asset class
-        if ticker_details and ticker_details.get("results"):
+        if symbol_upper.startswith("X:"):
+            asset_class = "crypto"
+        elif ticker_details and ticker_details.get("results"):
             ticker_type = ticker_details["results"].get("type", "").lower()
             if "crypto" in ticker_type:
                 asset_class = "crypto"
@@ -2033,10 +2164,12 @@ async def get_asset_details(
                 asset_class = "bond"
             else:
                 asset_class = "stock"
-        
+
         return {
             "data": {
-                "symbol": symbol_upper,
+                # Hand back the plain pair for crypto — the UI and brokerage
+                # never see Polygon's X: prefix.
+                "symbol": symbol_upper[2:] if symbol_upper.startswith("X:") else symbol_upper,
                 "name": asset_name,
                 "current_price": round(current_price, 2),
                 "previous_close": round(prev_price, 2),
@@ -2105,6 +2238,73 @@ async def get_recent_trades(
         })
     
     return {"data": trades}
+
+
+@router.get("/trade-engine/assets/{symbol}/price-history", response_model=Dict[str, List[Dict[str, Any]]])
+async def get_asset_price_history(
+    symbol: str = Path(..., description="Asset symbol"),
+    time_range: str = Query("1M", alias="range", description="1D, 1W, 1M, 3M, 6M, 1Y, 5Y, ALL"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Price candles for the asset chart — one Polygon aggregates call
+    (works on the free-tier key). Crypto pairs retry with the X: prefix.
+
+    Bar size scales with the window like a trading terminal: hourly bars for
+    intraday/week views, daily up to a year, weekly/monthly beyond that.
+    """
+    symbol_upper = symbol.upper().strip()
+
+    # range → (multiplier, timespan, lookback days). Lookbacks include indicator
+    # WARM-UP periods beyond the display window (SMA50 etc. need ~50 prior bars
+    # or they'd have nothing to draw on short ranges) — the frontend slices the
+    # display window client-side and uses the earlier bars only for math.
+    range_map = {
+        "1D": (1, "hour", 7),
+        "1W": (1, "hour", 14),
+        "1M": (1, "day", 30 + 110),
+        "3M": (1, "day", 90 + 110),
+        "6M": (1, "day", 180 + 110),
+        "1Y": (1, "day", 365 + 110),
+        "5Y": (1, "week", 365 * 5 + 400),
+        "ALL": (1, "month", 365 * 20),
+    }
+    multiplier, timespan, days = range_map.get(time_range.upper(), (1, "day", 30))
+    to_date = datetime.utcnow().date()
+    from_date = to_date - timedelta(days=days)
+
+    def fetch(ticker: str):
+        data = PolygonClient.get_aggregates(
+            ticker, multiplier, timespan, from_date.isoformat(), to_date.isoformat()
+        )
+        return (data or {}).get("results") or []
+
+    try:
+        results = fetch(symbol_upper)
+        if not results and not symbol_upper.startswith("X:"):
+            results = fetch(f"X:{symbol_upper}")
+
+        history = []
+        for bar in results:
+            if bar.get("t") is None:
+                continue
+            ts = datetime.utcfromtimestamp(bar["t"] / 1000)
+            history.append({
+                # Intraday bars keep the time component; daily+ bars are dates.
+                "date": ts.isoformat() if timespan == "hour" else ts.date().isoformat(),
+                "open": bar.get("o"),
+                "high": bar.get("h"),
+                "low": bar.get("l"),
+                "close": bar.get("c"),
+                "volume": bar.get("v"),
+            })
+
+        # All bars (warm-up included) go to the client — it trims the display
+        # window itself so indicators can be computed over the full series.
+        return {"data": history}
+    except Exception as e:
+        logger.error(f"Error getting price history for {symbol}: {e}", exc_info=True)
+        return {"data": []}
 
 
 @router.get("/trade-engine/assets/{symbol}/history", response_model=Dict[str, List[Dict[str, Any]]])

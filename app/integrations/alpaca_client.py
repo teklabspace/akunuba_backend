@@ -165,6 +165,13 @@ class AlpacaClient:
             "accept": "application/json"
         }
 
+    @staticmethod
+    def _time_in_force_for(symbol: str):
+        """Alpaca rejects 'day' for crypto orders — those must be GTC/IOC."""
+        s = (symbol or "").upper()
+        is_crypto = "/" in s or (len(s) >= 6 and s.endswith(("USD", "USDT", "USDC")))
+        return TimeInForce.GTC if is_crypto else TimeInForce.DAY
+
     @classmethod
     def create_market_order(cls, symbol: str, qty: float, side: str) -> Optional[Dict[str, Any]]:
         if not ALPACA_AVAILABLE:
@@ -178,7 +185,7 @@ class AlpacaClient:
                 symbol=symbol,
                 qty=qty,
                 side=OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL,
-                time_in_force=TimeInForce.DAY
+                time_in_force=cls._time_in_force_for(symbol)
             )
             order = client.submit_order(order_data=order_data)
             return order
@@ -200,7 +207,7 @@ class AlpacaClient:
                 qty=qty,
                 side=OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL,
                 limit_price=limit_price,
-                time_in_force=TimeInForce.DAY
+                time_in_force=cls._time_in_force_for(symbol)
             )
             order = client.submit_order(order_data=order_data)
             return order
@@ -263,7 +270,11 @@ class AlpacaClient:
             return None
         try:
             positions = client.list_positions()
-            return [position._raw for position in positions] if hasattr(positions[0], '_raw') else positions
+            # NOTE: guard the empty list — positions[0] used to IndexError when
+            # the account held nothing, turning "no positions" into None.
+            if positions and hasattr(positions[0], '_raw'):
+                return [position._raw for position in positions]
+            return positions or []
         except Exception as e:
             logger.error(f"Failed to get Alpaca positions: {e}")
             return None

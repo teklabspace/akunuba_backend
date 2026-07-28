@@ -251,14 +251,16 @@ def _full_name(user: Optional[User]) -> str:
     return name or user.email or "Unknown"
 
 
-def _my_offer_item(offer: Offer, viewer_account_id, escrow_id=None) -> dict:
+def _my_offer_item(offer: Offer, seller_account_ids, escrow_id=None) -> dict:
     """Serialize one offer for GET /offers/my from the viewer's perspective.
 
-    role is "seller" when the viewer owns the listing (offer received),
-    otherwise "buyer" (offer made). Callers must eager-load offer.account.user
-    and offer.listing with its account.user, asset and asset.photos."""
+    role is "seller" when the listing belongs to one of seller_account_ids —
+    the viewer's own account, plus (for advisors) their assigned clients'
+    accounts — otherwise "buyer" (offer made). Callers must eager-load
+    offer.account.user and offer.listing with its account.user, asset and
+    asset.photos."""
     listing = offer.listing
-    is_seller = listing is not None and listing.account_id == viewer_account_id
+    is_seller = listing is not None and listing.account_id in seller_account_ids
     counterparty_account = offer.account if is_seller else (listing.account if listing else None)
     counterparty_user = counterparty_account.user if counterparty_account else None
 
@@ -1563,13 +1565,25 @@ async def get_my_offers(
     if not account:
         raise NotFoundException("Account", str(current_user.id))
 
+    # Advisors also see offers received on their assigned clients' listings
+    # (same client scoping as the approval queue).
+    seller_account_ids = {account.id}
+    if current_user.role == Role.ADVISOR:
+        from app.models.advisor_client import AdvisorClient
+        client_account_rows = await db.execute(
+            select(Account.id)
+            .join(AdvisorClient, AdvisorClient.client_id == Account.user_id)
+            .where(AdvisorClient.advisor_id == current_user.id)
+        )
+        seller_account_ids.update(client_account_rows.scalars().all())
+
     query = (
         select(Offer)
         .join(MarketplaceListing, MarketplaceListing.id == Offer.listing_id)
         .where(
             or_(
                 Offer.account_id == account.id,
-                MarketplaceListing.account_id == account.id,
+                MarketplaceListing.account_id.in_(seller_account_ids),
             )
         )
         .options(
@@ -1598,7 +1612,7 @@ async def get_my_offers(
 
     return {
         "data": [
-            _my_offer_item(offer, account.id, escrow_by_offer.get(offer.id))
+            _my_offer_item(offer, seller_account_ids, escrow_by_offer.get(offer.id))
             for offer in offers
         ]
     }
