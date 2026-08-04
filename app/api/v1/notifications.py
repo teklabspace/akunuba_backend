@@ -44,6 +44,11 @@ def serialize_notification(n: Notification) -> Dict[str, Any]:
         "appraisal_type": meta.get("appraisal_type"),
         "author_kind": meta.get("author_kind"),
         "author_name": meta.get("author_name"),
+        # Deep-link / live-refetch targets (chat + marketplace + support).
+        "conversation_id": meta.get("conversation_id"),
+        "listing_id": meta.get("listing_id"),
+        "ticket_id": meta.get("ticket_id"),
+        "metadata": meta,
         "read": n.is_read,
         "is_read": n.is_read,
         "created_at": n.created_at.isoformat() if n.created_at else None,

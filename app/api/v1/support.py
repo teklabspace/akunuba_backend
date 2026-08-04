@@ -356,8 +356,43 @@ async def create_ticket_reply(
     db.add(reply)
     await db.commit()
     await db.refresh(reply)
-    
+
     logger.info(f"Ticket reply created: {reply.id} for ticket {ticket_id}")
+
+    # REAL-TIME: push the reply to the other party so their open thread
+    # refreshes instantly (internal notes stay staff-only, so no push).
+    if not reply_data.is_internal:
+        try:
+            import json as _json
+            from app.services.notification_service import NotificationService
+            from app.models.notification import NotificationType
+            meta = _json.dumps({
+                "type": "ticket_reply",
+                "ticket_id": str(ticket_id),
+                "preview": (reply_data.message or "")[:120],
+                "author_name": f"{current_user.first_name or ''} {current_user.last_name or ''}".strip(),
+            })
+            is_staff = has_permission(current_user.role, Permission.MANAGE_SUPPORT)
+            if is_staff:
+                # Staff replied → notify the ticket owner (bell + WS, no email spam).
+                await NotificationService.create_notification(
+                    db=db, account_id=ticket.account_id,
+                    notification_type=NotificationType.GENERAL,
+                    title="Support replied to your ticket",
+                    message=(reply_data.message or "")[:200],
+                    metadata=meta, send_email=False,
+                )
+            else:
+                # User replied → notify staff (admins) watching the queue.
+                await NotificationService.notify_admins(
+                    db=db, notification_type=NotificationType.GENERAL,
+                    title="New reply on a support ticket",
+                    message=(reply_data.message or "")[:200],
+                    metadata=meta,
+                )
+        except Exception as e:
+            logger.error(f"Failed to push ticket reply notification: {e}")
+
     return _reply_response(reply, current_user)
 
 

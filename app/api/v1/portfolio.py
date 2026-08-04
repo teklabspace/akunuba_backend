@@ -1190,7 +1190,10 @@ def _get_alpaca_positions(asset_class: Optional[str] = None) -> List[Dict[str, A
 
     positions = []
     for pos in raw:
-        cls = str(_field(pos, "asset_class", "") or "")
+        # alpaca-py returns an AssetClass enum ("crypto"/"us_equity" behind
+        # .value); the legacy SDK returns the plain string.
+        cls_raw = _field(pos, "asset_class", "")
+        cls = str(getattr(cls_raw, "value", cls_raw) or "").lower()
         if asset_class and cls != asset_class:
             continue
         try:

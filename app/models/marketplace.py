@@ -74,6 +74,9 @@ class Offer(Base):
     listing_id = Column(UUID(as_uuid=True), ForeignKey("marketplace_listings.id"), nullable=False)
     account_id = Column(UUID(as_uuid=True), ForeignKey("accounts.id"), nullable=False)
     offer_amount = Column(Numeric(20, 2), nullable=False)
+    # Seller's counter price, set when status becomes COUNTERED. Lives on the
+    # buyer's own offer row so the buyer sees (and can accept) the counter.
+    counter_amount = Column(Numeric(20, 2), nullable=True)
     currency = Column(String(3), default="USD", nullable=False)
     status = Column(SQLEnum(OfferStatus), default=OfferStatus.PENDING, nullable=False)
     message = Column(Text)

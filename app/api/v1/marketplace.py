@@ -177,6 +177,9 @@ class ListingDetailResponse(ListingResponse):
     slots_filled: Optional[int] = None
     overview: Optional[ListingOverview] = None
     faqs: Optional[List[ListingFAQ]] = None
+    # Full photo gallery of the underlying asset (primary first). The card
+    # thumbnail stays in thumbnail_url; detail pages can show all of them.
+    images: Optional[List[str]] = None
 
 
 def _listing_detail_response(listing: MarketplaceListing, is_owner: bool) -> ListingDetailResponse:
@@ -185,7 +188,10 @@ def _listing_detail_response(listing: MarketplaceListing, is_owner: bool) -> Lis
     meta = listing.meta_data or {}
     details = meta.get(_DETAILS_KEY) or {}
     seller_user = listing.account.user if listing.account else None
+    asset_photos = listing.asset.photos if listing.asset else []
+    images = [p.url or p.thumbnail_url for p in asset_photos if (p.url or p.thumbnail_url)]
     return ListingDetailResponse(
+        images=images or None,
         **_listing_with_category(listing).model_dump(),
         description=listing.description,
         seller_name=_full_name(seller_user) if seller_user else None,
@@ -281,6 +287,7 @@ def _my_offer_item(offer: Offer, seller_account_ids, escrow_id=None) -> dict:
         "asset_type": asset_type,
         "asset_thumbnail": asset_thumbnail,
         "offer_amount": offer.offer_amount,
+        "counter_amount": offer.counter_amount,
         "currency": offer.currency,
         "status": getattr(offer.status, "value", offer.status),
         "role": "seller" if is_seller else "buyer",
@@ -999,6 +1006,7 @@ async def accept_offer(
     return {
         "escrow_id": escrow.id,
         "payment_intent_id": escrow.stripe_payment_intent_id,
+        "client_secret": payment_intent.get("client_secret"),
         "amount": float(escrow.amount),
         "commission": float(escrow.commission),
     }
@@ -1072,6 +1080,10 @@ class EscrowResponse(BaseModel):
     asset_name: Optional[str] = None
     thumbnail_url: Optional[str] = None
     released_at: Optional[datetime] = None
+    # For the buyer of a pending escrow: Stripe client_secret to complete the
+    # fixed-amount card payment. Null for everyone else.
+    client_secret: Optional[str] = None
+    is_buyer: bool = False
 
     class Config:
         from_attributes = True
@@ -1280,11 +1292,13 @@ async def get_listing_documents(
     current_user: Optional[User] = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Documents the seller explicitly exposed on this listing (Documents tab).
+    """Documents shown on the listing's Documents tab.
 
-    Only AssetDocuments whose ids the seller attached via document_ids on
-    listing create/update are returned — the owner's other files stay
-    private, since any authenticated buyer (or guest) can reach this page."""
+    If the seller explicitly attached document_ids on listing create/update,
+    ONLY those are returned (their other files stay private). With no explicit
+    selection, all documents of the listed asset are shown — an approved
+    listing is a public sale, and buyers need the paperwork (client request:
+    asset docs must appear on the marketplace)."""
     listing, _ = await _visible_listing_or_404(listing_id, current_user, db)
 
     raw_ids = (listing.meta_data or {}).get(_PUBLIC_DOCS_KEY) or []
@@ -1294,16 +1308,13 @@ async def get_listing_documents(
             public_ids.append(UUID(str(raw)))
         except ValueError:
             continue
-    if not public_ids:
-        return {"data": []}
+
+    query = select(AssetDocument).where(AssetDocument.asset_id == listing.asset_id)
+    if public_ids:
+        query = query.where(AssetDocument.id.in_(public_ids))
 
     docs = (await db.execute(
-        select(AssetDocument)
-        .where(
-            AssetDocument.id.in_(public_ids),
-            AssetDocument.asset_id == listing.asset_id,
-        )
-        .order_by(AssetDocument.created_at.desc())
+        query.order_by(AssetDocument.created_at.desc())
     )).scalars().all()
 
     return {
@@ -1735,24 +1746,19 @@ async def counter_offer(
     
     if original_offer.status != OfferStatus.PENDING:
         raise BadRequestException("Can only counter pending offers")
-    
-    # Mark original as countered
+
+    # The counter lives ON the buyer's offer row (counter_amount). The old
+    # implementation created a NEW Offer owned by the seller on the seller's
+    # own listing — the buyer could never see it in /offers/my, let alone
+    # accept it.
     original_offer.status = OfferStatus.COUNTERED
-    
-    # Create new counter offer
-    counter_offer = Offer(
-        listing_id=original_offer.listing_id,
-        account_id=account.id,  # Seller's account
-        offer_amount=counter_amount,
-        currency=original_offer.currency,
-        message=message or f"Counter offer for {original_offer.offer_amount}",
-        status=OfferStatus.PENDING,
-        expires_at=datetime.utcnow() + timedelta(days=7),
-    )
-    
-    db.add(counter_offer)
+    original_offer.counter_amount = counter_amount
+    if message:
+        original_offer.message = message
+    original_offer.expires_at = datetime.utcnow() + timedelta(days=7)
+
     await db.commit()
-    await db.refresh(counter_offer)
+    await db.refresh(original_offer)
 
     from app.models.notification import NotificationType
     await _notify_account(
@@ -1760,12 +1766,156 @@ async def counter_offer(
         "Counter offer received",
         f"The seller countered your offer of {original_offer.offer_amount:,.2f} "
         f"{original_offer.currency} on '{listing.title}' with "
-        f"{counter_offer.offer_amount:,.2f} {counter_offer.currency}.",
+        f"{counter_amount:,.2f} {original_offer.currency}. "
+        f"Accept it to proceed to payment.",
         send_email=True,
     )
 
-    logger.info(f"Counter offer created: {counter_offer.id}")
-    return {"message": "Counter offer created", "offer_id": counter_offer.id}
+    logger.info(f"Counter offer set on offer {original_offer.id}: {counter_amount}")
+    return {"message": "Counter offer created", "offer_id": original_offer.id}
+
+
+@router.post("/offers/{offer_id}/accept-counter")
+async def accept_counter_offer(
+    offer_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """BUYER accepts the seller's counter offer.
+
+    The offer amount becomes the counter amount, the offer is accepted, the
+    listing goes to SOLD and an escrow + Stripe payment intent are created —
+    the same outcome as the seller accepting the original offer, but
+    initiated from the buyer's side."""
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+
+    offer = (await db.execute(
+        select(Offer).where(Offer.id == offer_id)
+    )).scalar_one_or_none()
+
+    if not offer:
+        raise NotFoundException("Offer", str(offer_id))
+    if offer.account_id != account.id:
+        raise UnauthorizedException("Only the offer's buyer can accept a counter offer")
+    if offer.status != OfferStatus.COUNTERED or offer.counter_amount is None:
+        raise BadRequestException("This offer has no counter to accept")
+
+    listing = (await db.execute(
+        select(MarketplaceListing).where(MarketplaceListing.id == offer.listing_id)
+    )).scalar_one_or_none()
+
+    if not listing or listing.status not in (ListingStatus.APPROVED, ListingStatus.ACTIVE):
+        raise ConflictException(
+            "This listing is not open for sale (it may be under appraisal, sold, or cancelled).",
+            code="LISTING_NOT_OPEN",
+        )
+
+    # The agreed price is the seller's counter — never buyer-editable.
+    offer.offer_amount = offer.counter_amount
+    commission = calculate_commission(offer.offer_amount, False)
+
+    escrow = EscrowTransaction(
+        listing_id=listing.id,
+        offer_id=offer.id,
+        buyer_id=offer.account_id,
+        seller_id=listing.account_id,
+        amount=offer.offer_amount,
+        currency=offer.currency,
+        commission=commission,
+        status=EscrowStatus.PENDING,
+    )
+
+    try:
+        payment_intent = StripeClient.create_payment_intent(
+            amount=int(offer.offer_amount * 100),
+            currency=offer.currency.lower(),
+            metadata={
+                "escrow_id": str(escrow.id),
+                "listing_id": str(listing.id),
+                "offer_id": str(offer.id),
+            }
+        )
+        escrow.stripe_payment_intent_id = payment_intent["id"]
+    except Exception as e:
+        logger.error(f"Failed to create payment intent: {e}")
+        raise BadRequestException("Failed to create payment intent")
+
+    offer.status = OfferStatus.ACCEPTED
+    listing.status = ListingStatus.SOLD
+
+    db.add(escrow)
+    await db.commit()
+    await db.refresh(escrow)
+
+    from app.models.notification import NotificationType
+    await _notify_account(
+        db, listing.account_id, NotificationType.OFFER_ACCEPTED,
+        "Counter offer accepted",
+        f"The buyer accepted your counter of {offer.offer_amount:,.2f} "
+        f"{offer.currency} on '{listing.title}'. Awaiting buyer payment.",
+        send_email=True,
+    )
+
+    logger.info(f"Counter accepted on offer {offer_id}, escrow {escrow.id}")
+    return {
+        "escrow_id": escrow.id,
+        "payment_intent_id": escrow.stripe_payment_intent_id,
+        "client_secret": payment_intent.get("client_secret"),
+        "amount": float(escrow.amount),
+        "commission": float(escrow.commission),
+    }
+
+
+@router.post("/offers/{offer_id}/decline-counter")
+async def decline_counter_offer(
+    offer_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """BUYER declines the seller's counter offer — the offer closes as rejected."""
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+
+    offer = (await db.execute(
+        select(Offer).where(Offer.id == offer_id)
+    )).scalar_one_or_none()
+
+    if not offer:
+        raise NotFoundException("Offer", str(offer_id))
+    if offer.account_id != account.id:
+        raise UnauthorizedException("Only the offer's buyer can decline a counter offer")
+    if offer.status != OfferStatus.COUNTERED:
+        raise BadRequestException("This offer has no counter to decline")
+
+    offer.status = OfferStatus.REJECTED
+    await db.commit()
+
+    listing = (await db.execute(
+        select(MarketplaceListing).where(MarketplaceListing.id == offer.listing_id)
+    )).scalar_one_or_none()
+
+    from app.models.notification import NotificationType
+    await _notify_account(
+        db, listing.account_id if listing else offer.account_id, NotificationType.GENERAL,
+        "Counter offer declined",
+        f"The buyer declined your counter offer on "
+        f"'{listing.title if listing else 'your listing'}'.",
+        send_email=True,
+    )
+
+    logger.info(f"Counter declined on offer {offer_id}")
+    return {"message": "Counter offer declined"}
 
 
 @router.post("/offers/{offer_id}/withdraw")
@@ -1837,6 +1987,22 @@ async def get_escrow(
     )).scalar_one_or_none()
     asset = listing.asset if listing else None
     photo = _primary_photo(asset.photos) if asset else None
+
+    # The buyer of a PENDING escrow gets the payment intent's client_secret so
+    # the frontend can charge the EXACT escrow amount via Stripe Elements —
+    # the buyer never types an amount.
+    client_secret = None
+    if (
+        escrow.buyer_id == account.id
+        and escrow.status == EscrowStatus.PENDING
+        and escrow.stripe_payment_intent_id
+    ):
+        try:
+            intent = StripeClient.retrieve_payment_intent(escrow.stripe_payment_intent_id)
+            client_secret = intent.get("client_secret")
+        except Exception as e:
+            logger.error(f"Failed to retrieve payment intent for escrow {escrow_id}: {e}")
+
     return EscrowResponse(
         id=escrow.id,
         amount=escrow.amount,
@@ -1850,6 +2016,8 @@ async def get_escrow(
         asset_name=asset.name if asset else None,
         thumbnail_url=(photo.thumbnail_url or photo.url) if photo else None,
         released_at=escrow.released_at,
+        client_secret=client_secret,
+        is_buyer=escrow.buyer_id == account.id,
     )
 
 
@@ -1875,14 +2043,28 @@ async def fund_escrow(
     
     if escrow.buyer_id != account.id:
         raise UnauthorizedException("Only buyer can fund escrow")
-    
+
     if escrow.status != EscrowStatus.PENDING:
         raise BadRequestException("Escrow is not in pending status")
-    
+
+    # FUNDED must mean the money actually arrived: verify the payment intent
+    # really succeeded at Stripe (the old code flipped the status blind).
+    if not escrow.stripe_payment_intent_id:
+        raise BadRequestException("No payment is attached to this escrow")
+    try:
+        intent = StripeClient.retrieve_payment_intent(escrow.stripe_payment_intent_id)
+    except Exception as e:
+        logger.error(f"Failed to verify payment for escrow {escrow_id}: {e}")
+        raise BadRequestException("Could not verify the payment — please try again")
+    if intent.get("status") != "succeeded":
+        raise BadRequestException(
+            "Payment has not completed yet. Please finish the card payment first."
+        )
+
     escrow.status = EscrowStatus.FUNDED
     await db.commit()
-    
-    logger.info(f"Escrow funded: {escrow_id}")
+
+    logger.info(f"Escrow funded: {escrow_id} (intent {escrow.stripe_payment_intent_id} succeeded)")
     return {"message": "Escrow funded successfully"}
 
 

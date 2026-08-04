@@ -292,13 +292,17 @@ async def resolve_dispute(
         )
         
     elif resolution_data.resolution == "refund":
-        # Refund to buyer
+        # Refund to buyer — create_refund takes a CHARGE id (the old
+        # payment_intent_id= keyword raised TypeError and refunds never ran).
         if dispute.stripe_payment_intent_id:
             try:
-                StripeClient.create_refund(
-                    payment_intent_id=dispute.stripe_payment_intent_id,
-                    amount=int(dispute.amount * 100)  # Convert to cents
-                )
+                import stripe as _stripe
+                _intent = _stripe.PaymentIntent.retrieve(dispute.stripe_payment_intent_id)
+                _charge_id = getattr(_intent, "latest_charge", None)
+                if _charge_id:
+                    StripeClient.create_refund(_charge_id, amount=int(dispute.amount * 100))
+                else:
+                    logger.error(f"Dispute refund: no charge on intent {dispute.stripe_payment_intent_id}")
             except Exception as e:
                 logger.error(f"Failed to create refund: {e}")
         
@@ -491,9 +495,22 @@ async def _refund_escrow_via_stripe(escrow: EscrowTransaction) -> None:
         import stripe
         from app.integrations.stripe_client import StripeClient
         payment_intent = stripe.PaymentIntent.retrieve(escrow.stripe_payment_intent_id)
-        charges = getattr(payment_intent, "charges", None)
-        if charges and charges.data:
-            StripeClient.create_refund(charges.data[0].id, amount=int(escrow.amount * 100))
+        # Stripe API 2022-11-15+ dropped the embedded `charges` list — the
+        # charge now lives in `latest_charge`. The old code found no charge and
+        # SILENTLY skipped the refund while the DB said "refunded".
+        charge_id = getattr(payment_intent, "latest_charge", None)
+        if not charge_id:
+            charges = getattr(payment_intent, "charges", None)
+            if charges and charges.data:
+                charge_id = charges.data[0].id
+        if charge_id:
+            StripeClient.create_refund(charge_id, amount=int(escrow.amount * 100))
+            logger.info(f"Stripe refund created for escrow {escrow.id} (charge {charge_id})")
+        else:
+            logger.error(
+                f"Stripe refund SKIPPED for escrow {escrow.id}: no charge on intent "
+                f"{escrow.stripe_payment_intent_id} (was it ever paid?)"
+            )
     except Exception as e:
         logger.error(f"Stripe refund failed for escrow {escrow.id}: {e}")
 

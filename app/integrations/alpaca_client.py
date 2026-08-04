@@ -269,7 +269,12 @@ class AlpacaClient:
         if not client:
             return None
         try:
-            positions = client.list_positions()
+            # alpaca-py's TradingClient calls it get_all_positions();
+            # list_positions() only exists on the legacy SDK.
+            if hasattr(client, "get_all_positions"):
+                positions = client.get_all_positions()
+            else:
+                positions = client.list_positions()
             # NOTE: guard the empty list — positions[0] used to IndexError when
             # the account held nothing, turning "no positions" into None.
             if positions and hasattr(positions[0], '_raw'):

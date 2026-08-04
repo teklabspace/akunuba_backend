@@ -88,6 +88,15 @@ class StripeClient:
             raise
 
     @staticmethod
+    def retrieve_payment_intent(payment_intent_id: str) -> Dict[str, Any]:
+        """Retrieve a payment intent (status checks / client_secret lookup)."""
+        try:
+            return stripe.PaymentIntent.retrieve(payment_intent_id)
+        except Exception as e:
+            logger.error(f"Failed to retrieve Stripe payment intent: {e}")
+            raise
+
+    @staticmethod
     def create_customer(email: str, name: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         try:
             customer = stripe.Customer.create(
