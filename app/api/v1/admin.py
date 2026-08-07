@@ -34,6 +34,17 @@ def require_admin(current_user: User = Depends(get_current_user)):
     return current_user
 
 
+def require_staff(current_user: User = Depends(get_current_user)):
+    """Dependency for staff (admin or advisor) read surfaces.
+
+    Advisors work the concierge appraisal queue and need the same read-only
+    asset view admins get; write/management endpoints stay on require_admin.
+    """
+    if current_user.role not in (Role.ADMIN, Role.ADVISOR):
+        raise ForbiddenException("Staff access required")
+    return current_user
+
+
 class AdminDashboardResponse(BaseModel):
     users: Dict[str, int]
     accounts: Dict[str, int]
@@ -2643,10 +2654,13 @@ async def admin_list_assets(
 @router.get("/assets/{asset_code}", response_model=Dict[str, Any])
 async def admin_get_asset_by_code(
     asset_code: str,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_staff),
     db: AsyncSession = Depends(get_db),
 ):
-    """Fetch a single asset by its human-readable code (e.g. AK-01) — admin only.
+    """Fetch a single asset by its human-readable code (e.g. AK-01) — staff only.
+
+    Read-only: also open to advisors so they can view the assets behind their
+    concierge appraisal queue (frontend "View Asset" button).
 
     Embeds the latest AI review, latest AI appraisal result, documents, and
     value history inline so the admin detail view needs no follow-up calls.

@@ -99,10 +99,16 @@ def test_unknown_role_gets_no_permissions():
 # ------------------------------------------------------------- router gating
 
 def test_every_admin_route_requires_admin():
+    # Deliberate staff-read exceptions gated by require_staff (admin OR advisor)
+    # instead of require_admin — read-only, see test_admin_staff_read_access.py.
+    staff_read_paths = {"/api/v1/admin/assets/{asset_code}"}
     admin_routes = [r for r in _api_routes() if r.endpoint.__module__ == "app.api.v1.admin"]
     assert len(admin_routes) >= 30, f"admin router shrank to {len(admin_routes)} routes"
     unguarded = [
-        (sorted(r.methods), r.path) for r in admin_routes if "require_admin" not in _deps(r)
+        (sorted(r.methods), r.path)
+        for r in admin_routes
+        if "require_admin" not in _deps(r)
+        and not (r.path in staff_read_paths and "require_staff" in _deps(r))
     ]
     assert not unguarded, f"admin routes WITHOUT require_admin gate: {unguarded}"
 
