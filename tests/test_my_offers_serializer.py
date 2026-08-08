@@ -1,8 +1,9 @@
 """Tests for the GET /marketplace/offers/my item serializer.
 
 Pure-helper tests (no DB): exercise _my_offer_item with stub ORM objects,
-covering buyer vs seller role resolution, counterparty selection, escrow id
-passthrough, and NULL-safe display names.
+covering buyer vs seller role resolution (seller_account_ids set — the
+viewer's own account plus, for advisors, their clients'), counterparty
+selection, escrow id/status passthrough, and NULL-safe display names.
 """
 import sys
 import uuid
@@ -13,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.api.v1.marketplace import _my_offer_item  # noqa: E402
 from app.models.asset import AssetType  # noqa: E402
-from app.models.marketplace import OfferStatus  # noqa: E402
+from app.models.marketplace import EscrowStatus, OfferStatus  # noqa: E402
 
 
 def _user(user_id, first="Jane", last="Doe", email="jane@example.com"):
@@ -41,6 +42,7 @@ def _stub_offer(buyer_account, seller_account, **overrides):
         account_id=buyer_account.id,
         account=buyer_account,
         offer_amount=12500,
+        counter_amount=None,
         currency="USD",
         status=OfferStatus.PENDING,
         message="hi",
@@ -57,7 +59,8 @@ def test_buyer_role_and_counterparty():
     buyer, seller = _account(uuid.uuid4(), buyer_user), _account(uuid.uuid4(), seller_user)
     offer = _stub_offer(buyer, seller)
 
-    item = _my_offer_item(offer, viewer_account_id=buyer.id, escrow_id=None)
+    # Viewer is the buyer: their own account is not the listing's seller.
+    item = _my_offer_item(offer, seller_account_ids={buyer.id}, escrow_id=None)
 
     assert item["role"] == "buyer"
     assert item["counterparty"] == "Sam Seller"
@@ -67,6 +70,7 @@ def test_buyer_role_and_counterparty():
     assert item["asset_thumbnail"] == "https://img/thumb.jpg"
     assert item["status"] == "pending"
     assert item["escrow_id"] is None
+    assert item["escrow_status"] is None
     assert item["updated_at"] == item["created_at"]  # NULL updated_at falls back
 
 
@@ -76,13 +80,20 @@ def test_seller_role_counterparty_and_escrow():
     escrow_id = uuid.uuid4()
     offer = _stub_offer(buyer, seller, status=OfferStatus.ACCEPTED)
 
-    item = _my_offer_item(offer, viewer_account_id=seller.id, escrow_id=escrow_id)
+    item = _my_offer_item(
+        offer,
+        seller_account_ids={seller.id},
+        escrow_id=escrow_id,
+        escrow_status=EscrowStatus.REFUNDED,
+    )
 
     assert item["role"] == "seller"
     assert item["counterparty"] == "Bob Buyer"
     assert item["counterparty_id"] == buyer_user.id
     assert item["status"] == "accepted"
     assert item["escrow_id"] == escrow_id
+    # Enum collapses to its literal value so the offers UI can badge "Refunded".
+    assert item["escrow_status"] == "refunded"
 
 
 def test_display_name_falls_back_to_email_then_unknown():
@@ -91,10 +102,10 @@ def test_display_name_falls_back_to_email_then_unknown():
     buyer, seller = _account(uuid.uuid4(), buyer_user), _account(uuid.uuid4(), seller_user)
     offer = _stub_offer(buyer, seller)
 
-    as_buyer = _my_offer_item(offer, viewer_account_id=buyer.id, escrow_id=None)
+    as_buyer = _my_offer_item(offer, seller_account_ids={buyer.id}, escrow_id=None)
     assert as_buyer["counterparty"] == "Unknown"  # seller has no name and no email
 
-    as_seller = _my_offer_item(offer, viewer_account_id=seller.id, escrow_id=None)
+    as_seller = _my_offer_item(offer, seller_account_ids={seller.id}, escrow_id=None)
     assert as_seller["counterparty"] == "anon@x.com"
 
 
@@ -104,7 +115,7 @@ def test_missing_asset_and_photos_are_null_safe():
     offer = _stub_offer(buyer, seller)
     offer.listing.asset = None
 
-    item = _my_offer_item(offer, viewer_account_id=buyer.id, escrow_id=None)
+    item = _my_offer_item(offer, seller_account_ids={buyer.id}, escrow_id=None)
 
     assert item["asset_type"] is None
     assert item["asset_thumbnail"] is None

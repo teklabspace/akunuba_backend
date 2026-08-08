@@ -101,7 +101,14 @@ class EscrowTransaction(Base):
     commission = Column(Numeric(20, 2))
     status = Column(SQLEnum(EscrowStatus), default=EscrowStatus.PENDING, nullable=False)
     stripe_payment_intent_id = Column(String(255))
+    # Reason the buyer/seller gave when raising a dispute (shown to admins).
+    dispute_reason = Column(Text, nullable=True)
     released_at = Column(DateTime(timezone=True))
+    # Seller payout bookkeeping (release pays amount − commission to the
+    # seller's linked bank): pending | paid | blocked_no_bank | failed —
+    # see app/services/escrow_payout.py.
+    payout_status = Column(String(20), nullable=True)
+    payout_destination_last4 = Column(String(4), nullable=True)
     # Audit trail for admin force-release / force-refund (and dispute resolution).
     resolved_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
     resolution_reason = Column(Text, nullable=True)

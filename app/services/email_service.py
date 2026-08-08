@@ -535,6 +535,73 @@ class EmailService:
             return False
 
     @classmethod
+    async def send_payout_account_missing_email(
+        cls,
+        to_email: str,
+        to_name: str,
+        amount: float,
+        currency: str = "USD",
+        settings_url: Optional[str] = None,
+    ) -> bool:
+        """Tell a user money is waiting for them but they have no linked bank
+        account to receive it (escrow release/refund payout blocked)."""
+        if not settings_url:
+            settings_url = f"{settings.FRONTEND_BASE_URL.rstrip('/')}/dashboard/settings"
+
+        html_template = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+                .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+                .header { background-color: #4F46E5; color: white; padding: 20px; text-align: center; border-radius: 5px 5px 0 0; }
+                .content { background-color: #f9fafb; padding: 30px; border-radius: 0 0 5px 5px; }
+                .amount-box { background-color: #ffffff; border: 2px solid #4F46E5; border-radius: 8px; padding: 20px; text-align: center; margin: 20px 0; font-size: 28px; font-weight: bold; color: #4F46E5; }
+                .button { display: inline-block; padding: 12px 24px; background-color: #4F46E5; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px; }
+                .footer { text-align: center; margin-top: 20px; color: #6b7280; font-size: 12px; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>Akunuba</h1>
+                </div>
+                <div class="content">
+                    <h2>Link a Bank Account to Receive Your Funds</h2>
+                    <p>Hi {{ name }},</p>
+                    <p>A payment from your marketplace transaction is ready to be sent to you:</p>
+                    <div class="amount-box">{{ currency }} {{ amount }}</div>
+                    <p>We couldn't send it because there is no bank account linked to your Akunuba profile. Link one in Settings and we'll send your funds there.</p>
+                    <a href="{{ settings_url }}" class="button">Link a Bank Account</a>
+                    <p>Or copy and paste this link into your browser:</p>
+                    <p style="word-break: break-all; color: #4F46E5;">{{ settings_url }}</p>
+                </div>
+                <div class="footer">
+                    <p>This is an automated email from Akunuba. Please do not reply to this email.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        try:
+            html_content = Template(html_template).render(
+                name=to_name,
+                amount=f"{amount:,.2f}",
+                currency=currency,
+                settings_url=settings_url,
+            )
+            return await cls.send_email(
+                to_email=to_email,
+                subject="Link a bank account to receive your funds - Akunuba",
+                html_content=html_content,
+            )
+        except Exception as e:
+            logger.error(f"Error sending payout-account-missing email: {e}")
+            return False
+
+    @classmethod
     async def send_otp_email(
         cls,
         to_email: str,

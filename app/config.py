@@ -119,6 +119,10 @@ class Settings(BaseSettings):
     # Must match a real deployed frontend route: {FRONTEND_BASE_URL}/auth/google/callback
     FRONTEND_BASE_URL: str = "https://akunuba.io"
     
+    # Escrow refunds return amount − commission (platform keeps its cut).
+    # Flip to False if product decides buyer-favor disputes get full refunds.
+    ESCROW_REFUND_RETAINS_COMMISSION: bool = True
+
     MAX_UPLOAD_SIZE: int = 10485760
     ALLOWED_FILE_TYPES: List[str] = ["pdf", "doc", "docx", "jpg", "jpeg", "png"]
     

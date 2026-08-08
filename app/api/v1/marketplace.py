@@ -22,6 +22,9 @@ from app.core.permissions import Role, Permission, has_permission
 from app.utils.logger import logger
 from app.utils.helpers import calculate_listing_fee, calculate_commission, generate_reference_id
 from app.integrations.stripe_client import StripeClient
+from app.services.escrow_payout import (
+    escrow_net_amount, prepare_seller_payout, refund_cents, resolve_payout_bank,
+)
 from pydantic import BaseModel
 
 security = HTTPBearer(auto_error=False)
@@ -257,7 +260,7 @@ def _full_name(user: Optional[User]) -> str:
     return name or user.email or "Unknown"
 
 
-def _my_offer_item(offer: Offer, seller_account_ids, escrow_id=None) -> dict:
+def _my_offer_item(offer: Offer, seller_account_ids, escrow_id=None, escrow_status=None) -> dict:
     """Serialize one offer for GET /offers/my from the viewer's perspective.
 
     role is "seller" when the listing belongs to one of seller_account_ids —
@@ -294,6 +297,9 @@ def _my_offer_item(offer: Offer, seller_account_ids, escrow_id=None) -> dict:
         "counterparty": _full_name(counterparty_user),
         "counterparty_id": counterparty_user.id if counterparty_user else None,
         "escrow_id": escrow_id,
+        # Lets the offers UI badge the sale outcome (e.g. "Refunded") without
+        # one escrow fetch per offer.
+        "escrow_status": getattr(escrow_status, "value", escrow_status),
         "message": offer.message,
         "created_at": offer.created_at,
         "updated_at": offer.updated_at or offer.created_at,
@@ -1037,14 +1043,31 @@ async def release_escrow(
     
     if escrow.status != EscrowStatus.FUNDED:
         raise BadRequestException("Escrow must be funded before release")
-    
+
+    # The seller is the payout recipient — block self-release until they have a
+    # bank to receive amount − commission, so funds never strand mid-flight.
+    # (Admin force-release stays unblocked and records blocked_no_bank instead.)
+    if not await resolve_payout_bank(db, escrow.seller_id):
+        await prepare_seller_payout(db, escrow)  # stamps blocked_no_bank + emails
+        await db.commit()
+        raise ConflictException(
+            "Link a bank account in Settings to receive your funds before releasing this escrow.",
+            code="PAYOUT_ACCOUNT_MISSING",
+        )
+
+    payout_status = await prepare_seller_payout(db, escrow)
     escrow.status = EscrowStatus.RELEASED
     escrow.released_at = datetime.utcnow()
-    
+
     await db.commit()
-    
-    logger.info(f"Escrow released: {escrow_id}")
-    return {"message": "Escrow released successfully"}
+
+    logger.info(f"Escrow released: {escrow_id} (payout {payout_status.value})")
+    return {
+        "message": "Escrow released successfully",
+        "net_amount": float(escrow_net_amount(escrow)),
+        "payout_status": escrow.payout_status,
+        "payout_destination_last4": escrow.payout_destination_last4,
+    }
 
 
 class ListingUpdate(ListingDetailFields):
@@ -1080,6 +1103,11 @@ class EscrowResponse(BaseModel):
     asset_name: Optional[str] = None
     thumbnail_url: Optional[str] = None
     released_at: Optional[datetime] = None
+    # Money-movement fields: what the recipient actually gets (amount −
+    # commission) and where the seller payout stands.
+    net_amount: Optional[Decimal] = None
+    payout_status: Optional[str] = None
+    payout_destination_last4: Optional[str] = None
     # For the buyer of a pending escrow: Stripe client_secret to complete the
     # fixed-amount card payment. Null for everyone else.
     client_secret: Optional[str] = None
@@ -1615,15 +1643,22 @@ async def get_my_offers(
     escrow_by_offer = {}
     if offers:
         escrow_rows = await db.execute(
-            select(EscrowTransaction.offer_id, EscrowTransaction.id)
+            select(EscrowTransaction.offer_id, EscrowTransaction.id, EscrowTransaction.status)
             .where(EscrowTransaction.offer_id.in_([o.id for o in offers]))
             .order_by(EscrowTransaction.created_at)  # latest escrow wins below
         )
-        escrow_by_offer = {offer_id: escrow_id for offer_id, escrow_id in escrow_rows}
+        escrow_by_offer = {
+            offer_id: (escrow_id, escrow_status)
+            for offer_id, escrow_id, escrow_status in escrow_rows
+        }
 
     return {
         "data": [
-            _my_offer_item(offer, seller_account_ids, escrow_by_offer.get(offer.id))
+            _my_offer_item(
+                offer,
+                seller_account_ids,
+                *(escrow_by_offer.get(offer.id) or (None, None)),
+            )
             for offer in offers
         ]
     }
@@ -2016,6 +2051,9 @@ async def get_escrow(
         asset_name=asset.name if asset else None,
         thumbnail_url=(photo.thumbnail_url or photo.url) if photo else None,
         released_at=escrow.released_at,
+        net_amount=escrow_net_amount(escrow),
+        payout_status=escrow.payout_status,
+        payout_destination_last4=escrow.payout_destination_last4,
         client_secret=client_secret,
         is_buyer=escrow.buyer_id == account.id,
     )
@@ -2071,7 +2109,10 @@ async def fund_escrow(
 @router.post("/escrow/{escrow_id}/dispute")
 async def create_dispute(
     escrow_id: UUID,
-    reason: str = Body(...),
+    # embed=True so the body is {"reason": "..."} (what the frontend sends).
+    # The bare Body(...) form expected the raw JSON string as the whole body
+    # and 422'd every real dispute attempt.
+    reason: str = Body(..., embed=True),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -2097,7 +2138,8 @@ async def create_dispute(
         raise BadRequestException("Can only dispute funded escrow")
     
     escrow.status = EscrowStatus.DISPUTED
-    # Store dispute reason in metadata if available
+    # Persist the reason so admin dispute views can show it.
+    escrow.dispute_reason = reason
     await db.commit()
 
     logger.info(f"Escrow dispute created: {escrow_id}")
@@ -2149,23 +2191,44 @@ async def refund_escrow(
     if escrow.status not in [EscrowStatus.FUNDED, EscrowStatus.DISPUTED]:
         raise BadRequestException("Can only refund funded or disputed escrow")
     
-    # Refund via Stripe if payment intent exists
+    # Refund via Stripe if payment intent exists — amount − commission (the
+    # platform keeps its cut; ESCROW_REFUND_RETAINS_COMMISSION=False for full).
     if escrow.stripe_payment_intent_id:
         try:
-            # Get payment intent to find charge
             import stripe
             payment_intent = stripe.PaymentIntent.retrieve(escrow.stripe_payment_intent_id)
-            if payment_intent.charges.data:
-                charge_id = payment_intent.charges.data[0].id
-                StripeClient.create_refund(charge_id)
+            # Stripe API 2022-11-15+ dropped the embedded `charges` list — the
+            # charge lives in `latest_charge` (old shape kept as fallback).
+            charge_id = getattr(payment_intent, "latest_charge", None)
+            if not charge_id:
+                charges = getattr(payment_intent, "charges", None)
+                if charges and charges.data:
+                    charge_id = charges.data[0].id
+            if charge_id:
+                StripeClient.create_refund(charge_id, amount=refund_cents(escrow))
+            else:
+                logger.error(f"Refund SKIPPED for escrow {escrow_id}: no charge on intent")
         except Exception as e:
             logger.error(f"Failed to refund via Stripe: {e}")
-    
+
     escrow.status = EscrowStatus.REFUNDED
+
+    # A refund voids the sale — put the listing back on the marketplace
+    # (approved = live) instead of leaving it stuck as sold.
+    listing = (await db.execute(
+        select(MarketplaceListing).where(MarketplaceListing.id == escrow.listing_id)
+    )).scalar_one_or_none()
+    if listing and listing.status == ListingStatus.SOLD:
+        listing.status = ListingStatus.APPROVED
+
     await db.commit()
-    
+
     logger.info(f"Escrow refunded: {escrow_id}")
-    return {"message": "Escrow refunded successfully"}
+    return {
+        "message": "Escrow refunded successfully",
+        "net_amount": float(escrow_net_amount(escrow)),
+        "refunded_amount": refund_cents(escrow) / 100.0,
+    }
 
 
 def _resolve_category_group(value: str) -> CategoryGroup:

@@ -17,6 +17,7 @@ from app.core.exceptions import NotFoundException, BadRequestException, Forbidde
 from app.core.permissions import Permission, has_permission
 from app.core.security import get_password_hash, generate_reset_token
 from app.services.email_service import EmailService
+from app.services.escrow_payout import escrow_net_amount, prepare_seller_payout, refund_cents
 from app.config import settings
 from app.utils.logger import logger
 from uuid import UUID
@@ -282,13 +283,9 @@ async def resolve_dispute(
         raise BadRequestException("Dispute is not in disputed status")
     
     if resolution_data.resolution == "release":
-        # Release funds to seller
-        if dispute.stripe_payment_intent_id:
-            try:
-                StripeClient.release_payment(dispute.stripe_payment_intent_id)
-            except Exception as e:
-                logger.error(f"Failed to release payment: {e}")
-        
+        # Release to seller: record the payout (amount − commission to their
+        # linked bank; blocked_no_bank + email when they have none).
+        await prepare_seller_payout(db, dispute)
         dispute.status = EscrowStatus.RELEASED
         dispute.released_at = datetime.utcnow()
         
@@ -311,14 +308,22 @@ async def resolve_dispute(
                 _intent = _stripe.PaymentIntent.retrieve(dispute.stripe_payment_intent_id)
                 _charge_id = getattr(_intent, "latest_charge", None)
                 if _charge_id:
-                    StripeClient.create_refund(_charge_id, amount=int(dispute.amount * 100))
+                    # amount − commission (platform keeps its cut on refunds).
+                    StripeClient.create_refund(_charge_id, amount=refund_cents(dispute))
                 else:
                     logger.error(f"Dispute refund: no charge on intent {dispute.stripe_payment_intent_id}")
             except Exception as e:
                 logger.error(f"Failed to create refund: {e}")
         
         dispute.status = EscrowStatus.REFUNDED
-        
+
+        # A refund voids the sale — relist the asset (approved = live again).
+        _listing = (await db.execute(
+            select(MarketplaceListing).where(MarketplaceListing.id == dispute.listing_id)
+        )).scalar_one_or_none()
+        if _listing and _listing.status == ListingStatus.SOLD:
+            _listing.status = ListingStatus.APPROVED
+
         # Notify buyer
         from app.services.notification_service import NotificationService, NotificationType
         await NotificationService.create_notification(
@@ -427,6 +432,11 @@ def _admin_escrow_item(
             "account_name": seller.get("account_name"),
             "email": seller.get("user_email"),
         },
+        "dispute_reason": escrow.dispute_reason,
+        # Money movement: what the recipient actually gets and payout progress.
+        "net_amount": float(escrow_net_amount(escrow)),
+        "payout_status": escrow.payout_status,
+        "payout_destination_last4": escrow.payout_destination_last4,
         "resolved_by": str(escrow.resolved_by) if escrow.resolved_by else None,
         "resolution_reason": escrow.resolution_reason,
         "created_at": escrow.created_at.isoformat() if escrow.created_at else None,
@@ -515,7 +525,9 @@ async def _refund_escrow_via_stripe(escrow: EscrowTransaction) -> None:
             if charges and charges.data:
                 charge_id = charges.data[0].id
         if charge_id:
-            StripeClient.create_refund(charge_id, amount=int(escrow.amount * 100))
+            # amount − commission: the platform keeps its cut on refunds
+            # (ESCROW_REFUND_RETAINS_COMMISSION=False restores full refunds).
+            StripeClient.create_refund(charge_id, amount=refund_cents(escrow))
             logger.info(f"Stripe refund created for escrow {escrow.id} (charge {charge_id})")
         else:
             logger.error(
@@ -574,8 +586,10 @@ async def admin_release_escrow(
         )
 
     reason = body.reason if body else None
-    # Release is a status transition in this system (funds were captured at fund
-    # time; seller payout via Stripe Connect is not wired here — see resolve_dispute).
+    # Record the seller payout (amount − commission to their linked bank). An
+    # admin release is never blocked by a missing bank: it lands as
+    # blocked_no_bank and the seller gets a "link a bank account" email.
+    await prepare_seller_payout(db, escrow)
     escrow.status = EscrowStatus.RELEASED
     escrow.released_at = datetime.utcnow()
     escrow.resolved_by = current_user.id
@@ -623,6 +637,12 @@ async def admin_refund_escrow(
     escrow.status = EscrowStatus.REFUNDED
     escrow.resolved_by = current_user.id
     escrow.resolution_reason = reason
+    # A refund voids the sale — relist the asset (approved = live again).
+    _listing = (await db.execute(
+        select(MarketplaceListing).where(MarketplaceListing.id == escrow.listing_id)
+    )).scalar_one_or_none()
+    if _listing and _listing.status == ListingStatus.SOLD:
+        _listing.status = ListingStatus.APPROVED
     await db.commit()
     await db.refresh(escrow)
 
