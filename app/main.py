@@ -23,7 +23,6 @@ from app.api.v1 import (
     reports,
     kyc,
     kyb,
-    chat,
     analytics,
     admin,
     files,
@@ -315,7 +314,8 @@ app.include_router(documents.router, prefix=f"{settings.API_V1_PREFIX}/documents
 app.include_router(files.router, prefix=f"{settings.API_V1_PREFIX}/files", tags=["Files"], dependencies=_KYC_GATED)
 app.include_router(support.router, prefix=f"{settings.API_V1_PREFIX}/support", tags=["Support"], dependencies=_KYC_GATED)
 app.include_router(reports.router, prefix=f"{settings.API_V1_PREFIX}/reports", tags=["Reports"], dependencies=_KYC_GATED)
-app.include_router(chat.router, prefix=f"{settings.API_V1_PREFIX}/chat", tags=["Chat"], dependencies=_KYC_GATED)
+# SendBird-backed chat router removed 2026-08-11 (client decision: chat lives
+# in Postgres via chat_conversations, not in SendBird's cloud).
 app.include_router(chat_conversations.router, prefix=f"{settings.API_V1_PREFIX}/chat", tags=["Chat"], dependencies=_KYC_GATED)
 # WebSocket route (registered directly on app, not via router)
 from app.api.v1.websocket_chat import websocket_chat_endpoint

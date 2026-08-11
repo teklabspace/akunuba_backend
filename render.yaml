@@ -123,12 +123,6 @@ services:
       - key: PERSONA_REDIRECT_URI
         sync: false # Must exactly match Persona template allowed redirect URI
 
-      # Sendbird
-      - key: SENDBIRD_APP_ID
-        sync: false # Set this manually in Render dashboard
-      - key: SENDBIRD_API_TOKEN
-        sync: false # Set this manually in Render dashboard
-
       # Polygon (Optional)
       - key: POLYGON_API_KEY
         sync: false # Set this manually in Render dashboard

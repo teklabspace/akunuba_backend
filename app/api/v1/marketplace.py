@@ -2106,17 +2106,29 @@ async def fund_escrow(
     return {"message": "Escrow funded successfully"}
 
 
+class DisputeCreateRequest(BaseModel):
+    # The dispute form has one field but frontends have sent it under several
+    # names — accept all of them instead of 422-ing (real reported bug: the
+    # user filled the reason and still got VALIDATION_ERROR).
+    reason: Optional[str] = None
+    dispute_reason: Optional[str] = None
+    message: Optional[str] = None
+
+    def resolved_reason(self) -> str:
+        return (self.reason or self.dispute_reason or self.message or "").strip()
+
+
 @router.post("/escrow/{escrow_id}/dispute")
 async def create_dispute(
     escrow_id: UUID,
-    # embed=True so the body is {"reason": "..."} (what the frontend sends).
-    # The bare Body(...) form expected the raw JSON string as the whole body
-    # and 422'd every real dispute attempt.
-    reason: str = Body(..., embed=True),
+    dispute_data: DisputeCreateRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """Create a dispute for escrow"""
+    reason = dispute_data.resolved_reason()
+    if not reason:
+        raise BadRequestException("A dispute reason is required")
     account_result = await db.execute(
         select(Account).where(Account.user_id == current_user.id)
     )

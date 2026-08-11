@@ -28,7 +28,7 @@ EXPECTED_MODULES = {
     "auth_new", "users", "accounts", "kyc", "kyb", "subscriptions",
     "notifications", "assets", "marketplace", "admin", "market", "webhooks",
     "portfolio", "trading", "payments", "banking", "documents", "files",
-    "support", "reports", "chat", "chat_conversations", "analytics",
+    "support", "reports", "chat_conversations", "analytics",
     "investment", "tasks", "reminders", "concierge", "crm", "entities",
     "compliance", "referrals", "advisor",
 }

@@ -35,6 +35,10 @@ from app.models.compliance import (
     ComplianceReport, CompliancePolicy
 )
 from app.models.user_preferences import UserPreferences
+from app.models.watchlist import InvestmentWatchlist
+from app.models.investment_goal import InvestmentGoal
+from app.models.investment_strategy import InvestmentStrategy
+from app.models.transfer import Transfer
 
 config = context.config
 

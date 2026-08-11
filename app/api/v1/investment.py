@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, desc, or_, func
 from typing import List, Optional, Dict, Any
 from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone
 from uuid import UUID, uuid4
 from app.database import get_db
 from app.api.deps import get_current_user
@@ -13,14 +13,23 @@ from app.models.asset import Asset, AssetType, AssetValuation
 from app.models.portfolio import Portfolio
 from app.models.order import Order, OrderStatus
 from app.models.banking import LinkedAccount, Transaction
+from app.models.investment_goal import InvestmentGoal, GoalStatus
+from app.models.investment_strategy import InvestmentStrategy
 from app.core.exceptions import NotFoundException, BadRequestException
 from app.services.net_worth import core_assets
+from app.services.valuation_history import load_valuations, value_asof
 from app.utils.logger import logger
 from app.integrations.polygon_client import PolygonClient
 from app.integrations.alpaca_client import AlpacaClient
 from pydantic import BaseModel
 
 router = APIRouter()
+
+
+def _naive_date(dt: datetime) -> datetime:
+    """Valuation rows may be tz-aware while cutoff dates are naive UTC —
+    comparing the two raises TypeError, so normalize before comparing."""
+    return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
 
 
 class AssetSummaryCard(BaseModel):
@@ -55,6 +64,9 @@ class CryptoPrice(BaseModel):
 
 class TraderProfile(BaseModel):
     account_number: Optional[str] = None
+    name: Optional[str] = None
+    joined: Optional[str] = None       # ISO date the user signed up
+    assets_value: float = 0.0          # gross owned wealth (net-worth assets)
     buying_power: float
     cash: float
     portfolio_value: float
@@ -120,7 +132,7 @@ async def get_asset_summary_cards(
             yesterday_value = total_value  # Fallback to current value
         
         change = float(total_value - yesterday_value)
-        change_percentage = float((change / yesterday_value * 100) if yesterday_value > 0 else 0)
+        change_percentage = float((change / float(yesterday_value) * 100) if yesterday_value > 0 else 0)
         
         summary_cards.append(AssetSummaryCard(
             type="total",
@@ -303,12 +315,14 @@ async def get_crypto_prices(
     
     for symbol in crypto_list:
         try:
-            price = PolygonClient.get_current_price(f"{symbol}USD")
+            # Polygon crypto tickers need the X: prefix — the bare pair used to
+            # return nothing, which left this card permanently empty (QA B9).
+            price = PolygonClient.get_current_price(f"X:{symbol}USD")
             if price:
-                # Get previous day for change calculation
-                yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
-                prev_data = PolygonClient.get_daily_open_close(f"{symbol}USD", yesterday)
-                prev_price = prev_data.get("close") if prev_data else price
+                prev_bar = PolygonClient.get_previous_close(f"X:{symbol}USD")
+                prev_results = (prev_bar or {}).get("results") or []
+                day_open = prev_results[0].get("o") if prev_results else None
+                prev_price = float(day_open) if day_open else price
                 change = price - prev_price if prev_price else 0
                 change_pct = (change / prev_price * 100) if prev_price > 0 else 0
                 
@@ -347,18 +361,36 @@ async def get_trader_profile(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
-    
+
     if not account:
         raise NotFoundException("Account", str(current_user.id))
-    
+
+    # Identity + wealth come from OUR data, not Alpaca — the card showed
+    # "User Account / Joined N/A / $0.00" when no brokerage was linked (QA B10).
+    display_name = " ".join(
+        part for part in [current_user.first_name, current_user.last_name] if part
+    ) or current_user.email.split("@")[0]
+    joined = current_user.created_at.date().isoformat() if current_user.created_at else None
+
+    assets_result = await db.execute(
+        select(Asset).where(Asset.account_id == account.id)
+    )
+    assets_value = float(sum(
+        (a.current_value for a in core_assets(assets_result.scalars().all())),
+        Decimal("0.00"),
+    ))
+
     # Get Alpaca account info
     try:
         alpaca_account = AlpacaClient.get_account()
-        
+
         if alpaca_account is None:
             # Return default values if Alpaca account not available
             return {
                 "data": TraderProfile(
+                    name=display_name,
+                    joined=joined,
+                    assets_value=assets_value,
                     buying_power=0.0,
                     cash=0.0,
                     portfolio_value=0.0,
@@ -384,6 +416,9 @@ async def get_trader_profile(
         return {
             "data": TraderProfile(
                 account_number=account_data.get("account_number", ""),
+                name=display_name,
+                joined=joined,
+                assets_value=assets_value,
                 buying_power=account_data.get("buying_power", 0),
                 cash=account_data.get("cash", 0),
                 portfolio_value=account_data.get("portfolio_value", 0),
@@ -398,6 +433,9 @@ async def get_trader_profile(
         # Return default values on error
         return {
             "data": TraderProfile(
+                name=display_name,
+                joined=joined,
+                assets_value=assets_value,
                 buying_power=0.0,
                 cash=0.0,
                 portfolio_value=0.0,
@@ -407,11 +445,12 @@ async def get_trader_profile(
 
 
 class PerformanceMetrics(BaseModel):
-    total_return: Decimal
-    total_return_percentage: Decimal
+    # floats for the same reason as AnalyticsMetrics: Decimal -> JSON string.
+    total_return: float
+    total_return_percentage: float
     period_days: int
-    current_value: Decimal
-    historical_value: Decimal
+    current_value: float
+    historical_value: float
     daily_returns: Optional[List[Dict[str, Any]]] = None
     best_performer: Optional[Dict[str, Any]] = None
     worst_performer: Optional[Dict[str, Any]] = None
@@ -419,10 +458,12 @@ class PerformanceMetrics(BaseModel):
 
 
 class AnalyticsMetrics(BaseModel):
-    total_invested: Decimal
-    current_value: Decimal
-    total_return: Decimal
-    total_return_percentage: Decimal
+    # floats, not Decimal: Decimal serializes to JSON strings ("22230000.00")
+    # and the frontend's .toFixed() crashes on strings (QA B10).
+    total_invested: float
+    current_value: float
+    total_return: float
+    total_return_percentage: float
     annualized_return: Optional[float] = None
     sharpe_ratio: Optional[float] = None
     volatility: Optional[float] = None
@@ -487,34 +528,15 @@ async def calculate_performance_metrics(
     current_value = sum([asset.current_value for asset in assets])
     currency = assets[0].currency if assets else "USD"
     
-    # Get historical valuations
-    historical_values = {}
-    for asset in assets:
-        valuation_result = await db.execute(
-            select(AssetValuation)
-            .where(
-                and_(
-                    AssetValuation.asset_id == asset.id,
-                    AssetValuation.valuation_date <= period_start
-                )
-            )
-            .order_by(desc(AssetValuation.valuation_date))
-            .limit(1)
-        )
-        historical_valuation = valuation_result.scalar_one_or_none()
-        
-        if historical_valuation:
-            historical_values[asset.id] = historical_valuation.value
-        else:
-            first_valuation_result = await db.execute(
-                select(AssetValuation)
-                .where(AssetValuation.asset_id == asset.id)
-                .order_by(AssetValuation.valuation_date)
-                .limit(1)
-            )
-            first_valuation = first_valuation_result.scalar_one_or_none()
-            historical_values[asset.id] = first_valuation.value if first_valuation else asset.current_value
-    
+    # One round-trip for the whole history — the old per-asset (and worse,
+    # per-snapshot-per-asset below) queries took minutes on 90-asset accounts.
+    valuations_by_asset = await load_valuations(db, [asset.id for asset in assets])
+
+    historical_values = {
+        asset.id: value_asof(valuations_by_asset.get(asset.id, []), asset, period_start)
+        for asset in assets
+    }
+
     # Calculate historical total value
     historical_value = sum(historical_values.values())
     
@@ -530,25 +552,14 @@ async def calculate_performance_metrics(
     for i in range(days, -1, -step):
         snapshot_date = datetime.utcnow() - timedelta(days=i)
         snapshot_value = Decimal("0.00")
-        
+
         for asset in assets:
-            valuation_result = await db.execute(
-                select(AssetValuation)
-                .where(
-                    and_(
-                        AssetValuation.asset_id == asset.id,
-                        AssetValuation.valuation_date <= snapshot_date
-                    )
-                )
-                .order_by(desc(AssetValuation.valuation_date))
-                .limit(1)
-            )
-            valuation = valuation_result.scalar_one_or_none()
-            if valuation:
-                snapshot_value += valuation.value
+            asset_history = valuations_by_asset.get(asset.id, [])
+            if asset_history:
+                snapshot_value += value_asof(asset_history, asset, snapshot_date)
             else:
                 snapshot_value += historical_values.get(asset.id, asset.current_value)
-        
+
         daily_returns.append({
             "date": snapshot_date.date().isoformat(),
             "value": float(snapshot_value)
@@ -699,17 +710,12 @@ async def get_investment_analytics(
         current_value = sum([asset.current_value for asset in assets])
         
         # Calculate total invested (sum of first valuations or purchase prices)
+        valuations_by_asset = await load_valuations(db, [asset.id for asset in assets])
         total_invested = Decimal("0.00")
         for asset in assets:
-            first_valuation_result = await db.execute(
-                select(AssetValuation)
-                .where(AssetValuation.asset_id == asset.id)
-                .order_by(AssetValuation.valuation_date)
-                .limit(1)
-            )
-            first_valuation = first_valuation_result.scalar_one_or_none()
-            if first_valuation:
-                total_invested += first_valuation.value
+            asset_history = valuations_by_asset.get(asset.id, [])
+            if asset_history:
+                total_invested += asset_history[0].value
             elif asset.purchase_price:
                 total_invested += asset.purchase_price
             else:
@@ -722,24 +728,16 @@ async def get_investment_analytics(
         period_years = days / 365.0
         annualized_return = None
         if period_years > 0 and total_invested > 0:
-            annualized_return = float(((current_value / total_invested) ** (1 / period_years) - 1) * 100)
+            annualized_return = float(((float(current_value) / float(total_invested)) ** (1 / period_years) - 1) * 100)
         
         # Calculate volatility (simplified)
         period_start = datetime.utcnow() - timedelta(days=days)
         all_valuations = []
         for asset in assets:
-            valuations_result = await db.execute(
-                select(AssetValuation)
-                .where(
-                    and_(
-                        AssetValuation.asset_id == asset.id,
-                        AssetValuation.valuation_date >= period_start
-                    )
-                )
-                .order_by(AssetValuation.valuation_date)
-                .limit(30)
-            )
-            asset_valuations = valuations_result.scalars().all()
+            asset_valuations = [
+                v for v in valuations_by_asset.get(asset.id, [])
+                if _naive_date(v.valuation_date) >= period_start
+            ][:30]
             if len(asset_valuations) > 1:
                 for i in range(1, len(asset_valuations)):
                     prev_value = asset_valuations[i-1].value
@@ -775,20 +773,9 @@ async def get_investment_analytics(
             
             period_historical_value = Decimal("0.00")
             for asset in assets:
-                valuation_result = await db.execute(
-                    select(AssetValuation)
-                    .where(
-                        and_(
-                            AssetValuation.asset_id == asset.id,
-                            AssetValuation.valuation_date <= period_start_date
-                        )
-                    )
-                    .order_by(desc(AssetValuation.valuation_date))
-                    .limit(1)
-                )
-                valuation = valuation_result.scalar_one_or_none()
-                if valuation:
-                    period_historical_value += valuation.value
+                asset_history = valuations_by_asset.get(asset.id, [])
+                if asset_history:
+                    period_historical_value += value_asof(asset_history, asset, period_start_date)
                 else:
                     period_historical_value += asset.current_value
             
@@ -984,6 +971,8 @@ class GoalAdjustRequest(BaseModel):
     monthly_contribution: Optional[Decimal] = None
     risk_tolerance: Optional[str] = None
     notes: Optional[str] = None
+    current_value: Optional[Decimal] = None
+    current_quantity: Optional[Decimal] = None
 
 
 @router.post("/goals/{goal_id}/adjust", response_model=Dict[str, Any])
@@ -994,32 +983,173 @@ async def adjust_investment_goal(
     db: AsyncSession = Depends(get_db)
 ):
     """Adjust investment goal parameters"""
+    goal = await _get_owned_goal(db, current_user, goal_id)
+
+    if adjust_data.target_amount is not None:
+        if adjust_data.target_amount <= 0:
+            raise BadRequestException("target_amount must be positive")
+        goal.target_amount = adjust_data.target_amount
+    if adjust_data.target_date is not None:
+        goal.target_date = _parse_goal_date(adjust_data.target_date)
+    if adjust_data.monthly_contribution is not None:
+        goal.monthly_contribution = adjust_data.monthly_contribution
+    if adjust_data.risk_tolerance is not None:
+        goal.risk_tolerance = adjust_data.risk_tolerance
+    if adjust_data.notes is not None:
+        goal.notes = adjust_data.notes
+    if adjust_data.current_value is not None:
+        goal.current_value = adjust_data.current_value
+    if adjust_data.current_quantity is not None:
+        goal.current_quantity = adjust_data.current_quantity
+
+    if goal.status == GoalStatus.ACTIVE and goal.current_value >= goal.target_amount:
+        goal.status = GoalStatus.COMPLETED
+
+    await db.commit()
+    await db.refresh(goal)
+    return {"goal": _goal_payload(goal)}
+
+
+def _goal_payload(goal: "InvestmentGoal") -> Dict[str, Any]:
+    target = goal.target_amount or Decimal("0.00")
+    completion = float(min(goal.current_value / target * 100, 100)) if target > 0 else 0.0
+    return {
+        "id": str(goal.id),
+        "name": goal.name,
+        "asset_name": goal.name,
+        "symbol": goal.symbol,
+        "asset_symbol": goal.symbol,
+        "target_amount": float(goal.target_amount),
+        "target_quantity": float(goal.target_quantity) if goal.target_quantity is not None else None,
+        "current_value": float(goal.current_value),
+        "current_quantity": float(goal.current_quantity) if goal.current_quantity is not None else None,
+        "completion_percentage": round(completion, 2),
+        "monthly_contribution": float(goal.monthly_contribution) if goal.monthly_contribution is not None else None,
+        "risk_tolerance": goal.risk_tolerance,
+        "notes": goal.notes,
+        "status": goal.status.value,
+        "target_date": goal.target_date.isoformat() if goal.target_date else None,
+        "created_at": goal.created_at.isoformat() if goal.created_at else None,
+    }
+
+
+def _parse_goal_date(raw: str) -> datetime:
     try:
-        account_result = await db.execute(
-            select(Account).where(Account.user_id == current_user.id)
+        return datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=dt_timezone.utc)
+    except ValueError:
+        raise BadRequestException("target_date must be YYYY-MM-DD")
+
+
+async def _get_account_or_404(db: AsyncSession, current_user: User) -> Account:
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+    return account
+
+
+async def _get_owned_goal(db: AsyncSession, current_user: User, goal_id: UUID) -> "InvestmentGoal":
+    account = await _get_account_or_404(db, current_user)
+    goal_result = await db.execute(
+        select(InvestmentGoal).where(
+            and_(InvestmentGoal.id == goal_id, InvestmentGoal.account_id == account.id)
         )
-        account = account_result.scalar_one_or_none()
-        
-        if not account:
-            raise NotFoundException("Account", str(current_user.id))
-        
-        # In a real implementation, you would have an InvestmentGoal model
-        # For now, return a placeholder response
-        return {
-            "id": str(goal_id),
-            "message": "Goal adjusted successfully",
-            "updated_fields": {
-                "target_amount": float(adjust_data.target_amount) if adjust_data.target_amount else None,
-                "target_date": adjust_data.target_date,
-                "monthly_contribution": float(adjust_data.monthly_contribution) if adjust_data.monthly_contribution else None,
-                "risk_tolerance": adjust_data.risk_tolerance,
-                "notes": adjust_data.notes
-            },
-            "updated_at": datetime.utcnow().isoformat()
-        }
-    except Exception as e:
-        logger.error(f"Error adjusting investment goal: {e}", exc_info=True)
-        raise BadRequestException(f"Failed to adjust goal: {str(e)}")
+    )
+    goal = goal_result.scalar_one_or_none()
+    if not goal:
+        raise NotFoundException("Goal", str(goal_id))
+    return goal
+
+
+class GoalCreateRequest(BaseModel):
+    name: str
+    symbol: Optional[str] = None
+    target_amount: Decimal
+    target_quantity: Optional[Decimal] = None
+    current_value: Decimal = Decimal("0.00")
+    current_quantity: Optional[Decimal] = None
+    monthly_contribution: Optional[Decimal] = None
+    risk_tolerance: Optional[str] = None
+    notes: Optional[str] = None
+    target_date: Optional[str] = None  # YYYY-MM-DD
+
+
+@router.get("/goals", response_model=Dict[str, Any])
+async def list_investment_goals(
+    status_filter: str = Query("all", alias="status", description="active, completed, cancelled, all"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """List the caller's investment goals (Goals Tracker page)."""
+    account = await _get_account_or_404(db, current_user)
+
+    query = select(InvestmentGoal).where(InvestmentGoal.account_id == account.id)
+    normalized = (status_filter or "all").lower()
+    if normalized != "all":
+        try:
+            query = query.where(InvestmentGoal.status == GoalStatus(normalized))
+        except ValueError:
+            raise BadRequestException("status must be active, completed, cancelled or all")
+    query = query.order_by(desc(InvestmentGoal.created_at))
+
+    goals = (await db.execute(query)).scalars().all()
+    return {"goals": [_goal_payload(g) for g in goals], "total": len(goals)}
+
+
+@router.post("/goals", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
+async def create_investment_goal(
+    goal_data: GoalCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Create an investment goal."""
+    account = await _get_account_or_404(db, current_user)
+
+    if goal_data.target_amount <= 0:
+        raise BadRequestException("target_amount must be positive")
+
+    goal = InvestmentGoal(
+        account_id=account.id,
+        name=goal_data.name,
+        symbol=goal_data.symbol,
+        target_amount=goal_data.target_amount,
+        target_quantity=goal_data.target_quantity,
+        current_value=goal_data.current_value,
+        current_quantity=goal_data.current_quantity,
+        monthly_contribution=goal_data.monthly_contribution,
+        risk_tolerance=goal_data.risk_tolerance,
+        notes=goal_data.notes,
+        target_date=_parse_goal_date(goal_data.target_date) if goal_data.target_date else None,
+    )
+    db.add(goal)
+    await db.commit()
+    await db.refresh(goal)
+    return {"goal": _goal_payload(goal)}
+
+
+@router.get("/goals/{goal_id}", response_model=Dict[str, Any])
+async def get_investment_goal(
+    goal_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Fetch a single goal (owner-scoped)."""
+    goal = await _get_owned_goal(db, current_user, goal_id)
+    return {"goal": _goal_payload(goal)}
+
+
+@router.delete("/goals/{goal_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_investment_goal(
+    goal_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Delete a goal (owner-scoped)."""
+    goal = await _get_owned_goal(db, current_user, goal_id)
+    await db.delete(goal)
+    await db.commit()
 
 
 # ==================== INVESTMENT STRATEGIES ====================
@@ -1173,35 +1303,137 @@ async def clone_investment_strategy(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Clone an existing investment strategy"""
-    try:
-        account_result = await db.execute(
-            select(Account).where(Account.user_id == current_user.id)
+    """Clone an existing investment strategy into the caller's saved list."""
+    account = await _get_account_or_404(db, current_user)
+
+    original_result = await db.execute(
+        select(InvestmentStrategy).where(InvestmentStrategy.id == strategy_id)
+    )
+    original = original_result.scalar_one_or_none()
+    if not original:
+        raise NotFoundException("Strategy", str(strategy_id))
+
+    parameters = dict(original.parameters or {})
+    if clone_data.adjust_parameters:
+        parameters.update(clone_data.adjust_parameters)
+
+    clone = InvestmentStrategy(
+        account_id=account.id,
+        cloned_from=original.id,
+        title=clone_data.new_name,
+        description=original.description,
+        full_description=original.full_description,
+        author=current_user.email,
+        chart_type=original.chart_type,
+        parameters=parameters,
+        is_open_source=original.is_open_source,
+    )
+    db.add(clone)
+    await db.commit()
+    await db.refresh(clone)
+
+    return {
+        "original_strategy_id": str(strategy_id),
+        "new_strategy_id": str(clone.id),
+        "name": clone.title,
+        "status": "active",
+        "cloned_at": clone.created_at.isoformat() if clone.created_at else datetime.utcnow().isoformat(),
+        "message": "Strategy cloned successfully"
+    }
+
+
+def _strategy_list_payload(strategy: "InvestmentStrategy") -> Dict[str, Any]:
+    created = strategy.created_at.isoformat() if strategy.created_at else None
+    return {
+        "id": str(strategy.id),
+        "title": strategy.title,
+        "name": strategy.title,
+        "description": strategy.description,
+        "author": strategy.author,
+        "date": created,
+        "created_at": created,
+        "comments": strategy.comment_count,
+        "comment_count": strategy.comment_count,
+        "boosts": strategy.boost_count,
+        "boost_count": strategy.boost_count,
+        "is_open_source": strategy.is_open_source,
+    }
+
+
+@router.get("/strategies", response_model=Dict[str, Any])
+async def list_investment_strategies(
+    filter: str = Query("all", description="all, mine, platform"),
+    open_source_only: bool = Query(False),
+    sort_by: str = Query("date", description="date or boosts"),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """List investment strategies: platform-seeded ones plus the caller's own."""
+    account = await _get_account_or_404(db, current_user)
+
+    normalized = (filter or "all").lower()
+    if normalized == "mine":
+        scope = InvestmentStrategy.account_id == account.id
+    elif normalized == "platform":
+        scope = InvestmentStrategy.account_id.is_(None)
+    else:
+        scope = or_(
+            InvestmentStrategy.account_id.is_(None),
+            InvestmentStrategy.account_id == account.id,
         )
-        account = account_result.scalar_one_or_none()
-        
-        if not account:
-            raise NotFoundException("Account", str(current_user.id))
-        
-        # In a real implementation, you would:
-        # 1. Load the original strategy
-        # 2. Create a new strategy with the same parameters (or adjusted)
-        # 3. Save to database
-        
-        # Generate new strategy ID
-        new_strategy_id = UUID()
-        
-        return {
-            "original_strategy_id": str(strategy_id),
-            "new_strategy_id": str(new_strategy_id),
-            "name": clone_data.new_name,
-            "status": "active",
-            "cloned_at": datetime.utcnow().isoformat(),
-            "message": "Strategy cloned successfully"
-        }
-    except Exception as e:
-        logger.error(f"Error cloning strategy: {e}", exc_info=True)
-        raise BadRequestException(f"Failed to clone strategy: {str(e)}")
+
+    query = select(InvestmentStrategy).where(scope)
+    if open_source_only:
+        query = query.where(InvestmentStrategy.is_open_source.is_(True))
+    if sort_by == "boosts":
+        query = query.order_by(desc(InvestmentStrategy.boost_count))
+    else:
+        query = query.order_by(desc(InvestmentStrategy.created_at))
+    query = query.limit(limit)
+
+    strategies = (await db.execute(query)).scalars().all()
+    return {
+        "strategies": [_strategy_list_payload(s) for s in strategies],
+        "total": len(strategies),
+    }
+
+
+@router.get("/strategies/{strategy_id}", response_model=Dict[str, Any])
+async def get_investment_strategy(
+    strategy_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Strategy detail; platform strategies are visible to everyone, private
+    ones only to their owner."""
+    account = await _get_account_or_404(db, current_user)
+
+    strategy_result = await db.execute(
+        select(InvestmentStrategy).where(InvestmentStrategy.id == strategy_id)
+    )
+    strategy = strategy_result.scalar_one_or_none()
+    if not strategy or (strategy.account_id is not None and strategy.account_id != account.id):
+        raise NotFoundException("Strategy", str(strategy_id))
+
+    saved_result = await db.execute(
+        select(func.count()).select_from(InvestmentStrategy).where(
+            and_(
+                InvestmentStrategy.account_id == account.id,
+                InvestmentStrategy.cloned_from == strategy.id,
+            )
+        )
+    )
+    is_saved = (saved_result.scalar() or 0) > 0
+
+    payload = _strategy_list_payload(strategy)
+    payload.update({
+        "full_description": strategy.full_description,
+        "chart_type": strategy.chart_type,
+        "parameters": strategy.parameters or {},
+        "is_saved": is_saved or strategy.account_id == account.id,
+    })
+    return {"strategy": payload}
 
 
 # ==================== INVESTMENT WATCHLIST ====================

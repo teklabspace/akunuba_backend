@@ -37,7 +37,7 @@ from app.main import app
 # Modules whose ENTIRE router is included with the KYC gate in app/main.py.
 KYC_GATED_MODULES = {
     "portfolio", "trading", "payments", "banking", "documents", "files",
-    "support", "reports", "chat", "chat_conversations", "analytics",
+    "support", "reports", "chat_conversations", "analytics",
     "investment", "tasks", "reminders", "concierge", "crm", "entities",
     "compliance", "referrals", "advisor",
 }

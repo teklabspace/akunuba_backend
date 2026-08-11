@@ -66,8 +66,6 @@ class Settings(BaseSettings):
     # When true, return OTP in API response if email delivery fails (use until Resend domain is verified)
     EMAIL_RETURN_OTP_ON_FAILURE: bool = False
 
-    SENDBIRD_APP_ID: str
-    SENDBIRD_API_TOKEN: str
     
     # Polygon Market Data API
     POLYGON_API_KEY: str = ""
@@ -151,6 +149,9 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
+        # Ignore env vars with no matching field (e.g. the retired SENDBIRD_*
+        # keys) instead of failing startup with extra_forbidden.
+        extra = "ignore"
 
 
 settings = Settings()

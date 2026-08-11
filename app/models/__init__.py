@@ -27,6 +27,9 @@ from app.models.referral import Referral, ReferralReward, ReferralStatus
 from app.models.chat import Conversation, ConversationParticipant, Message, MessageAttachment, MessageRead
 from app.models.task import Task, Reminder
 from app.models.watchlist import InvestmentWatchlist
+from app.models.investment_goal import InvestmentGoal, GoalStatus
+from app.models.investment_strategy import InvestmentStrategy
+from app.models.transfer import Transfer
 from app.models.kyc import KYCVerification
 from app.models.kyb import KYBVerification
 from app.models.user_preferences import UserPreferences
@@ -131,5 +134,9 @@ __all__ = [
     "Task",
     "Reminder",
     "InvestmentWatchlist",
+    "InvestmentGoal",
+    "GoalStatus",
+    "InvestmentStrategy",
+    "Transfer",
 ]
 

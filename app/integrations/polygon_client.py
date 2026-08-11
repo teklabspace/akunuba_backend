@@ -47,7 +47,11 @@ class PolygonClient:
             if hit:
                 logger.warning(f"Polygon request failed, serving stale cache: {url}")
                 return hit[1]
-            raise
+            # Negative cache: a failed lookup (typically a free-tier 429) is
+            # remembered briefly so hot endpoints don't re-fire the same doomed
+            # request on every page load and burn the 5-req/min budget.
+            PolygonClient._cache[key] = (now + 60, None)
+            return None
         if len(PolygonClient._cache) > 500:
             expired = [k for k, v in PolygonClient._cache.items() if v[0] <= now]
             for k in expired:
@@ -229,6 +233,16 @@ class PolygonClient:
         except Exception as e:
             logger.error(f"Failed to get Polygon daily open/close: {e}")
             return None
+
+    @staticmethod
+    def has_cached_price(ticker: str) -> bool:
+        """True when a fresh previous-close bar for the ticker is already in
+        the TTL cache — i.e. quoting it now costs zero API budget."""
+        url = f"{PolygonClient.BASE_URL}/v2/aggs/ticker/{ticker}/prev"
+        params = PolygonClient._get_params()
+        key = url + "?" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        hit = PolygonClient._cache.get(key)
+        return bool(hit and hit[0] > time.time() and hit[1] is not None)
 
     @staticmethod
     def get_previous_close(ticker: str) -> Optional[Dict[str, Any]]:

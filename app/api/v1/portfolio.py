@@ -5,7 +5,7 @@ from sqlalchemy.orm import selectinload
 from typing import Optional, List, Dict, Any
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
-from uuid import UUID
+from uuid import UUID, uuid4
 from app.database import get_db
 from app.api.deps import get_current_user
 from app.models.user import User
@@ -15,8 +15,29 @@ from app.models.portfolio import Portfolio
 from app.models.banking import LinkedAccount, Transaction, AccountType as BankingAccountType
 from app.models.order import Order, OrderStatus, OrderType
 from app.models.notification import Notification, NotificationType
+from app.models.transfer import Transfer
 from app.core.exceptions import NotFoundException, BadRequestException
 from app.services.net_worth import compute_net_worth, core_assets, breakdown_dict
+from app.services.valuation_history import load_valuations, value_asof, first_value
+from app.services.crypto_metrics import metric_series
+
+
+def _polygon_quote(symbol: str):
+    """(price, day_change, day_change_pct) from the previous-close bar — the
+    only price source the free-tier Polygon key can always serve, TTL-cached
+    inside PolygonClient. Returns None when no price is available."""
+    from app.integrations.polygon_client import PolygonClient as _PC
+
+    price = _PC.get_current_price(symbol)
+    if not price:
+        return None
+    prev_bar = _PC.get_previous_close(symbol)
+    prev_results = (prev_bar or {}).get("results") or []
+    day_open = prev_results[0].get("o") if prev_results else None
+    prev_price = float(day_open) if day_open else price
+    change = price - prev_price if prev_price else 0.0
+    change_pct = (change / prev_price * 100) if prev_price > 0 else 0.0
+    return price, change, change_pct
 from app.utils.logger import logger
 from app.integrations.polygon_client import PolygonClient
 from app.integrations.alpaca_client import AlpacaClient
@@ -727,14 +748,17 @@ async def compare_with_benchmark(
 # ============================================================================
 
 class PortfolioSummaryResponse(BaseModel):
-    total_portfolio_value: Decimal
-    total_assets: Decimal
+    total_portfolio_value: Decimal  # net: assets + cash - debts
+    total_assets: Decimal           # gross owned wealth (matches /allocation total)
     total_debts: Decimal
     cash_available: Decimal
+    total_invested: Decimal         # cost basis (first valuations)
     total_returns: Decimal
     return_percentage: Decimal
     today_change: Decimal
     today_change_percentage: Decimal
+    asset_types_count: int
+    total_holdings: int
     net_worth_breakdown: Optional[Dict[str, Any]] = None
 
 
@@ -764,21 +788,13 @@ async def get_portfolio_summary(
 
     total_assets = breakdown.total_assets
     
-    # Calculate total invested (sum of initial values or cost basis)
+    # Calculate total invested (sum of initial values or cost basis).
+    # Single batched history load — the old per-asset queries were an N+1
+    # that pushed this endpoint towards 40s on 90-asset accounts.
+    valuations_by_asset = await load_valuations(db, [asset.id for asset in assets])
     total_invested = Decimal("0.00")
     for asset in assets:
-        # Try to get first valuation as cost basis
-        first_valuation_result = await db.execute(
-            select(AssetValuation)
-            .where(AssetValuation.asset_id == asset.id)
-            .order_by(AssetValuation.valuation_date)
-            .limit(1)
-        )
-        first_valuation = first_valuation_result.scalar_one_or_none()
-        if first_valuation:
-            total_invested += first_valuation.value
-        else:
-            total_invested += asset.current_value  # Fallback
+        total_invested += first_value(valuations_by_asset.get(asset.id, []), asset)
     
     total_returns = total_assets - total_invested
     return_percentage = (total_returns / total_invested * 100) if total_invested > 0 else Decimal("0.00")
@@ -789,22 +805,12 @@ async def get_portfolio_summary(
     yesterday = today - timedelta(days=1)
     today_value = total_assets
     
+    yesterday_cutoff = datetime.combine(yesterday, datetime.min.time()).replace(tzinfo=timezone.utc)
     yesterday_value = Decimal("0.00")
     for asset in assets:
-        yesterday_valuation_result = await db.execute(
-            select(AssetValuation)
-            .where(
-                and_(
-                    AssetValuation.asset_id == asset.id,
-                    AssetValuation.valuation_date <= datetime.combine(yesterday, datetime.min.time()).replace(tzinfo=timezone.utc)
-                )
-            )
-            .order_by(desc(AssetValuation.valuation_date))
-            .limit(1)
-        )
-        yesterday_valuation = yesterday_valuation_result.scalar_one_or_none()
-        if yesterday_valuation:
-            yesterday_value += yesterday_valuation.value
+        asset_history = valuations_by_asset.get(asset.id, [])
+        if asset_history:
+            yesterday_value += value_asof(asset_history, asset, yesterday_cutoff)
         else:
             yesterday_value += asset.current_value
     
@@ -837,10 +843,13 @@ async def get_portfolio_summary(
         total_assets=total_assets,
         total_debts=total_debts,
         cash_available=cash_available,
+        total_invested=total_invested,
         total_returns=total_returns,
         return_percentage=return_percentage,
         today_change=today_change,
         today_change_percentage=today_change_percentage,
+        asset_types_count=len({asset.asset_type for asset in assets if asset.asset_type}),
+        total_holdings=len(assets),
         net_worth_breakdown=breakdown_dict(breakdown)
     )
 
@@ -1027,78 +1036,55 @@ async def get_market_summary(
     """Get market summary with indices and crypto prices"""
     indices = []
     crypto = []
-    
-    # Get S&P 500 and NASDAQ (using Polygon)
+
+    # Quote via previous-close bars (free-tier friendly, TTL-cached in
+    # PolygonClient) instead of the snapshot endpoint that 403/429'd and left
+    # these cards permanently empty (QA B9).
     try:
-        sp500_snapshot = PolygonClient.get_snapshot("SPY")
-        if sp500_snapshot and sp500_snapshot.get("ticker"):
-            ticker_data = sp500_snapshot["ticker"]
-            day_data = ticker_data.get("day", {})
-            prev_day = ticker_data.get("prevDay", {})
-            current_price = day_data.get("c") or prev_day.get("c", 0)
-            prev_price = prev_day.get("c", 0)
-            change = current_price - prev_price if prev_price else 0
-            change_pct = (change / prev_price * 100) if prev_price > 0 else 0
-            
+        quote = _polygon_quote("SPY")
+        if quote:
+            price, change, change_pct = quote
             indices.append({
                 "name": "S&P 500",
-                "value": round(current_price * 10, 2),  # SPY is ~1/10 of S&P 500
+                "value": round(price * 10, 2),  # SPY is ~1/10 of S&P 500
                 "change": round(change * 10, 2),
                 "change_percentage": round(change_pct, 2)
             })
     except Exception as e:
         logger.error(f"Failed to get S&P 500 data: {e}")
-    
+
     try:
-        nasdaq_snapshot = PolygonClient.get_snapshot("QQQ")
-        if nasdaq_snapshot and nasdaq_snapshot.get("ticker"):
-            ticker_data = nasdaq_snapshot["ticker"]
-            day_data = ticker_data.get("day", {})
-            prev_day = ticker_data.get("prevDay", {})
-            current_price = day_data.get("c") or prev_day.get("c", 0)
-            prev_price = prev_day.get("c", 0)
-            change = current_price - prev_price if prev_price else 0
-            change_pct = (change / prev_price * 100) if prev_price > 0 else 0
-            
+        quote = _polygon_quote("QQQ")
+        if quote:
+            price, change, change_pct = quote
             indices.append({
                 "name": "NASDAQ",
-                "value": round(current_price * 10, 2),  # QQQ is ~1/10 of NASDAQ
+                "value": round(price * 10, 2),  # QQQ is ~1/10 of NASDAQ
                 "change": round(change * 10, 2),
                 "change_percentage": round(change_pct, 2)
             })
     except Exception as e:
         logger.error(f"Failed to get NASDAQ data: {e}")
-    
-    # Get crypto prices (BTC, ETH) - using Polygon
+
     try:
-        btc_price = PolygonClient.get_current_price("BTCUSD")
-        if btc_price:
-            # Get previous day for change calculation
-            yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
-            btc_prev = PolygonClient.get_daily_open_close("BTCUSD", yesterday)
-            prev_price = btc_prev.get("close") if btc_prev else btc_price
-            change = btc_price - prev_price if prev_price else 0
-            change_pct = (change / prev_price * 100) if prev_price > 0 else 0
-            
+        quote = _polygon_quote("X:BTCUSD")
+        if quote:
+            price, change, change_pct = quote
             crypto.append({
                 "symbol": "BTC",
                 "name": "Bitcoin",
-                "price": round(btc_price, 2),
+                "price": round(price, 2),
                 "change": round(change, 2),
                 "change_percentage": round(change_pct, 2)
             })
     except Exception as e:
         logger.error(f"Failed to get BTC price: {e}")
-    
+
     try:
-        eth_price = PolygonClient.get_current_price("ETHUSD")
-        if eth_price:
-            yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
-            eth_prev = PolygonClient.get_daily_open_close("ETHUSD", yesterday)
-            prev_price = eth_prev.get("close") if eth_prev else eth_price
-            change = eth_price - prev_price if prev_price else 0
-            change_pct = (change / prev_price * 100) if prev_price > 0 else 0
-            
+        eth_quote = _polygon_quote("X:ETHUSD")
+        if eth_quote:
+            eth_price, change, change_pct = eth_quote
+
             crypto.append({
                 "symbol": "ETH",
                 "name": "Ethereum",
@@ -1356,6 +1342,7 @@ async def get_crypto_performance(
         return total + alpaca_value
 
     data_points = []
+    snapshot_dates = []
     intraday_hours = {"1h": 1, "6h": 6, "12h": 12, "24h": 24}
     if time_range in intraday_hours:
         hours = intraday_hours[time_range]
@@ -1363,6 +1350,7 @@ async def get_crypto_performance(
         step_seconds = hours * 3600 / n_points
         for i in range(n_points, -1, -1):
             snapshot_date = datetime.utcnow() - timedelta(seconds=step_seconds * i)
+            snapshot_dates.append(snapshot_date)
             data_points.append({
                 "time": snapshot_date.strftime("%H:%M"),
                 "value": float(value_at(snapshot_date)),
@@ -1371,17 +1359,39 @@ async def get_crypto_performance(
         days = int({"7d": 7, "30d": 30, "1y": 365}.get(time_range, 30))
         for i in range(days, 0, -1):
             snapshot_date = datetime.utcnow() - timedelta(days=i)
+            snapshot_dates.append(snapshot_date)
             data_points.append({
                 "time": snapshot_date.strftime("%Y-%m-%d"),
                 "value": float(value_at(snapshot_date)),
             })
 
-    return {"data": data_points}
+    # Each metric tab gets its own series (QA B7: all three used to return the
+    # same dollar curve, so the frontend put a % axis on dollar values).
+    exposure_denoms = None
+    if metric == "risk-exposure":
+        all_assets_result = await db.execute(
+            select(Asset).where(Asset.account_id == account.id)
+        )
+        portfolio_assets = core_assets(all_assets_result.scalars().all())
+        portfolio_history = await load_valuations(db, [a.id for a in portfolio_assets])
+        total_alpaca_value = Decimal(str(sum(
+            p["market_value"] for p in _get_alpaca_positions()
+        )))
+        exposure_denoms = []
+        for snapshot_date in snapshot_dates:
+            total = sum(
+                (value_asof(portfolio_history.get(a.id, []), a, snapshot_date)
+                 for a in portfolio_assets),
+                Decimal("0.00"),
+            )
+            exposure_denoms.append(total + total_alpaca_value)
+
+    return {"data": metric_series(data_points, metric, exposure_denoms)}
 
 
 @router.get("/crypto/breakdown", response_model=Dict[str, List[Dict[str, Any]]])
 async def get_crypto_breakdown(
-    group_by: str = Query(..., description="Group by: value, return-rate"),
+    group_by: str = Query(..., description="Group by: value, return-rate (also accepts return_rate/returnRate)"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -1448,7 +1458,10 @@ async def get_crypto_breakdown(
             "color": color
         })
     
-    # Sort by value or return rate
+    # Sort by value or return rate. snake_case and camelCase spellings are
+    # accepted for compat — the rest of the API is snake_case (QA B10).
+    if group_by in ("return_rate", "returnRate"):
+        group_by = "return-rate"
     if group_by == "value":
         breakdown.sort(key=lambda x: x["value"], reverse=True)
     elif group_by == "return-rate":
@@ -1676,7 +1689,20 @@ async def get_cash_flow_summary(
                 total_inflow += tx.amount
             else:
                 total_outflow += abs(tx.amount)
-    
+
+    # In-app transfers count as outflow for the period (QA B4).
+    period_transfers = await db.execute(
+        select(Transfer).where(
+            and_(
+                Transfer.account_id == account.id,
+                Transfer.transfer_date >= start_date_obj.date(),
+                Transfer.transfer_date <= end_date_obj.date(),
+            )
+        )
+    )
+    for transfer in period_transfers.scalars().all():
+        total_outflow += transfer.amount
+
     net_cash_flow = total_inflow - total_outflow
     net_percentage = (net_cash_flow / total_inflow * 100) if total_inflow > 0 else Decimal("0.00")
     
@@ -1880,6 +1906,40 @@ async def get_cash_flow_transactions(
                 "currency": tx.currency
             })
     
+    # Transfers initiated in-app join the feed (QA B4: they used to vanish).
+    transfers_result = await db.execute(
+        select(Transfer).where(
+            and_(
+                Transfer.account_id == account.id,
+                Transfer.transfer_date >= start_date_obj.date(),
+                Transfer.transfer_date <= end_date_obj.date(),
+            )
+        )
+    )
+    linked_names = {str(la.id): la.account_name for la in linked_accounts}
+    for transfer in transfers_result.scalars().all():
+        entry = {
+            "id": str(transfer.id),
+            "date": transfer.transfer_date.isoformat(),
+            "category": "Transfer",
+            "amount": float(transfer.amount),
+            "type": "outflow",
+            "account": linked_names.get(str(transfer.from_linked_account_id), "Transfer"),
+            "account_id": str(transfer.from_linked_account_id) if transfer.from_linked_account_id else None,
+            "notes": transfer.description or f"{transfer.transfer_type.title()} transfer",
+            "currency": transfer.currency,
+            "status": transfer.status,
+        }
+        if type == "inflow":
+            continue  # transfers out of a bank account are outflows
+        if category and category != "Transfer":
+            continue
+        if min_amount and transfer.amount < min_amount:
+            continue
+        if max_amount and transfer.amount > max_amount:
+            continue
+        all_transactions.append(entry)
+
     # Sort and paginate
     all_transactions.sort(key=lambda x: x["date"], reverse=True)
     total = len(all_transactions)
@@ -1967,23 +2027,80 @@ async def create_transfer(
             raise BadRequestException("wallet_address required for external transfers")
     else:
         raise BadRequestException("transfer_type must be 'internal' or 'external'")
-    
-    # Generate transfer ID and confirmation number
-    transfer_id = f"transfer_{UUID().hex[:12]}"
-    confirmation_number = f"FT{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
-    
-    # In a real implementation, you would:
-    # 1. Validate account balances
-    # 2. Create transfer record in database
-    # 3. Process the transfer via appropriate service
-    # 4. Update account balances
-    
+
+    if transfer_data.amount is None or transfer_data.amount <= 0:
+        raise BadRequestException("amount must be positive")
+
+    try:
+        transfer_date = datetime.strptime(transfer_data.transfer_date, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        raise BadRequestException("transfer_date must be YYYY-MM-DD")
+
+    def _resolve_linked(raw_id: Optional[str]) -> Optional[LinkedAccount]:
+        """Match a request account id against the caller's linked accounts."""
+        if not raw_id:
+            return None
+        try:
+            wanted = UUID(str(raw_id))
+        except ValueError:
+            return None
+        for linked in own_linked_accounts:
+            if linked.id == wanted:
+                return linked
+        return None
+
+    own_linked_result = await db.execute(
+        select(LinkedAccount).where(LinkedAccount.account_id == account.id)
+    )
+    own_linked_accounts = own_linked_result.scalars().all()
+
+    from_linked = None
+    to_linked = None
+    if transfer_data.transfer_type == "internal":
+        from_linked = _resolve_linked(transfer_data.from_account_id)
+        if from_linked is None:
+            raise NotFoundException("Source account", str(transfer_data.from_account_id))
+        to_linked = _resolve_linked(transfer_data.to_account_id)  # may be a wallet label -> None
+    else:
+        # External transfers drain a linked source account too — resolve it so
+        # the balance check below applies (contract: 404 for unknown ids,
+        # INSUFFICIENT_FUNDS when amount exceeds the balance).
+        if transfer_data.from_account_id:
+            from_linked = _resolve_linked(transfer_data.from_account_id)
+            if from_linked is None:
+                raise NotFoundException("Source account", str(transfer_data.from_account_id))
+
+    # Balance check against the Plaid-synced balance of the source account.
+    if from_linked is not None and from_linked.balance is not None:
+        if Decimal(from_linked.balance) < transfer_data.amount:
+            raise BadRequestException(
+                "Insufficient funds in the source account for this transfer.",
+                code="INSUFFICIENT_FUNDS",
+            )
+
+    transfer = Transfer(
+        account_id=account.id,
+        transfer_type=transfer_data.transfer_type,
+        from_linked_account_id=from_linked.id if from_linked else None,
+        to_linked_account_id=to_linked.id if to_linked else None,
+        wallet_address=transfer_data.wallet_address,
+        amount=transfer_data.amount,
+        transfer_date=transfer_date,
+        frequency=transfer_data.frequency or "one-time",
+        description=transfer_data.description,
+        status="pending",
+        confirmation_number=f"FT{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
+    )
+    db.add(transfer)
+    await db.commit()
+    await db.refresh(transfer)
+
     return {
         "data": {
-            "id": transfer_id,
-            "status": "pending",
-            "confirmation_number": confirmation_number,
-            "created_at": datetime.utcnow().isoformat()
+            "id": str(transfer.id),
+            "status": transfer.status,
+            "confirmation_number": transfer.confirmation_number,
+            "created_at": transfer.created_at.isoformat() if transfer.created_at else datetime.utcnow().isoformat()
         }
     }
 
@@ -1994,19 +2111,52 @@ async def get_transfer_status(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get transfer status"""
-    # In a real implementation, fetch from database
+    """Get transfer status (owner-scoped; unknown ids are 404, not fabricated)."""
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+
+    try:
+        transfer_uuid = UUID(transfer_id)
+    except ValueError:
+        raise NotFoundException("Transfer", transfer_id)
+
+    transfer_result = await db.execute(
+        select(Transfer).where(
+            and_(Transfer.id == transfer_uuid, Transfer.account_id == account.id)
+        )
+    )
+    transfer = transfer_result.scalar_one_or_none()
+    if not transfer:
+        raise NotFoundException("Transfer", transfer_id)
+
+    async def _linked_label(linked_id) -> Optional[str]:
+        if not linked_id:
+            return None
+        linked = (
+            await db.execute(select(LinkedAccount).where(LinkedAccount.id == linked_id))
+        ).scalar_one_or_none()
+        if not linked:
+            return None
+        masked = f" (****{linked.account_number[-4:]})" if linked.account_number else ""
+        return f"{linked.account_name}{masked}"
+
     return {
         "data": {
-            "id": transfer_id,
-            "status": "completed",
-            "confirmation_number": f"FT{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
-            "from_account": "Bank A - Checking (****4932)",
-            "to_account": "Wallet - Investment",
-            "amount": 5000.00,
-            "transfer_date": datetime.utcnow().date().isoformat(),
-            "completed_at": datetime.utcnow().isoformat(),
-            "created_at": datetime.utcnow().isoformat()
+            "id": str(transfer.id),
+            "status": transfer.status,
+            "confirmation_number": transfer.confirmation_number,
+            "transfer_type": transfer.transfer_type,
+            "from_account": await _linked_label(transfer.from_linked_account_id),
+            "to_account": await _linked_label(transfer.to_linked_account_id) or transfer.wallet_address,
+            "amount": float(transfer.amount),
+            "currency": transfer.currency,
+            "transfer_date": transfer.transfer_date.isoformat(),
+            "description": transfer.description,
+            "created_at": transfer.created_at.isoformat() if transfer.created_at else None
         }
     }
 
@@ -2066,6 +2216,51 @@ async def search_assets(
         logger.error(f"Failed to search assets: {e}")
 
     return {"data": results[:limit]}
+
+
+@router.get("/trade-engine/quotes", response_model=Dict[str, Dict[str, Any]])
+async def get_batch_quotes(
+    symbols: str = Query(..., description="Comma-separated symbols, max 20 (e.g. AAPL,MSFT,BTCUSD)"),
+    current_user: User = Depends(get_current_user),
+):
+    """Batch price lookup for visible rows (QA B8: search results carry no
+    price so search-driven UIs showed $0.00).
+
+    Cached quotes are free; at most 3 UNCACHED symbols are fetched per call to
+    respect the free-tier Polygon budget (5 req/min). Symbols that would
+    exceed the budget return {"price": null} — the client re-requests later
+    and hits the now-warm cache.
+    """
+    requested = [s.strip().upper() for s in symbols.split(",") if s.strip()][:20]
+    if not requested:
+        raise BadRequestException("symbols must contain at least one symbol")
+
+    quotes: Dict[str, Any] = {}
+    fresh_fetches = 0
+    for symbol in requested:
+        # Crypto pairs arrive plain (BTCUSD) but Polygon wants the X: prefix.
+        candidates = [symbol] if symbol.startswith("X:") else [symbol, f"X:{symbol}"]
+        quote = None
+        for candidate in candidates:
+            cached = PolygonClient.has_cached_price(candidate)
+            if not cached:
+                if fresh_fetches >= 3:
+                    continue
+                fresh_fetches += 1
+            quote = _polygon_quote(candidate)
+            if quote:
+                break
+        if quote:
+            price, change, change_pct = quote
+            quotes[symbol] = {
+                "price": round(price, 2),
+                "change": round(change, 2),
+                "change_percentage": round(change_pct, 2),
+            }
+        else:
+            quotes[symbol] = {"price": None}
+
+    return {"quotes": quotes}
 
 
 @router.get("/trade-engine/assets/{symbol}", response_model=Dict[str, Dict[str, Any]])
@@ -2463,30 +2658,53 @@ async def place_order(
         
         if not alpaca_order:
             raise BadRequestException("Failed to create order")
-        
+
+        # Capture the execution price at placement (QA B6: orders were stored
+        # with price 0 and every downstream feed showed "$0.00" trades). Same
+        # price source as the asset-details endpoint, crypto X: retry included.
+        execution_price = None
+        if order_data.order_mode == "limit":
+            execution_price = order_data.limit_price
+        else:
+            try:
+                symbol_upper = order_data.symbol.upper().strip()
+                quote = PolygonClient.get_current_price(symbol_upper)
+                if not quote and not symbol_upper.startswith("X:"):
+                    quote = PolygonClient.get_current_price(f"X:{symbol_upper}")
+                if quote:
+                    execution_price = Decimal(str(quote))
+            except Exception as price_err:  # a quote miss must never fail the order
+                logger.warning(f"No execution price for {order_data.symbol}: {price_err}")
+
+        is_market = order_data.order_mode == "market"
+        filled = is_market and execution_price is not None
+
         # Save order to database
         order = Order(
             account_id=account.id,
-            order_type=OrderType.MARKET if order_data.order_mode == "market" else OrderType.LIMIT,
+            order_type=OrderType.MARKET if is_market else OrderType.LIMIT,
             symbol=order_data.symbol,
             quantity=order_data.quantity,
-            price=order_data.limit_price,
+            price=execution_price,
             side=order_data.order_type,
-            status=OrderStatus.SUBMITTED,
+            status=OrderStatus.FILLED if filled else OrderStatus.SUBMITTED,
+            filled_quantity=order_data.quantity if filled else 0,
+            filled_price=execution_price if filled else None,
             alpaca_order_id=str(alpaca_order.get("id", "")) if isinstance(alpaca_order, dict) else str(getattr(alpaca_order, "id", ""))
         )
         db.add(order)
         await db.commit()
         await db.refresh(order)
-        
+
         order_id = str(alpaca_order.get("id", "")) if isinstance(alpaca_order, dict) else str(getattr(alpaca_order, "id", ""))
-        estimated_total = float(order_data.quantity * (order_data.limit_price if order_data.limit_price else 0))
+        estimated_total = float(order_data.quantity * (execution_price or 0))
         
         return {
             "data": {
                 "order_id": order_id,
-                "status": "pending",
+                "status": order.status.value,
                 "confirmation_number": f"ORD{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
+                "price": float(execution_price) if execution_price is not None else None,
                 "estimated_total": estimated_total,
                 "created_at": datetime.utcnow().isoformat()
             }
