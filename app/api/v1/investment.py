@@ -1296,6 +1296,15 @@ class CloneStrategyRequest(BaseModel):
     adjust_parameters: Optional[Dict[str, Any]] = None
 
 
+class CreateStrategyRequest(BaseModel):
+    title: str
+    description: Optional[str] = None
+    full_description: Optional[str] = None
+    chart_type: Optional[str] = "line"
+    parameters: Optional[Dict[str, Any]] = None
+    is_open_source: bool = False
+
+
 @router.post("/strategies/{strategy_id}/clone", response_model=Dict[str, Any])
 async def clone_investment_strategy(
     strategy_id: UUID,
@@ -1323,7 +1332,9 @@ async def clone_investment_strategy(
         title=clone_data.new_name,
         description=original.description,
         full_description=original.full_description,
-        author=current_user.email,
+        # A saved copy keeps the original creator's name — saving must not
+        # rebrand the strategy as the saver's.
+        author=original.author,
         chart_type=original.chart_type,
         parameters=parameters,
         is_open_source=original.is_open_source,
@@ -1360,6 +1371,44 @@ def _strategy_list_payload(strategy: "InvestmentStrategy") -> Dict[str, Any]:
     }
 
 
+@router.post("/strategies", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
+async def create_investment_strategy(
+    strategy_data: CreateStrategyRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Create a user-authored strategy (lands in the caller's own list)."""
+    account = await _get_account_or_404(db, current_user)
+
+    title = (strategy_data.title or "").strip()
+    if not title:
+        raise BadRequestException("title is required")
+
+    author_name = f"{current_user.first_name or ''} {current_user.last_name or ''}".strip()
+    strategy = InvestmentStrategy(
+        account_id=account.id,
+        title=title,
+        description=strategy_data.description,
+        full_description=strategy_data.full_description or strategy_data.description,
+        author=author_name or current_user.email,
+        chart_type=strategy_data.chart_type or "line",
+        parameters=strategy_data.parameters or {},
+        is_open_source=strategy_data.is_open_source,
+    )
+    db.add(strategy)
+    await db.commit()
+    await db.refresh(strategy)
+
+    payload = _strategy_list_payload(strategy)
+    payload.update({
+        "full_description": strategy.full_description,
+        "chart_type": strategy.chart_type,
+        "parameters": strategy.parameters or {},
+        "is_saved": True,
+    })
+    return {"strategy": payload}
+
+
 @router.get("/strategies", response_model=Dict[str, Any])
 async def list_investment_strategies(
     filter: str = Query("all", description="all, mine, platform"),
@@ -1378,9 +1427,15 @@ async def list_investment_strategies(
     elif normalized == "platform":
         scope = InvestmentStrategy.account_id.is_(None)
     else:
+        # "all" = platform strategies + the caller's own AUTHORED ones.
+        # Saved copies (clones) live only under filter=mine so the browse
+        # view isn't cluttered with duplicates of platform strategies.
         scope = or_(
             InvestmentStrategy.account_id.is_(None),
-            InvestmentStrategy.account_id == account.id,
+            and_(
+                InvestmentStrategy.account_id == account.id,
+                InvestmentStrategy.cloned_from.is_(None),
+            ),
         )
 
     query = select(InvestmentStrategy).where(scope)

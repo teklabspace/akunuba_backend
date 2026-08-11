@@ -33,6 +33,7 @@ def test_goals_crud_routes_exist():
 def test_strategy_list_and_detail_routes_exist():
     routes = _routes(investment_router)
     assert "GET" in routes.get("/strategies", set())
+    assert "POST" in routes.get("/strategies", set())  # create (frontend integration, 11 Aug)
     assert "GET" in routes.get("/strategies/{strategy_id}", set())
     assert "POST" in routes.get("/strategies/{strategy_id}/clone", set())
 
