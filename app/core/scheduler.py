@@ -298,6 +298,39 @@ async def recalculate_portfolios():
         record_job_failure("recalculate_portfolios")
 
 
+def _try_pay_open_invoice(stripe, stripe_sub) -> bool:
+    """Off-session collection of a subscription's open renewal invoice with the
+    saved default payment method (subscription-level first, then customer-level).
+    Returns True when the invoice was paid — the customer never has to come
+    back and renew manually as long as a card is on file."""
+    try:
+        invoice_id = stripe_sub.get("latest_invoice")
+        if not invoice_id:
+            return False
+        if not isinstance(invoice_id, str):  # may arrive expanded
+            invoice_id = invoice_id.get("id")
+        invoice = stripe.Invoice.retrieve(invoice_id)
+        if invoice.get("status") != "open":
+            return False
+
+        pm = stripe_sub.get("default_payment_method")
+        if not pm:
+            customer_id = invoice.get("customer")
+            if customer_id:
+                customer = stripe.Customer.retrieve(customer_id)
+                pm = (customer.get("invoice_settings") or {}).get("default_payment_method")
+        if not pm:
+            logger.info(f"No saved payment method to auto-renew invoice {invoice_id}")
+            return False
+
+        stripe.Invoice.pay(invoice_id, payment_method=pm)
+        logger.info(f"Auto-collected renewal invoice {invoice_id} off-session")
+        return True
+    except Exception as e:
+        logger.warning(f"Off-session renewal payment failed: {e}")
+        return False
+
+
 async def process_subscription_renewals():
     """Process subscription renewals and handle failed payments"""
     from app.database import AsyncSessionLocal
@@ -332,9 +365,25 @@ async def process_subscription_renewals():
                                 stripe_sub.current_period_end
                             )
                             continue
-                        elif stripe_sub.status == "past_due":
+                        elif stripe_sub.status in ("past_due", "incomplete", "unpaid"):
+                            # Auto-collect the renewal with the saved payment
+                            # method so the customer doesn't have to come back
+                            # and renew manually.
+                            if _try_pay_open_invoice(stripe, stripe_sub):
+                                stripe_sub = stripe.Subscription.retrieve(
+                                    subscription.stripe_subscription_id
+                                )
+                                if stripe_sub.status == "active":
+                                    subscription.status = SubscriptionStatus.ACTIVE
+                                    subscription.current_period_start = datetime.fromtimestamp(
+                                        stripe_sub.current_period_start
+                                    )
+                                    subscription.current_period_end = datetime.fromtimestamp(
+                                        stripe_sub.current_period_end
+                                    )
+                                    continue
                             subscription.status = SubscriptionStatus.PAST_DUE
-                            # Retry logic handled by Stripe
+                            # Stripe smart retries keep running as a fallback
                             continue
                     except Exception as e:
                         logger.error(f"Error checking Stripe subscription {subscription.id}: {e}")
@@ -433,6 +482,10 @@ async def process_subscription_retry_and_downgrade():
                 if sub.stripe_subscription_id:
                     try:
                         stripe_sub = stripe.Subscription.retrieve(sub.stripe_subscription_id)
+                        # Attempt off-session collection before syncing status —
+                        # a saved card means the customer never has to renew by hand.
+                        if stripe_sub.status == "past_due" and _try_pay_open_invoice(stripe, stripe_sub):
+                            stripe_sub = stripe.Subscription.retrieve(sub.stripe_subscription_id)
                         if stripe_sub.status == "active":
                             sub.status = SubscriptionStatus.ACTIVE
                             sub.current_period_start = datetime.fromtimestamp(stripe_sub.current_period_start)

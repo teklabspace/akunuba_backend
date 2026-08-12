@@ -1,7 +1,7 @@
 try:
     # Try new SDK first (alpaca-py)
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, StopOrderRequest
+    from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, StopOrderRequest, StopLimitOrderRequest
     from alpaca.trading.enums import OrderSide, TimeInForce
     ALPACA_AVAILABLE = True
     ALPACA_NEW_SDK = True
@@ -11,6 +11,7 @@ except ImportError:
         from alpaca.trade.client import TradeClient as TradingClient
         from alpaca.trade.requests import MarketOrderRequest, LimitOrderRequest, StopOrderRequest
         from alpaca.trade.enums import OrderSide, TimeInForce
+        StopLimitOrderRequest = None
         ALPACA_AVAILABLE = True
         ALPACA_NEW_SDK = False
     except ImportError:
@@ -20,6 +21,7 @@ except ImportError:
         MarketOrderRequest = None
         LimitOrderRequest = None
         StopOrderRequest = None
+        StopLimitOrderRequest = None
         OrderSide = None
         TimeInForce = None
 
@@ -32,6 +34,7 @@ from datetime import datetime, timedelta
 
 
 class AlpacaClient:
+    _last_order_error = None
     _instance: Optional[TradingClient] = None
     _oauth_token: Optional[str] = None
     _oauth_token_expires_at: Optional[datetime] = None
@@ -191,6 +194,7 @@ class AlpacaClient:
             return order
         except Exception as e:
             logger.error(f"Failed to create Alpaca market order: {e}")
+            cls._last_order_error = str(e)
             return None
 
     @classmethod
@@ -213,6 +217,7 @@ class AlpacaClient:
             return order
         except Exception as e:
             logger.error(f"Failed to create Alpaca limit order: {e}")
+            cls._last_order_error = str(e)
             return None
 
     @classmethod
@@ -235,6 +240,37 @@ class AlpacaClient:
             return order
         except Exception as e:
             logger.error(f"Failed to create Alpaca stop order: {e}")
+            cls._last_order_error = str(e)
+            return None
+
+    @classmethod
+    def create_stop_limit_order(
+        cls, symbol: str, qty: float, side: str, stop_price: float, limit_price: float
+    ) -> Optional[Dict[str, Any]]:
+        """Stop-limit: triggers at stop_price, then rests as a limit at limit_price."""
+        if not ALPACA_AVAILABLE:
+            logger.warning("Alpaca SDK not available")
+            return None
+        if StopLimitOrderRequest is None:
+            logger.error("Installed Alpaca SDK has no StopLimitOrderRequest")
+            return None
+        client = cls.get_client()
+        if not client:
+            return None
+        try:
+            order_data = StopLimitOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL,
+                stop_price=stop_price,
+                limit_price=limit_price,
+                time_in_force=cls._time_in_force_for(symbol)
+            )
+            order = client.submit_order(order_data=order_data)
+            return order
+        except Exception as e:
+            logger.error(f"Failed to create Alpaca stop-limit order: {e}")
+            cls._last_order_error = str(e)
             return None
 
     @classmethod
@@ -327,6 +363,7 @@ class AlpacaClient:
             return order
         except Exception as e:
             logger.error(f"Failed to create Alpaca fractional order: {e}")
+            cls._last_order_error = str(e)
             return None
 
     @classmethod

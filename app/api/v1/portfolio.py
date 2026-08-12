@@ -2612,9 +2612,10 @@ async def get_brokerage_accounts(
 class OrderRequest(BaseModel):
     symbol: str
     order_type: str = Field(..., description="buy or sell")
-    order_mode: str = Field(..., description="market or limit")
+    order_mode: str = Field(..., description="market, limit, or stop-limit")
     quantity: Decimal
-    limit_price: Optional[Decimal] = Field(None, description="Required for limit orders")
+    limit_price: Optional[Decimal] = Field(None, description="Required for limit and stop-limit orders")
+    stop_price: Optional[Decimal] = Field(None, description="Required for stop-limit orders")
     brokerage_account_id: str
     order_duration: str = Field("day-only", description="day-only, good-till-canceled, immediate-or-cancel")
     open_until: Optional[str] = Field(None, description="For GTC orders")
@@ -2636,17 +2637,30 @@ async def place_order(
     if not account:
         raise NotFoundException("Account", str(current_user.id))
     
-    # Validate limit order
-    if order_data.order_mode == "limit" and not order_data.limit_price:
+    # Normalize and validate the order mode ("stop_limit" tolerated as alias)
+    mode = (order_data.order_mode or "").lower().replace("_", "-")
+    if mode not in ("market", "limit", "stop-limit"):
+        raise BadRequestException("order_mode must be 'market', 'limit', or 'stop-limit'")
+    if mode == "limit" and not order_data.limit_price:
         raise BadRequestException("limit_price required for limit orders")
-    
+    if mode == "stop-limit" and (not order_data.limit_price or not order_data.stop_price):
+        raise BadRequestException("stop_price and limit_price required for stop-limit orders")
+
     # Create order via Alpaca
     try:
-        if order_data.order_mode == "market":
+        if mode == "market":
             alpaca_order = AlpacaClient.create_market_order(
                 symbol=order_data.symbol,
                 qty=float(order_data.quantity),
                 side=order_data.order_type
+            )
+        elif mode == "stop-limit":
+            alpaca_order = AlpacaClient.create_stop_limit_order(
+                symbol=order_data.symbol,
+                qty=float(order_data.quantity),
+                side=order_data.order_type,
+                stop_price=float(order_data.stop_price),
+                limit_price=float(order_data.limit_price)
             )
         else:  # limit
             alpaca_order = AlpacaClient.create_limit_order(
@@ -2655,15 +2669,19 @@ async def place_order(
                 side=order_data.order_type,
                 limit_price=float(order_data.limit_price)
             )
-        
+
         if not alpaca_order:
-            raise BadRequestException("Failed to create order")
+            # Surface the broker's reject reason (wash-trade guard, insufficient
+            # qty, market closed, …) instead of a blind "failed".
+            broker_error = getattr(AlpacaClient, "_last_order_error", None)
+            detail = f": {broker_error}" if broker_error else ""
+            raise BadRequestException(f"Broker rejected the order{detail}")
 
         # Capture the execution price at placement (QA B6: orders were stored
         # with price 0 and every downstream feed showed "$0.00" trades). Same
         # price source as the asset-details endpoint, crypto X: retry included.
         execution_price = None
-        if order_data.order_mode == "limit":
+        if mode in ("limit", "stop-limit"):
             execution_price = order_data.limit_price
         else:
             try:
@@ -2676,13 +2694,19 @@ async def place_order(
             except Exception as price_err:  # a quote miss must never fail the order
                 logger.warning(f"No execution price for {order_data.symbol}: {price_err}")
 
-        is_market = order_data.order_mode == "market"
+        is_market = mode == "market"
         filled = is_market and execution_price is not None
 
-        # Save order to database
+        # Save order to database. Stop-limit persists as STOP (closest enum
+        # value — the stop trigger defines the order); Alpaca holds full detail.
+        db_order_type = (
+            OrderType.MARKET if is_market
+            else OrderType.STOP if mode == "stop-limit"
+            else OrderType.LIMIT
+        )
         order = Order(
             account_id=account.id,
-            order_type=OrderType.MARKET if is_market else OrderType.LIMIT,
+            order_type=db_order_type,
             symbol=order_data.symbol,
             quantity=order_data.quantity,
             price=execution_price,
