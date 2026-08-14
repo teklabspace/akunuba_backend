@@ -2923,3 +2923,213 @@ async def admin_marketplace_highlights(
         ],
         "generated_at": now.isoformat(),
     }
+
+
+# -- Advisor requests (delegated asset creation, Milestone 1) -----------------
+
+class ApproveAdvisorRequestBody(BaseModel):
+    advisor_id: UUID
+
+
+class RejectAdvisorRequestBody(BaseModel):
+    reason: Optional[str] = None
+
+
+@router.get("/advisor-requests", response_model=Dict[str, Any])
+async def admin_list_advisor_requests(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """The advisor-request queue -- admin only. Defaults to newest first."""
+    from app.api.v1.delegation import serialize_request
+    from app.models.delegation import AdvisorRequest
+
+    Investor = aliased(User)
+    Advisor = aliased(User)
+
+    stmt = (
+        select(AdvisorRequest, Investor, Advisor)
+        .join(Investor, AdvisorRequest.investor_id == Investor.id)
+        .outerjoin(Advisor, AdvisorRequest.requested_advisor_id == Advisor.id)
+    )
+    if status_filter:
+        stmt = stmt.where(AdvisorRequest.status == status_filter)
+
+    total = (await db.execute(
+        select(func.count()).select_from(stmt.subquery())
+    )).scalar() or 0
+
+    rows = (await db.execute(
+        stmt.order_by(AdvisorRequest.created_at.desc())
+        .offset((page - 1) * page_size).limit(page_size)
+    )).all()
+
+    data = []
+    for req, investor, advisor in rows:
+        item = serialize_request(req, advisor)
+        item["investor"] = {
+            "id": str(investor.id),
+            "name": _full_name(investor),
+            "email": investor.email,
+        }
+        data.append(item)
+
+    return {"success": True, "data": data, "total": total, "page": page, "page_size": page_size}
+
+
+@router.post("/advisor-requests/{request_id}/approve", response_model=Dict[str, Any])
+async def admin_approve_advisor_request(
+    request_id: UUID,
+    body: ApproveAdvisorRequestBody,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Approve a request: assign the advisor and issue a single-use grant.
+
+    Reassignment (design decision D2): if the investor already has a different
+    advisor, the assignment is swapped. Demoting the previous advisor's EDIT
+    rights to VIEW lands in Milestone 3 with the asset_access table -- there are
+    no per-asset grants to demote yet.
+    """
+    from app.api.v1.delegation import (
+        ensure_request_is_decidable,
+        new_grant_expiry,
+        serialize_grant,
+        serialize_request,
+    )
+    from app.models.advisor_client import AdvisorClient
+    from app.models.delegation import (
+        AdvisorRequest, AdvisorRequestStatus, AssetDelegationGrant, GrantStatus,
+    )
+    from app.models.notification import NotificationType
+    from app.services.notification_service import NotificationService
+
+    req = (await db.execute(
+        select(AdvisorRequest).where(AdvisorRequest.id == request_id).with_for_update()
+    )).scalar_one_or_none()
+    if not req:
+        raise NotFoundException("AdvisorRequest", str(request_id))
+    ensure_request_is_decidable(req)
+
+    advisor = (await db.execute(select(User).where(User.id == body.advisor_id))).scalar_one_or_none()
+    if not advisor:
+        raise NotFoundException("User", str(body.advisor_id))
+    if advisor.role != Role.ADVISOR:
+        raise BadRequestException("Target user is not an advisor.")
+
+    investor = (await db.execute(select(User).where(User.id == req.investor_id))).scalar_one_or_none()
+    if not investor:
+        raise NotFoundException("User", str(req.investor_id))
+
+    # Assign, or swap an existing assignment (D2). client_id is unique, so an
+    # investor has at most one advisor.
+    existing = (await db.execute(
+        select(AdvisorClient).where(AdvisorClient.client_id == investor.id)
+    )).scalar_one_or_none()
+
+    conv = await _get_or_create_advisor_chat(db, advisor, investor)
+    if existing and existing.advisor_id != advisor.id:
+        existing.advisor_id = advisor.id
+        existing.conversation_id = conv.id
+        existing.assigned_by = current_user.id
+    elif not existing:
+        db.add(AdvisorClient(
+            advisor_id=advisor.id, client_id=investor.id,
+            conversation_id=conv.id, assigned_by=current_user.id,
+        ))
+
+    # Supersede any live grant for this pair so the partial unique index holds.
+    stale = (await db.execute(
+        select(AssetDelegationGrant).where(
+            AssetDelegationGrant.investor_id == investor.id,
+            AssetDelegationGrant.advisor_id == advisor.id,
+            AssetDelegationGrant.status == GrantStatus.ACTIVE.value,
+        )
+    )).scalars().all()
+    for old in stale:
+        old.status = GrantStatus.REVOKED.value
+        old.revoked_at = datetime.now(timezone.utc)
+        old.revoked_by = current_user.id
+
+    grant = AssetDelegationGrant(
+        request_id=req.id,
+        investor_id=investor.id,
+        advisor_id=advisor.id,
+        status=GrantStatus.ACTIVE.value,
+        expires_at=new_grant_expiry(),
+        issued_by=current_user.id,
+    )
+    db.add(grant)
+
+    req.status = AdvisorRequestStatus.APPROVED.value
+    req.decided_by = current_user.id
+    req.decided_at = datetime.now(timezone.utc)
+
+    await db.commit()
+    await db.refresh(grant)
+    await db.refresh(req)
+
+    meta = json.dumps({
+        "event": "advisor_request_approved",
+        "request_id": str(req.id),
+        "grant_id": str(grant.id),
+        "conversation_id": str(conv.id),
+    })
+    await NotificationService.notify_user(
+        db, advisor.id, NotificationType.GENERAL, "You're authorised to add an asset",
+        f"You can create one asset on behalf of {_full_name(investor)}.", meta)
+    await NotificationService.notify_user(
+        db, investor.id, NotificationType.GENERAL, "Advisor request approved",
+        f"{_full_name(advisor)} is now your advisor and can add one asset for you.", meta)
+
+    logger.info(
+        f"Admin {current_user.id} approved advisor request {req.id}: "
+        f"advisor {advisor.id} -> investor {investor.id}, grant {grant.id}"
+    )
+    return {
+        "success": True,
+        "data": {
+            "request": serialize_request(req, advisor),
+            "grant": serialize_grant(grant, advisor, investor),
+            "conversation_id": str(conv.id),
+        },
+    }
+
+
+@router.post("/advisor-requests/{request_id}/reject", response_model=Dict[str, Any])
+async def admin_reject_advisor_request(
+    request_id: UUID,
+    body: RejectAdvisorRequestBody,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Reject a pending advisor request, with an optional reason for the investor."""
+    from app.api.v1.delegation import ensure_request_is_decidable, serialize_request
+    from app.models.delegation import AdvisorRequest, AdvisorRequestStatus
+    from app.models.notification import NotificationType
+    from app.services.notification_service import NotificationService
+
+    req = (await db.execute(
+        select(AdvisorRequest).where(AdvisorRequest.id == request_id).with_for_update()
+    )).scalar_one_or_none()
+    if not req:
+        raise NotFoundException("AdvisorRequest", str(request_id))
+    ensure_request_is_decidable(req)
+
+    req.status = AdvisorRequestStatus.REJECTED.value
+    req.decided_by = current_user.id
+    req.decision_reason = body.reason
+    req.decided_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(req)
+
+    await NotificationService.notify_user(
+        db, req.investor_id, NotificationType.GENERAL, "Advisor request declined",
+        body.reason or "Your advisor request was declined. Contact support for details.",
+        json.dumps({"event": "advisor_request_rejected", "request_id": str(req.id)}))
+
+    logger.info(f"Admin {current_user.id} rejected advisor request {req.id}")
+    return {"success": True, "data": serialize_request(req)}

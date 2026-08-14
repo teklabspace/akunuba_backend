@@ -30,6 +30,10 @@ from app.models.watchlist import InvestmentWatchlist
 from app.models.investment_goal import InvestmentGoal, GoalStatus
 from app.models.investment_strategy import InvestmentStrategy
 from app.models.transfer import Transfer
+from app.models.delegation import (
+    AdvisorRequest, AssetDelegationGrant, AdvisorRequestStatus, GrantStatus
+)
+from app.models.activity import ActivityLog
 from app.models.kyc import KYCVerification
 from app.models.kyb import KYBVerification
 from app.models.user_preferences import UserPreferences
@@ -138,5 +142,10 @@ __all__ = [
     "GoalStatus",
     "InvestmentStrategy",
     "Transfer",
+    "AdvisorRequest",
+    "AssetDelegationGrant",
+    "AdvisorRequestStatus",
+    "GrantStatus",
+    "ActivityLog",
 ]
 
