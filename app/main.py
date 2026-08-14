@@ -39,6 +39,7 @@ from app.api.v1 import (
     websocket_chat,
     webhooks,
     advisor,
+    delegation,
 )
 from app.utils.logger import logger
 from app.core.responses import (
@@ -334,6 +335,10 @@ app.include_router(entities.router, prefix=f"{settings.API_V1_PREFIX}/entities",
 app.include_router(compliance.router, prefix=f"{settings.API_V1_PREFIX}/compliance", tags=["Compliance"], dependencies=_KYC_GATED)
 app.include_router(referrals.router, prefix=f"{settings.API_V1_PREFIX}/referrals", tags=["Referrals"], dependencies=_KYC_GATED)
 app.include_router(advisor.router, prefix=f"{settings.API_V1_PREFIX}/advisor", tags=["Advisor"], dependencies=_KYC_GATED)
+# Delegated asset creation (Milestone 1): investor requests + grant lifecycle.
+# KYC-gated to match /assets — the grant exists to create an asset.
+app.include_router(delegation.router, prefix=f"{settings.API_V1_PREFIX}/advisor-requests", tags=["Delegation"], dependencies=_KYC_GATED)
+app.include_router(delegation.grants_router, prefix=f"{settings.API_V1_PREFIX}/delegation-grants", tags=["Delegation"], dependencies=_KYC_GATED)
 app.include_router(webhooks.router, prefix=f"{settings.API_V1_PREFIX}/webhooks", tags=["Webhooks"])
 
 
