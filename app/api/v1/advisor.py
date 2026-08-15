@@ -51,7 +51,10 @@ async def ensure_advisor_of(db: AsyncSession, user: User, client_id) -> Account:
     if not is_advisor_scope_allowed(user, assignment):
         raise ForbiddenException(
             "This investor is not one of your clients.",
-            code=NOT_YOUR_CLIENT,
+            # Literal, not the NOT_YOUR_CLIENT constant: the drift guard in
+            # tests/test_error_code_drift.py only detects string literals at
+            # raise sites, and a code it cannot see never reaches the contract.
+            code="NOT_YOUR_CLIENT",
         )
 
     account = (await db.execute(
@@ -237,10 +240,21 @@ async def get_client_overview(
         summary=f"Viewed client overview for {_client_person(client)['name']}",
     )
 
+    # The auto-created advisor<->investor chat. Surfaced so an admin reviewing
+    # the relationship can read the transcript without a second lookup.
+    assignment = (await db.execute(
+        select(AdvisorClient).where(AdvisorClient.client_id == client_id)
+    )).scalar_one_or_none()
+
     return {
         "success": True,
         "data": {
             "client": _client_person(client),
+            "advisor_id": str(assignment.advisor_id) if assignment else None,
+            "conversation_id": (
+                str(assignment.conversation_id)
+                if assignment and assignment.conversation_id else None
+            ),
             "kyc_status": kyc.status.value if kyc else "not_started",
             "plan": get_plan_tier(sub) if sub else None,
             "net_worth": sum(by_type.values()),

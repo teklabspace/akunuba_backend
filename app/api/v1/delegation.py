@@ -141,6 +141,129 @@ def new_grant_expiry(now: Optional[datetime] = None) -> datetime:
     return (now or datetime.now(timezone.utc)) + timedelta(days=DEFAULT_GRANT_TTL_DAYS)
 
 
+# -- On-behalf asset creation (Milestone 2) -----------------------------------
+
+NO_ACTIVE_GRANT = "NO_ACTIVE_GRANT"
+
+
+async def acquire_creation_grant(db: AsyncSession, user: User, on_behalf_of):
+    """Lock the advisor's single-use grant and return (investor_account, grant).
+
+    Row-locked with FOR UPDATE so two concurrent creates cannot both consume the
+    same grant -- the loser sees it already CONSUMED and is rejected.
+
+    Returns the INVESTOR's account deliberately: the asset belongs to them, and
+    the plan/asset limit must be charged to their subscription, never the
+    advisor's.
+    """
+    from app.models.account import Account
+
+    if user.role != Role.ADVISOR:
+        raise ForbiddenException(
+            "Only an advisor can create an asset on behalf of an investor.",
+            code="ADVISOR_ROLE_REQUIRED",
+        )
+
+    grant = (await db.execute(
+        select(AssetDelegationGrant)
+        .where(
+            AssetDelegationGrant.investor_id == on_behalf_of,
+            AssetDelegationGrant.advisor_id == user.id,
+            AssetDelegationGrant.status == GrantStatus.ACTIVE.value,
+        )
+        .with_for_update()
+    )).scalar_one_or_none()
+
+    if grant is None or not grant_is_usable(grant, datetime.now(timezone.utc)):
+        raise ForbiddenException(
+            "You do not have an active authorisation to add an asset for this investor.",
+            # Literal on purpose — see the note in advisor.py's NOT_YOUR_CLIENT
+            # raise: the drift guard only sees string literals at raise sites.
+            code="NO_ACTIVE_GRANT",
+        )
+
+    account = (await db.execute(
+        select(Account).where(Account.user_id == on_behalf_of)
+    )).scalar_one_or_none()
+    if not account:
+        raise NotFoundException("Account", str(on_behalf_of))
+
+    return account, grant
+
+
+def consume_creation_grant(grant: AssetDelegationGrant, asset_id) -> None:
+    """Mark the grant spent on `asset_id`.
+
+    Caller must invoke this BEFORE its commit so the asset row and the consumed
+    grant land in the same transaction -- otherwise a crash in between would
+    leave a grant that can be spent twice.
+    """
+    grant.status = GrantStatus.CONSUMED.value
+    grant.asset_id = asset_id
+    grant.consumed_at = datetime.now(timezone.utc)
+
+
+async def resolve_asset_actor_context(db: AsyncSession, user: User, asset_id):
+    """Who owns `asset_id`, and may `user` act on it? -> (owner_user, account, grant).
+
+    Returns the OWNER's user and account, so every downstream gate -- verified
+    status, subscription feature, KYB, per-plan limits -- is evaluated against
+    the investor who owns the asset rather than whoever is holding the keyboard.
+
+    Two ways to qualify:
+      * the caller owns the asset (unchanged behaviour), or
+      * the caller is the advisor who created it under a still-unlocked grant.
+
+    Raises NotFound if neither holds, matching the existing "asset not found
+    under your account" behaviour rather than leaking that the asset exists.
+    """
+    from app.models.account import Account
+    from app.models.asset import Asset
+
+    own_account = (await db.execute(
+        select(Account).where(Account.user_id == user.id)
+    )).scalar_one_or_none()
+
+    if own_account is not None:
+        owned = (await db.execute(
+            select(Asset).where(Asset.id == asset_id, Asset.account_id == own_account.id)
+        )).scalar_one_or_none()
+        if owned is not None:
+            return user, own_account, None
+
+    grant = await find_edit_grant(db, user, asset_id)
+    if grant is None:
+        raise NotFoundException("Asset", str(asset_id))
+
+    owner = (await db.execute(
+        select(User).where(User.id == grant.investor_id)
+    )).scalar_one_or_none()
+    owner_account = (await db.execute(
+        select(Account).where(Account.user_id == grant.investor_id)
+    )).scalar_one_or_none()
+    if owner is None or owner_account is None:
+        raise NotFoundException("Account", str(grant.investor_id))
+
+    return owner, owner_account, grant
+
+
+async def find_edit_grant(db: AsyncSession, user: User, asset_id):
+    """The grant letting `user` still edit `asset_id`, if any.
+
+    CONSUMED means "created, not yet confirmed by the investor" -- decision D1,
+    so the advisor can fix a typo without a fresh admin-approved request. LOCKED
+    and REVOKED both end edit rights; the advisor keeps read access via
+    /advisor/clients/{id}/assets either way.
+    """
+    return (await db.execute(
+        select(AssetDelegationGrant).where(
+            AssetDelegationGrant.asset_id == asset_id,
+            AssetDelegationGrant.advisor_id == user.id,
+            AssetDelegationGrant.status == GrantStatus.CONSUMED.value,
+        )
+    )).scalar_one_or_none()
+
+
 # -- Investor endpoints -------------------------------------------------------
 
 class CreateRequestBody(BaseModel):
@@ -321,6 +444,59 @@ async def list_delegation_grants(
         item["is_usable"] = grant_is_usable(grant, now)
         data.append(item)
     return {"success": True, "data": data}
+
+
+@grants_router.post("/{grant_id}/lock", response_model=Dict[str, Any])
+async def lock_delegation_grant(
+    grant_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """"Confirm & lock" -- the investor accepts the asset the advisor entered.
+
+    This is the second half of decision D1: the advisor kept EDIT after creating
+    the asset so typos could be fixed without a fresh admin-approved request,
+    and this call ends that window. The advisor keeps READ access to the asset
+    via /advisor/clients/{id}/assets.
+    """
+    from app.models.notification import NotificationType
+    from app.services.activity_service import log_activity
+    from app.services.notification_service import NotificationService
+
+    grant = (await db.execute(
+        select(AssetDelegationGrant).where(AssetDelegationGrant.id == grant_id).with_for_update()
+    )).scalar_one_or_none()
+    if not grant:
+        raise NotFoundException("AssetDelegationGrant", str(grant_id))
+
+    is_owner = str(grant.investor_id) == str(current_user.id)
+    if not (is_owner or current_user.role == Role.ADMIN):
+        raise ForbiddenException(
+            "Only the investor or an admin can confirm this asset.",
+            code="CANNOT_LOCK_GRANT",
+        )
+    if grant.status != GrantStatus.CONSUMED.value:
+        raise BadRequestException(
+            f"Only an asset awaiting confirmation can be locked (this one is {grant.status})."
+        )
+
+    grant.status = GrantStatus.LOCKED.value
+    await db.commit()
+    await db.refresh(grant)
+
+    await log_activity(
+        db, current_user.id, grant.investor_id, "asset.confirmed_locked",
+        entity_type="asset", entity_id=grant.asset_id,
+        summary="Investor confirmed the asset; advisor edit access ended",
+        meta={"grant_id": str(grant.id)},
+    )
+    await NotificationService.notify_user(
+        db, grant.advisor_id, NotificationType.GENERAL, "Asset confirmed",
+        "Your client confirmed the asset you added. It is now read-only for you.",
+        None)
+
+    logger.info(f"User {current_user.id} locked delegation grant {grant.id}")
+    return {"success": True, "data": serialize_grant(grant)}
 
 
 @grants_router.post("/{grant_id}/revoke", response_model=Dict[str, Any])

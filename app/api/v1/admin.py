@@ -2122,6 +2122,34 @@ async def _get_or_create_advisor_chat(db: AsyncSession, advisor, client):
     return conv
 
 
+async def _ensure_chat_participants(db: AsyncSession, conversation_id, *users) -> None:
+    """Make sure each user can actually post in this conversation.
+
+    Reusing an existing advisor<->investor thread is only safe if the CURRENT
+    advisor is a participant. Legacy threads were created for whoever the
+    advisor was at the time, so after a reassignment the new advisor gets
+    403 "User not part of this conversation" on their own client's chat.
+
+    Adds only what is missing; the previous advisor is deliberately left in
+    place so the history keeps its authorship.
+    """
+    from app.models.chat import ConversationParticipant, ParticipantRole
+
+    existing_ids = {
+        row for row in (await db.execute(
+            select(ConversationParticipant.user_id)
+            .where(ConversationParticipant.conversation_id == conversation_id)
+        )).scalars().all()
+    }
+    for user in users:
+        if user and user.id not in existing_ids:
+            db.add(ConversationParticipant(
+                conversation_id=conversation_id,
+                user_id=user.id,
+                role=ParticipantRole.PARTICIPANT,
+            ))
+
+
 class AssignClientBody(BaseModel):
     investor_id: UUID
 
@@ -2925,6 +2953,116 @@ async def admin_marketplace_highlights(
     }
 
 
+# -- Advisor <-> investor relationship oversight ------------------------------
+# The admin equivalent of an advisor's "My Clients": every pairing on the
+# platform, how active the relationship is, and who still has no advisor.
+
+@router.get("/advisor-clients/unassigned", response_model=Dict[str, Any])
+async def admin_list_unassigned_investors(
+    search: Optional[str] = Query(None),
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Investors with no advisor — the queue of who still needs assigning.
+
+    Declared before any /advisor-clients/{...} route so "unassigned" is never
+    swallowed as a path parameter.
+    """
+    from sqlalchemy import or_
+    from app.models.advisor_client import AdvisorClient
+
+    assigned = select(AdvisorClient.client_id)
+    stmt = select(User).where(User.role == Role.INVESTOR, User.id.notin_(assigned))
+    if search:
+        like = f"%{search}%"
+        stmt = stmt.where(or_(
+            User.first_name.ilike(like), User.last_name.ilike(like), User.email.ilike(like)
+        ))
+
+    rows = (await db.execute(stmt.order_by(User.created_at.desc()))).scalars().all()
+    return {
+        "success": True,
+        "data": [{
+            "id": str(u.id),
+            "name": _full_name(u),
+            "email": u.email,
+            "is_active": u.is_active,
+            "created_at": u.created_at.isoformat() if u.created_at else None,
+        } for u in rows],
+        "total": len(rows),
+    }
+
+
+@router.get("/advisor-clients", response_model=Dict[str, Any])
+async def admin_list_advisor_clients_roster(
+    search: Optional[str] = Query(None, description="Matches either party's name or email"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Every advisor<->investor pairing, with how alive the relationship is.
+
+    `message_count` / `last_message_at` come from the auto-created chat and are
+    the cheapest honest signal of whether a pairing is actually being worked.
+    """
+    from sqlalchemy import or_
+    from app.models.advisor_client import AdvisorClient
+    from app.models.chat import Message
+
+    Advisor = aliased(User)
+    Investor = aliased(User)
+
+    stmt = (
+        select(AdvisorClient, Advisor, Investor)
+        .join(Advisor, AdvisorClient.advisor_id == Advisor.id)
+        .join(Investor, AdvisorClient.client_id == Investor.id)
+    )
+    if search:
+        like = f"%{search}%"
+        stmt = stmt.where(or_(
+            Advisor.first_name.ilike(like), Advisor.last_name.ilike(like), Advisor.email.ilike(like),
+            Investor.first_name.ilike(like), Investor.last_name.ilike(like), Investor.email.ilike(like),
+        ))
+
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar() or 0
+
+    rows = (await db.execute(
+        stmt.order_by(AdvisorClient.created_at.desc())
+        .offset((page - 1) * page_size).limit(page_size)
+    )).all()
+
+    # One aggregate query for all conversations on this page, not N per row.
+    conv_ids = [ac.conversation_id for ac, _, _ in rows if ac.conversation_id]
+    stats: Dict[str, Dict[str, Any]] = {}
+    if conv_ids:
+        for cid, count, last in (await db.execute(
+            select(Message.conversation_id, func.count(Message.id), func.max(Message.timestamp))
+            .where(Message.conversation_id.in_(conv_ids))
+            .group_by(Message.conversation_id)
+        )).all():
+            # Key on str() so the lookup can't depend on the driver handing back
+            # the same Python type as AdvisorClient.conversation_id — a mismatched
+            # key would silently read as "no messages" rather than erroring.
+            stats[str(cid)] = {"count": count or 0, "last": last}
+
+    data = []
+    for ac, advisor, investor in rows:
+        s = stats.get(str(ac.conversation_id), {})
+        last = s.get("last")
+        data.append({
+            "id": str(ac.id),
+            "advisor": {"id": str(advisor.id), "name": _full_name(advisor), "email": advisor.email},
+            "investor": {"id": str(investor.id), "name": _full_name(investor), "email": investor.email},
+            "conversation_id": str(ac.conversation_id) if ac.conversation_id else None,
+            "message_count": s.get("count", 0),
+            "last_message_at": last.isoformat() if last else None,
+            "assigned_at": ac.created_at.isoformat() if ac.created_at else None,
+        })
+
+    return {"success": True, "data": data, "total": total, "page": page, "page_size": page_size}
+
+
 # -- Advisor requests (delegated asset creation, Milestone 1) -----------------
 
 class ApproveAdvisorRequestBody(BaseModel):
@@ -3030,16 +3168,26 @@ async def admin_approve_advisor_request(
         select(AdvisorClient).where(AdvisorClient.client_id == investor.id)
     )).scalar_one_or_none()
 
-    conv = await _get_or_create_advisor_chat(db, advisor, investor)
-    if existing and existing.advisor_id != advisor.id:
-        existing.advisor_id = advisor.id
-        existing.conversation_id = conv.id
-        existing.assigned_by = current_user.id
-    elif not existing:
-        db.add(AdvisorClient(
-            advisor_id=advisor.id, client_id=investor.id,
-            conversation_id=conv.id, assigned_by=current_user.id,
-        ))
+    # NB: _get_or_create_advisor_chat always CREATES (there is no "get" in it),
+    # so calling it unconditionally would spawn an orphan conversation on every
+    # re-approval and leave advisor_clients.conversation_id pointing at the old
+    # thread -- which then reads as "0 messages" everywhere. Only create when
+    # this pairing has no usable thread, and always keep the row in sync.
+    if existing and existing.advisor_id == advisor.id and existing.conversation_id:
+        conv_id = existing.conversation_id          # same pairing: keep the history
+        # ...but the thread may predate this advisor, so repair membership.
+        await _ensure_chat_participants(db, conv_id, advisor, investor)
+    else:
+        conv_id = (await _get_or_create_advisor_chat(db, advisor, investor)).id
+        if existing:
+            existing.advisor_id = advisor.id
+            existing.conversation_id = conv_id
+            existing.assigned_by = current_user.id
+        else:
+            db.add(AdvisorClient(
+                advisor_id=advisor.id, client_id=investor.id,
+                conversation_id=conv_id, assigned_by=current_user.id,
+            ))
 
     # Supersede any live grant for this pair so the partial unique index holds.
     stale = (await db.execute(
@@ -3076,7 +3224,7 @@ async def admin_approve_advisor_request(
         "event": "advisor_request_approved",
         "request_id": str(req.id),
         "grant_id": str(grant.id),
-        "conversation_id": str(conv.id),
+        "conversation_id": str(conv_id),
     })
     await NotificationService.notify_user(
         db, advisor.id, NotificationType.GENERAL, "You're authorised to add an asset",
@@ -3094,7 +3242,7 @@ async def admin_approve_advisor_request(
         "data": {
             "request": serialize_request(req, advisor),
             "grant": serialize_grant(grant, advisor, investor),
-            "conversation_id": str(conv.id),
+            "conversation_id": str(conv_id),
         },
     }
 

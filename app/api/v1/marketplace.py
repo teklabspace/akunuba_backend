@@ -324,22 +324,32 @@ async def create_listing(
     from app.models.kyb import KYBVerification, KYBStatus
     from sqlalchemy import func
     
-    if not current_user.is_verified:
+    # Resolve WHOSE listing this is: the caller's own, or -- when an advisor is
+    # acting under a still-unlocked delegation grant -- their client's. Every
+    # gate below (verified, subscription feature, KYB, listing limit) is then
+    # evaluated against the OWNER, since the listing and its fees are theirs.
+    # Checking the advisor instead would let an unverified or unsubscribed
+    # client get listed on the back of their advisor's standing.
+    from app.api.v1.delegation import resolve_asset_actor_context
+    owner_user, account, _grant = await resolve_asset_actor_context(
+        db, current_user, listing_data.asset_id
+    )
+
+    if not owner_user.is_verified:
         raise UnauthorizedException("User must be verified to create listings")
-    
-    account = await get_account(current_user=current_user, db=db)
+
     plan = await get_user_subscription_plan(account=account, db=db)
-    
+
     # Check subscription feature
     if not has_feature(plan, Feature.MARKETPLACE_LIST):
         raise ForbiddenException("Marketplace listing creation requires a paid subscription")
-    
+
     # Check KYB for corporate/trust accounts
     from app.services.account_restrictions_service import AccountRestrictionsService
     await AccountRestrictionsService.require_kyb_verification(db, account, "create marketplace listings")
-    
+
     # Check usage limit — admins are exempt
-    if current_user.role.value != "admin":
+    if owner_user.role.value != "admin":
         active_listings_count = await db.execute(
             select(func.count(MarketplaceListing.id)).where(
                 MarketplaceListing.account_id == account.id,
@@ -682,6 +692,19 @@ async def approve_listing(
         raise NotFoundException("Listing", str(listing_id))
 
     await _assert_can_moderate_listing(db, current_user, listing)
+
+    # Segregation of duties: an advisor who entered this asset under a delegation
+    # grant must not also wave it onto the public marketplace -- that would be
+    # create, appraise, list AND approve with no independent check anywhere.
+    # Another advisor or an admin approves instead.
+    if current_user.role == Role.ADVISOR:
+        from app.api.v1.delegation import find_edit_grant
+        if await find_edit_grant(db, current_user, listing.asset_id) is not None:
+            raise ForbiddenException(
+                "You added this asset for your client, so it must be approved by "
+                "someone else.",
+                code="SELF_APPROVAL_FORBIDDEN",
+            )
 
     asset = (await db.execute(
         select(Asset).where(Asset.id == listing.asset_id)

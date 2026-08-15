@@ -398,14 +398,26 @@ async def create_asset(
     db: AsyncSession = Depends(get_db)
 ):
     """Create a new asset with category-based fields"""
-    ensure_investor_can_write_assets(current_user)
+    # Two ways in: the investor creating their own asset (the original rule), or
+    # an advisor spending a single-use grant to create ONE asset for a client
+    # (Milestone 2). The delegated branch resolves the INVESTOR's account, so
+    # ownership and the plan/asset limit below are charged to the investor and
+    # never to the advisor.
+    delegation_grant = None
     try:
-        # Get user's account
-        account = await get_account(current_user=current_user, db=db)
+        if asset_data.on_behalf_of is not None:
+            from app.api.v1.delegation import acquire_creation_grant
+            account, delegation_grant = await acquire_creation_grant(
+                db, current_user, asset_data.on_behalf_of
+            )
+        else:
+            ensure_investor_can_write_assets(current_user)
+            account = await get_account(current_user=current_user, db=db)
+
         plan = await get_user_subscription_plan(account=account, db=db)
 
-        # Check usage limit (the role gate above guarantees an investor here,
-        # so the former admin exemption is moot)
+        # Check usage limit against the OWNING account (the investor's, when
+        # delegated) -- the gates above guarantee a non-staff owner here.
         assets_count = await db.execute(
             select(func.count(Asset.id)).where(Asset.account_id == account.id)
         )
@@ -671,6 +683,12 @@ async def create_asset(
         for document in document_rows:
             document.asset_id = asset.id
 
+        # Spend the grant in the SAME transaction as the asset insert, so a
+        # crash in between can never leave a grant that is spendable twice.
+        if delegation_grant is not None:
+            from app.api.v1.delegation import consume_creation_grant
+            consume_creation_grant(delegation_grant, asset.id)
+
         await db.commit()
 
         # Reload asset with all relationships for full response
@@ -686,6 +704,27 @@ async def create_asset(
         asset = result.scalar_one()
 
         logger.info(f"Asset created: {asset.id} for account {account.id}")
+
+        if delegation_grant is not None:
+            # An advisor acting for a client is exactly the kind of action the
+            # audit log exists for -- and the owner must be told, not discover
+            # a new asset on their dashboard unannounced.
+            from app.models.notification import NotificationType
+            from app.services.activity_service import log_activity
+            from app.services.notification_service import NotificationService
+
+            await log_activity(
+                db, current_user.id, asset_data.on_behalf_of, "asset.created_on_behalf",
+                entity_type="asset", entity_id=asset.id,
+                summary=f"Advisor created asset '{asset.name}' on your behalf",
+                meta={"grant_id": str(delegation_grant.id)},
+            )
+            await NotificationService.notify_user(
+                db, asset_data.on_behalf_of, NotificationType.GENERAL,
+                "An asset was added for you",
+                f"Your advisor added '{asset.name}'. Review it and confirm to lock the details.",
+                None,
+            )
 
         # NOTE: assets are NOT auto-published to the marketplace on creation.
         # A listing only becomes public after staff (admin/advisor) complete a
@@ -1218,14 +1257,26 @@ async def update_asset(
     db: AsyncSession = Depends(get_db)
 ):
     """Update an asset - all fields are optional"""
-    ensure_investor_can_write_assets(current_user)
+    # An advisor who created this asset under a grant keeps EDIT until the
+    # investor confirms it (decision D1) -- otherwise fixing a typo would need
+    # a whole new admin-approved request. Once LOCKED or REVOKED, the grant no
+    # longer matches and the advisor falls back to read-only.
+    from app.api.v1.delegation import find_edit_grant
+    edit_grant = await find_edit_grant(db, current_user, asset_id)
+
+    if edit_grant is None:
+        ensure_investor_can_write_assets(current_user)
+        owner_user_id = current_user.id
+    else:
+        owner_user_id = edit_grant.investor_id
+
     account_result = await db.execute(
-        select(Account).where(Account.user_id == current_user.id)
+        select(Account).where(Account.user_id == owner_user_id)
     )
     account = account_result.scalar_one_or_none()
-    
+
     if not account:
-        raise NotFoundException("Account", str(current_user.id))
+        raise NotFoundException("Account", str(owner_user_id))
     
     result = await db.execute(
         select(Asset).where(
@@ -2217,7 +2268,11 @@ async def request_asset_appraisal(
     - any other type (e.g. "Concierge"): a human appraisal request, created as
       PENDING for the concierge workflow (unchanged behaviour).
     """
-    account = await get_account(current_user=current_user, db=db)
+    # Owner, or the advisor who created this asset under a still-unlocked grant.
+    # `account` is always the OWNER's, so the AI-appraisal usage limit below is
+    # charged to the investor's plan rather than the advisor's.
+    from app.api.v1.delegation import resolve_asset_actor_context
+    _owner_user, account, _grant = await resolve_asset_actor_context(db, current_user, asset_id)
 
     # Verify asset belongs to account, eagerly loading category for type-specific AI prompts
     asset_result = await db.execute(

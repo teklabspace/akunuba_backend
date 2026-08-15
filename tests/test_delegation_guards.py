@@ -164,6 +164,27 @@ def test_admin_decision_routes_use_the_decidable_guard():
         )
 
 
+def test_approval_reuses_an_existing_chat_instead_of_orphaning_it():
+    """_get_or_create_advisor_chat always CREATES -- it never "gets".
+
+    Calling it unconditionally on re-approval spawns a fresh conversation while
+    advisor_clients.conversation_id still points at the old one, so the chat
+    reads as empty everywhere it is surfaced. Approval must reuse the existing
+    thread for an unchanged pairing and keep the row in sync otherwise.
+    """
+    import inspect
+
+    from app.api.v1.admin import admin_approve_advisor_request
+
+    source = inspect.getsource(admin_approve_advisor_request)
+    assert "existing.advisor_id == advisor.id and existing.conversation_id" in source, (
+        "approval does not reuse the existing conversation for an unchanged pairing"
+    )
+    assert "existing.conversation_id = conv_id" in source, (
+        "approval does not resync advisor_clients.conversation_id on reassignment"
+    )
+
+
 def test_approval_issues_a_grant_and_reuses_the_existing_chat_helper():
     import inspect
 

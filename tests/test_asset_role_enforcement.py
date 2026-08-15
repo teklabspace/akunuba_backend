@@ -89,6 +89,35 @@ def test_all_asset_write_routes_call_the_gate():
         )
 
 
+def test_delegated_creation_is_the_only_exception_to_the_investor_rule():
+    """Milestone 2 (2026-08-14) narrowed the rule above, deliberately.
+
+    create_asset and update_asset now call the investor gate only on their
+    non-delegated branch, so the string assertion above still passes but no
+    longer proves those two routes are investor-only. These assertions pin the
+    replacement rule: the delegated branch is reachable ONLY by spending a grant.
+    """
+    create_src = inspect.getsource(create_asset)
+    assert "acquire_creation_grant(" in create_src, (
+        "delegated creation must go through the grant helper, not an ad-hoc check"
+    )
+    assert "consume_creation_grant(" in create_src, "the grant must be spent on create"
+    # Consumption has to happen inside the asset's own transaction.
+    assert create_src.index("consume_creation_grant(") < create_src.index("await db.commit()"), (
+        "grant consumed after commit — a crash between the two would let it be spent twice"
+    )
+
+    update_src = inspect.getsource(update_asset)
+    assert "find_edit_grant(" in update_src, "delegated edit must be gated on a live grant"
+
+
+def test_delete_stays_owner_only_even_for_a_delegate():
+    """An advisor must never be able to delete a client's asset."""
+    source = inspect.getsource(delete_asset)
+    assert "ensure_investor_can_write_assets(current_user)" in source
+    assert "find_edit_grant" not in source, "delete_asset must not honour a delegation grant"
+
+
 def _run_standalone():
     failures = 0
     for name, fn in sorted(globals().items()):
