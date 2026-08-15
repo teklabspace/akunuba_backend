@@ -53,6 +53,12 @@ class _AcquisitionDateGuard(BaseModel):
 
 
 class AssetCreate(_AcquisitionDateGuard):
+    # Delegated creation (Milestone 2): an advisor creating this asset FOR an
+    # investor puts the investor's user id here. Requires an ACTIVE grant, and
+    # the asset -- plus its plan/limit usage -- belongs to that investor, not
+    # to the advisor.
+    on_behalf_of: Optional[UUID] = None
+
     # Category-based fields (new approach)
     category: Optional[str] = None  # Category name
     category_id: Optional[UUID] = None  # Category ID

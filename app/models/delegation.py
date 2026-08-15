@@ -24,8 +24,9 @@ class AdvisorRequestStatus(str, enum.Enum):
 
 
 class GrantStatus(str, enum.Enum):
-    ACTIVE = "active"
-    CONSUMED = "consumed"
+    ACTIVE = "active"        # issued; the advisor may create ONE asset
+    CONSUMED = "consumed"    # asset created; advisor still holds EDIT on it (D1)
+    LOCKED = "locked"        # investor confirmed; advisor drops to read-only
     REVOKED = "revoked"
     EXPIRED = "expired"
 
