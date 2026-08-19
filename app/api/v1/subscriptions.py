@@ -558,7 +558,7 @@ async def create_subscription(
 
 
 async def reconcile_incomplete_with_stripe(db, subscription) -> None:
-    """Self-heal an INCOMPLETE row when Stripe says the customer already paid.
+    """Re-read Stripe and make the local row agree with it.
 
     Activation normally arrives via the invoice.payment_succeeded webhook, but a
     missed/delayed webhook left paid users stuck on the frontend's "checking
@@ -566,6 +566,11 @@ async def reconcile_incomplete_with_stripe(db, subscription) -> None:
     production incident: the Stripe webhook endpoint was disabled). Called from
     GET /subscriptions so the very poll the frontend is already doing performs
     the recovery. Best-effort: never raises into the caller.
+
+    Serves two cases. An INCOMPLETE row gets promoted once Stripe says it is paid.
+    An ACTIVE row gets its plan re-synced — an upgrade whose proration needed card
+    confirmation leaves the row ACTIVE on the OLD plan, so the promote-only check
+    skipped it entirely and nothing but the webhook could ever flip the plan.
     """
     try:
         stripe_sub = StripeClient.retrieve_subscription(subscription.stripe_subscription_id)
@@ -598,7 +603,8 @@ async def reconcile_incomplete_with_stripe(db, subscription) -> None:
         await db.commit()
         logger.info(
             f"Reconciled subscription {subscription.id}: Stripe says {stripe_status}, "
-            f"promoted INCOMPLETE -> ACTIVE (webhook was missed)"
+            f"now {subscription.plan_tier}/{subscription.billing_cycle} "
+            f"(webhook was missed or late)"
         )
     elif stripe_status == "canceled":
         subscription.status = SubscriptionStatus.CANCELLED
@@ -613,6 +619,7 @@ async def reconcile_incomplete_with_stripe(db, subscription) -> None:
 
 @router.get("")
 async def get_subscription(
+    sync: bool = False,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -667,9 +674,14 @@ async def get_subscription(
 
     # Self-heal a paid-but-stuck row before reporting status: if the activation
     # webhook was missed, the frontend's own status poll performs the recovery.
-    if (
-        subscription.status == SubscriptionStatus.INCOMPLETE
-        and subscription.stripe_subscription_id
+    #
+    # An INCOMPLETE row is always worth checking — the user is by definition waiting on
+    # a payment. An ACTIVE row is only re-synced when the caller passes ?sync=true, which
+    # the post-payment poll does: an upgrade awaiting confirmation stays ACTIVE on the old
+    # plan, so it needs the same recovery, but every routine dashboard load hits this
+    # endpoint too and must not pay for a Stripe round-trip.
+    if subscription.stripe_subscription_id and (
+        subscription.status == SubscriptionStatus.INCOMPLETE or sync
     ):
         await reconcile_incomplete_with_stripe(db, subscription)
 
@@ -1019,29 +1031,66 @@ async def upgrade_subscription(
     latest_invoice = stripe_sub.get("latest_invoice") or {}
     intent = latest_invoice.get("payment_intent") or {}
     client_secret = intent.get("client_secret")
+    intent_status = intent.get("status")
+
+    # `always_invoice` makes Stripe finalize the proration invoice and charge the
+    # subscription's saved default card (save_default_payment_method="on_subscription"
+    # put it there at purchase) before this call returns. So the intent is normally
+    # already `succeeded` — and Stripe refuses to let anyone confirm a settled intent.
+    # Handing back its client_secret regardless invited the frontend to try, and that
+    # refusal reached the user as a card error ("A processing error occurred.") above a
+    # live Pay button, for money already taken. Report the status so the client can poll
+    # for the webhook, but never a secret there is nothing left to do with.
+    settled = intent_status in ("succeeded", "processing")
 
     payment_intent = (
         {
             "id": intent.get("id"),
-            "client_secret": client_secret,
-            "status": intent.get("status"),
+            "client_secret": None if settled else client_secret,
+            "status": intent_status,
             "amount": float((Decimal(latest_invoice.get("amount_due") or 0)) / Decimal(100)),
         }
-        if client_secret
+        if intent.get("id")
         else None
     )
 
-    # Deliberately do NOT mutate plan_tier / amount / period here. Stripe has issued a
-    # proration invoice; customer.subscription.updated syncs local state from the price
-    # metadata once it is paid. Writing the new plan now would grant it before the money
-    # moves — that was the third door into free access.
+    # The plan is granted only once the money has actually moved — writing it any
+    # earlier was the third door into free access. But `always_invoice` bills the
+    # proration inline, so by the time we get here Stripe has usually ALREADY charged
+    # the saved default card. In that case there is nothing left to wait for, and
+    # recording the new plan is not granting it early: it is the payment landing.
+    #
+    # This used to be left entirely to customer.subscription.updated, which stranded
+    # paid upgrades on the frontend's "activating your plan" screen whenever that
+    # webhook was slow or disabled (a real production incident — see
+    # reconcile_incomplete_with_stripe). GET /subscriptions self-heals a stuck row, but
+    # only an INCOMPLETE one; an upgrade leaves the row ACTIVE, so that recovery never
+    # covered this path and the screen never resolved.
+    #
+    # Record the plan we just told Stripe to bill rather than reading it back off the
+    # price metadata: it is the same plan, and unlike the metadata it cannot come back
+    # empty. The webhook stays authoritative and simply re-applies the same values.
+    proration_paid = intent_status == "succeeded" or (
+        not intent.get("id") and (latest_invoice.get("amount_due") or 0) == 0
+    )
+    if proration_paid:
+        subscription.plan = PLAN_ID_TO_ENUM.get(new_plan_id, subscription.plan)
+        subscription.plan_tier = new_plan_id
+        subscription.billing_cycle = new_billing_cycle
+        subscription.amount = new_amount
+        logger.info(
+            f"Upgrade paid inline for subscription {subscription.id}: "
+            f"{current_plan_id} -> {new_plan_id} ({new_billing_cycle})"
+        )
+
     subscription.cancel_at_period_end = False
     subscription.cancelled_at = None
 
     await db.commit()
     await db.refresh(subscription)
 
-    # Reports the CURRENT plan, not the requested one. The requested plan lands via webhook.
+    # Reports whatever is now true locally: the new plan when the proration was paid
+    # inline above, otherwise still the old one until its invoice is paid.
     current_plan_id = get_plan_tier(subscription)
     current_config = PLANS_CONFIG.get(current_plan_id, PLANS_CONFIG["starter"])
     subscription_response = SubscriptionResponse(
