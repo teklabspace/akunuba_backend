@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Boolean, DateTime, Enum as SQLEnum, ForeignKey
+from sqlalchemy import Column, String, Boolean, DateTime, Numeric, Enum as SQLEnum, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -26,6 +26,10 @@ class Account(Base):
     # Stripe customer id. Lives on the account, not the subscription: a customer
     # outlives any single subscription, and payment history keys on it after cancel.
     stripe_customer_id = Column(String(255), index=True)
+    # Settled trading cash. Debited by buys, credited by sells and bank
+    # deposits; every change is mirrored into cash_transactions. Distinct from
+    # the Plaid bank balances on linked_accounts. See app/services/cash_ledger.py.
+    cash_balance = Column(Numeric(20, 2), nullable=False, server_default="0.00", default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

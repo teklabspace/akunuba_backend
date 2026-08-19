@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query, Body, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, or_, desc
 from sqlalchemy.orm import selectinload
-from typing import List, Optional, Dict, Any
+from typing import List, Literal, Optional, Dict, Any
 from decimal import Decimal
 from datetime import datetime, timezone
 from app.database import get_db
@@ -68,6 +68,25 @@ class AppraisalValuationUpdate(BaseModel):
     appraised_value: Decimal
     valuation_date: str  # YYYY-MM-DD
     currency: str = "USD"
+    # Listing details for the marketplace publish this finalize call triggers
+    # (see maybe_publish_valued_asset). Required, not optional: manual listing
+    # was removed, so finalize-time is the only place these are ever set, and
+    # finalizing already auto-publishes whenever a valuation document is
+    # attached -- leaving these optional would just move the "N/A listing"
+    # bug here instead of closing it. 422 (missing-field), same as
+    # appraised_value, if any is omitted.
+    expected_return: str          # e.g. "8.5%"
+    duration: str                 # e.g. "36 months"
+    risk_level: Literal["low", "medium", "high"]
+    slots_total: int
+
+    class Config:
+        # A prior version of this model silently dropped these same four
+        # fields (unknown keys were ignored, not rejected) -- staff finalized
+        # valuations, got a 200, and never knew the listing details they
+        # entered were discarded. forbid so any future field-name mismatch
+        # 422s loudly instead of repeating that failure mode.
+        extra = "forbid"
 
 
 class AppraisalResponse(BaseModel):
@@ -344,6 +363,10 @@ async def update_appraisal_status(
         if is_open_human_appraisal(appraisal.appraisal_type, appraisal.status):
             await suspend_listing_for_open_appraisal(db, appraisal.asset_id, appraisal)
         elif appraisal.status == AppraisalStatus.COMPLETED:
+            # No listing `details` from this endpoint -- if nothing is
+            # published yet, maybe_publish_valued_asset holds off rather than
+            # going live blank, and waits for PUT .../valuation (which
+            # requires them) to actually publish.
             await maybe_publish_valued_asset(db, appraisal, current_user)
         else:
             await restore_listing_after_appraisal(db, appraisal.asset_id, appraisal)
@@ -512,7 +535,11 @@ async def upload_appraisal_documents(
     logger.info(f"User {current_user.id} uploaded {len(created)} document(s) to appraisal {appraisal_id}")
 
     # If staff just attached the valuation document, and the amount is already
-    # set, this auto-publishes the asset to the marketplace (idempotent).
+    # set, this auto-publishes the asset to the marketplace (idempotent). No
+    # listing `details` from this endpoint (it's a multi-file upload, not a
+    # details form) -- see maybe_publish_valued_asset's docstring for why that's
+    # safe: a first-time publish holds off without them rather than going live
+    # blank, and waits for PUT .../valuation (which requires them) instead.
     if is_staff and effective_doc_type == "valuation":
         from app.services.asset_listing_service import maybe_publish_valued_asset
         await maybe_publish_valued_asset(db, appraisal, current_user)
@@ -809,7 +836,12 @@ async def update_appraisal_valuation(
     # Amount is now saved; if a valuation document is already attached this
     # auto-publishes the asset to the marketplace (idempotent, never raises).
     from app.services.asset_listing_service import maybe_publish_valued_asset
-    await maybe_publish_valued_asset(db, appraisal, current_user)
+    await maybe_publish_valued_asset(db, appraisal, current_user, details={
+        "expected_return": valuation_data.expected_return,
+        "duration": valuation_data.duration,
+        "risk_level": valuation_data.risk_level,
+        "slots_total": valuation_data.slots_total,
+    })
 
     # Notify the asset owner (bell + email) that their appraisal completed.
     try:

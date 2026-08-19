@@ -11,6 +11,7 @@ from app.integrations.alpaca_client import AlpacaClient
 from app.core.exceptions import NotFoundException, BadRequestException, ForbiddenException
 from app.api.deps import get_account, get_user_subscription_plan
 from app.core.features import Feature, has_feature
+from app.services.cash_ledger import apply_delta
 from app.utils.logger import logger
 from pydantic import BaseModel
 
@@ -204,10 +205,17 @@ async def get_alpaca_account(
                 "status": getattr(alpaca_account, "status", "")
             }
         
+        # Cash and buying power come from the caller's OWN ledger. The Alpaca
+        # client runs on app-level credentials — one shared paper account — so
+        # its cash figure was identical for every user and never moved when
+        # they traded. Broker-level flags below are still Alpaca's.
+        own_cash = float(apply_delta(account.cash_balance, 0))
+
         return {
             "account_number": account_data.get("account_number", ""),
-            "buying_power": account_data.get("buying_power", 0),
-            "cash": account_data.get("cash", 0),
+            "buying_power": own_cash,
+            "cash": own_cash,
+            "broker_portfolio_value": account_data.get("portfolio_value", 0),
             "portfolio_value": account_data.get("portfolio_value", 0),
             "pattern_day_trader": account_data.get("pattern_day_trader", False),
             "trading_blocked": account_data.get("trading_blocked", False),

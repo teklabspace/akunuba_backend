@@ -16,6 +16,8 @@ from app.models.asset import (
 )
 from app.models.portfolio import Portfolio
 from app.models.order import Order, OrderHistory
+from app.models.cash import CashTransaction
+from app.models.portfolio_share import PortfolioShare
 from app.models.marketplace import MarketplaceListing, Offer, EscrowTransaction
 from app.models.payment import Payment, Refund, Invoice, Subscription
 from app.models.banking import LinkedAccount, Transaction

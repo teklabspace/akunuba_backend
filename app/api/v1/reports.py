@@ -20,6 +20,13 @@ from app.models.asset import AssetAppraisal, AppraisalStatus
 from app.core.exceptions import NotFoundException, BadRequestException
 from app.core.permissions import Permission, has_permission
 from app.services.net_worth import compute_net_worth, core_assets, breakdown_dict
+from app.services.report_export import (
+    RendererUnavailable,
+    UnsupportedFormat,
+    extension_for,
+    media_type_for,
+    render,
+)
 from app.utils.logger import logger
 from pydantic import BaseModel
 from uuid import UUID
@@ -543,12 +550,13 @@ async def generate_report(
                 ]
             }
         
-        # Store report data as JSON (for now, until we implement file generation)
+        # The payload is stored as JSON and rendered to the requested format on
+        # download (app/services/report_export.py), so re-exporting the same
+        # report in another format needs no regeneration.
         report.parameters = report_data_dict
         report.status = ReportStatus.COMPLETED
         report.generated_at = datetime.now(timezone.utc)
-        
-        # For now, we'll store the data. In production, you'd generate PDF/CSV/XLSX files
+
         report.file_url = f"/api/v1/reports/{report.id}/download"
         
     except Exception as e:
@@ -729,24 +737,33 @@ async def download_report(
     
     if report.status != ReportStatus.COMPLETED:
         raise BadRequestException("Report is not ready for download")
-    
-    # For now, return JSON data
-    # In production, you'd generate and return PDF/CSV/XLSX files
-    if report.format == ReportFormat.JSON:
-        return JSONResponse(
-            content=report.parameters or {},
-            headers={"Content-Disposition": f'attachment; filename="report_{report_id}.json"'}
-        )
-    else:
-        # For PDF/CSV/XLSX, you'd need to implement file generation
-        # For now, return JSON with a message
-        return JSONResponse(
-            content={
-                "message": f"File generation for {report.format.value} format not yet implemented",
-                "data": report.parameters or {}
-            },
-            headers={"Content-Disposition": f'attachment; filename="report_{report_id}.json"'}
-        )
+
+    # Render a real file in the format the report was generated for. Every
+    # format used to come back as JSON — pdf/csv/xlsx as a stub body reading
+    # "not yet implemented" under a .json filename.
+    export_format = report.format.value if report.format else "json"
+    try:
+        payload = render(report.parameters or {}, export_format)
+    except UnsupportedFormat as exc:
+        raise BadRequestException(str(exc), code="UNSUPPORTED_REPORT_FORMAT")
+    except RendererUnavailable as exc:
+        # Optional renderer dependency missing in this deployment.
+        logger.error(f"Report {report_id} renderer unavailable: {exc}")
+        raise BadRequestException(str(exc), code="UNSUPPORTED_REPORT_FORMAT")
+
+    report_label = report.report_type.value if report.report_type else "report"
+    filename = f"{report_label}_report_{report_id}.{extension_for(export_format)}"
+
+    # content-disposition: attachment also keeps the response out of the
+    # ResponseEnvelopeMiddleware wrapper (see app/main.py).
+    return StreamingResponse(
+        io.BytesIO(payload),
+        media_type=media_type_for(export_format),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(payload)),
+        },
+    )
 
 
 @router.get("/statistics", response_model=Dict[str, Any])

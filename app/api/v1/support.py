@@ -1,7 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Body, File, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Body, File, Response, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_, and_
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import selectinload, aliased
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone, timedelta
 from app.database import get_db
@@ -13,7 +13,9 @@ from app.models.ticket_reply import TicketReply
 from app.models.document import Document, DocumentType
 from app.integrations.supabase_client import SupabaseClient
 from app.core.exceptions import NotFoundException, BadRequestException
-from app.core.permissions import Role, Permission, has_permission
+from app.core.permissions import Permission, has_permission
+from app.services.ticket_scope import ticket_scope_for_role
+from app.services.ticket_aggregation import count_documents_by_ticket
 from app.utils.logger import logger
 from app.config import settings
 from uuid import UUID
@@ -35,20 +37,42 @@ def _display_name(user: Optional[User]) -> str:
     return name or (user.email or "User")
 
 
-def _ticket_dict(ticket: SupportTicket, requester: Optional[User]) -> dict:
-    """Enriched ticket row: adds the display ticket number + requester identity."""
+def _ticket_dict(
+    ticket: SupportTicket,
+    requester: Optional[User],
+    assignee: Optional[User] = None,
+    documents_count: int = 0,
+    replies_count: int = 0,
+) -> dict:
+    """Full ticket row: every column the UI needs, none behind a second call."""
     return {
         "id": ticket.id,
         "ticket_number": _ticket_code(ticket.ticket_number),
         "subject": ticket.subject,
+        "description": ticket.description,
         "status": ticket.status.value,
         "priority": ticket.priority.value,
+        "category": ticket.category,
         "created_at": ticket.created_at,
+        "updated_at": ticket.updated_at or ticket.created_at,
+        "resolved_at": ticket.resolved_at,
         "requester": {
             "id": requester.id if requester else None,
             "name": _display_name(requester),
             "email": requester.email if requester else None,
+            "avatar_url": requester.avatar_url if requester else None,
         },
+        "assignee": (
+            {
+                "id": assignee.id,
+                "name": _display_name(assignee),
+                "avatar_url": assignee.avatar_url,
+            }
+            if assignee else None
+        ),
+        "satisfaction_rating": ticket.satisfaction_rating,
+        "documents_count": documents_count,
+        "replies_count": replies_count,
     }
 
 
@@ -63,16 +87,31 @@ class TicketRequester(BaseModel):
     id: Optional[UUID] = None
     name: str
     email: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+
+class TicketAssignee(BaseModel):
+    id: UUID
+    name: str
+    avatar_url: Optional[str] = None
 
 
 class TicketResponse(BaseModel):
     id: UUID
     ticket_number: Optional[str] = None
     subject: str
+    description: str
     status: str
     priority: str
+    category: Optional[str] = None
     created_at: datetime
+    updated_at: datetime
+    resolved_at: Optional[datetime] = None
     requester: Optional[TicketRequester] = None
+    assignee: Optional[TicketAssignee] = None
+    satisfaction_rating: Optional[int] = None
+    documents_count: int = 0
+    replies_count: int = 0
 
     class Config:
         from_attributes = True
@@ -131,46 +170,153 @@ async def create_ticket(
     except Exception as e:
         logger.error(f"Failed to notify admins of new ticket {ticket.id}: {e}")
 
-    return _ticket_dict(ticket, current_user)
+    assignee = None
+    if ticket.assigned_to:
+        assignee = (await db.execute(
+            select(User).where(User.id == ticket.assigned_to)
+        )).scalar_one_or_none()
+
+    return _ticket_dict(ticket, current_user, assignee)
+
+
+async def _bulk_reply_documents_counts(
+    db: AsyncSession, ticket_ids: List[UUID], is_staff: bool
+) -> tuple[Dict[UUID, int], Dict[UUID, int]]:
+    """One round trip each for reply counts and document counts across a page of tickets."""
+    if not ticket_ids:
+        return {}, {}
+
+    reply_query = select(TicketReply.ticket_id, func.count(TicketReply.id)).where(
+        TicketReply.ticket_id.in_(ticket_ids)
+    )
+    if not is_staff:
+        # Investors shouldn't see internal-note activity bump their count.
+        reply_query = reply_query.where(TicketReply.is_internal == "false")
+    reply_rows = (await db.execute(reply_query.group_by(TicketReply.ticket_id))).all()
+    replies_count_map = {tid: cnt for tid, cnt in reply_rows}
+
+    meta_data_values = (await db.execute(
+        select(Document.meta_data).where(
+            or_(*[Document.meta_data.contains(f'"ticket_id": "{tid}"') for tid in ticket_ids])
+        )
+    )).scalars().all()
+    documents_count_map = count_documents_by_ticket(meta_data_values, ticket_ids)
+
+    return replies_count_map, documents_count_map
+
+
+@router.get("/tickets/stats")
+async def get_support_stats(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get support ticket statistics.
+
+    Declared above the ``/tickets/{ticket_id}`` route so FastAPI matches this
+    literal path first -- previously "stats" was parsed as a ticket UUID.
+    """
+    is_staff = has_permission(current_user.role, Permission.MANAGE_SUPPORT)
+
+    account = None
+    if not is_staff:
+        account_result = await db.execute(
+            select(Account).where(Account.user_id == current_user.id)
+        )
+        account = account_result.scalar_one_or_none()
+        if not account:
+            raise NotFoundException("Account", str(current_user.id))
+
+    scope_conds = [] if is_staff else [SupportTicket.account_id == account.id]
+
+    # Total tickets
+    total_result = await db.execute(
+        select(func.count(SupportTicket.id)).where(and_(*scope_conds))
+    )
+    total_tickets = total_result.scalar() or 0
+
+    # By status
+    status_result = await db.execute(
+        select(
+            SupportTicket.status,
+            func.count(SupportTicket.id).label("count")
+        ).where(and_(*scope_conds)).group_by(SupportTicket.status)
+    )
+    by_status = {
+        row.status.value: row.count
+        for row in status_result.all()
+    }
+
+    # By priority
+    priority_result = await db.execute(
+        select(
+            SupportTicket.priority,
+            func.count(SupportTicket.id).label("count")
+        ).where(and_(*scope_conds)).group_by(SupportTicket.priority)
+    )
+    by_priority = {
+        row.priority.value: row.count
+        for row in priority_result.all()
+    }
+
+    return {
+        "total_tickets": total_tickets,
+        "by_status": by_status,
+        "by_priority": by_priority
+    }
 
 
 @router.get("/tickets", response_model=List[TicketResponse])
 async def list_tickets(
+    response: Response,
     status: Optional[TicketStatus] = Query(None, description="Filter by status: open, in_progress, resolved, closed"),
     status_filter: Optional[TicketStatus] = Query(None, description="Alias of `status` (backward compatible)"),
+    priority: Optional[TicketPriority] = Query(None, description="Filter by priority: low, medium, high, urgent"),
     search: Optional[str] = Query(None, description="Case-insensitive match on subject or description"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=200),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """List support tickets, enriched with ticket number + requester identity.
 
-    Scope by role:
-      - staff (MANAGE_SUPPORT: admin, advisor) see all tickets;
+    Scope by role (see app.services.ticket_scope, shared with /support/analytics):
+      - admin sees every ticket;
+      - advisor sees tickets assigned to them;
       - everyone else (investor) sees only their own tickets.
-    `status`/`status_filter` and `search` behave identically for every role.
+    `status`/`status_filter`, `priority` and `search` behave identically for every role.
+    Paginated with `page`/`limit`; total row count comes back in `X-Total-Count`.
     """
-    account_result = await db.execute(
-        select(Account).where(Account.user_id == current_user.id)
-    )
-    account = account_result.scalar_one_or_none()
-
-    if not account:
-        raise NotFoundException("Account", str(current_user.id))
-
-    status_value = status or status_filter
     is_staff = has_permission(current_user.role, Permission.MANAGE_SUPPORT)
+    scope = ticket_scope_for_role(current_user.role)
 
+    account = None
+    if scope != "all":
+        account_result = await db.execute(
+            select(Account).where(Account.user_id == current_user.id)
+        )
+        account = account_result.scalar_one_or_none()
+        if not account:
+            raise NotFoundException("Account", str(current_user.id))
+
+    Assignee = aliased(User)
     # Join the requester (account -> user) so we can return their name/email.
     query = (
-        select(SupportTicket, User)
+        select(SupportTicket, User, Assignee)
         .join(Account, SupportTicket.account_id == Account.id)
         .join(User, Account.user_id == User.id)
+        .outerjoin(Assignee, SupportTicket.assigned_to == Assignee.id)
     )
 
-    if not is_staff:
+    if scope == "own":
         query = query.where(SupportTicket.account_id == account.id)
+    elif scope == "assigned":
+        query = query.where(SupportTicket.assigned_to == current_user.id)
+
+    status_value = status or status_filter
     if status_value:
         query = query.where(SupportTicket.status == status_value)
+    if priority:
+        query = query.where(SupportTicket.priority == priority)
     if search:
         term = f"%{search.strip()}%"
         query = query.where(or_(
@@ -178,8 +324,31 @@ async def list_tickets(
             SupportTicket.description.ilike(term),
         ))
 
-    result = await db.execute(query.order_by(SupportTicket.created_at.desc()))
-    return [_ticket_dict(ticket, requester) for ticket, requester in result.all()]
+    total = (await db.execute(
+        select(func.count()).select_from(query.subquery())
+    )).scalar() or 0
+    response.headers["X-Total-Count"] = str(total)
+
+    paged_query = (
+        query.order_by(SupportTicket.created_at.desc())
+        .offset((page - 1) * limit)
+        .limit(limit)
+    )
+    rows = (await db.execute(paged_query)).all()
+
+    ticket_ids = [ticket.id for ticket, _, _ in rows]
+    replies_count_map, documents_count_map = await _bulk_reply_documents_counts(
+        db, ticket_ids, is_staff
+    )
+
+    return [
+        _ticket_dict(
+            ticket, requester, assignee,
+            documents_count=documents_count_map.get(ticket.id, 0),
+            replies_count=replies_count_map.get(ticket.id, 0),
+        )
+        for ticket, requester, assignee in rows
+    ]
 
 
 @router.get("/tickets/{ticket_id}", response_model=TicketResponse)
@@ -189,11 +358,15 @@ async def get_ticket(
     db: AsyncSession = Depends(get_db)
 ):
     """Get a support ticket"""
-    account_result = await db.execute(
-        select(Account).where(Account.user_id == current_user.id)
-    )
-    account = account_result.scalar_one_or_none()
-    
+    is_staff = has_permission(current_user.role, Permission.MANAGE_SUPPORT)
+
+    account = None
+    if not is_staff:
+        account_result = await db.execute(
+            select(Account).where(Account.user_id == current_user.id)
+        )
+        account = account_result.scalar_one_or_none()
+
     result = await db.execute(
         select(SupportTicket).where(SupportTicket.id == ticket_id)
     )
@@ -203,17 +376,31 @@ async def get_ticket(
         raise NotFoundException("Ticket", str(ticket_id))
 
     # Check access
-    if not has_permission(current_user.role, Permission.MANAGE_SUPPORT):
-        if ticket.account_id != account.id:
+    if not is_staff:
+        if not account or ticket.account_id != account.id:
             raise HTTPException(status_code=403, detail="Access denied")
 
-    # Resolve the requester (owner of the ticket's account) for display.
+    # Resolve the requester (owner of the ticket's account) and assignee for display.
     requester = (await db.execute(
         select(User).join(Account, Account.user_id == User.id)
         .where(Account.id == ticket.account_id)
     )).scalar_one_or_none()
 
-    return _ticket_dict(ticket, requester)
+    assignee = None
+    if ticket.assigned_to:
+        assignee = (await db.execute(
+            select(User).where(User.id == ticket.assigned_to)
+        )).scalar_one_or_none()
+
+    replies_count_map, documents_count_map = await _bulk_reply_documents_counts(
+        db, [ticket.id], is_staff
+    )
+
+    return _ticket_dict(
+        ticket, requester, assignee,
+        documents_count=documents_count_map.get(ticket.id, 0),
+        replies_count=replies_count_map.get(ticket.id, 0),
+    )
 
 
 class TicketUpdateRequest(BaseModel):
@@ -489,67 +676,6 @@ async def rate_ticket(
     }
 
 
-@router.get("/tickets/stats")
-async def get_support_stats(
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Get support ticket statistics"""
-    account_result = await db.execute(
-        select(Account).where(Account.user_id == current_user.id)
-    )
-    account = account_result.scalar_one_or_none()
-    
-    if not account:
-        raise NotFoundException("Account", str(current_user.id))
-    
-    # Base query
-    if has_permission(current_user.role, Permission.MANAGE_SUPPORT):
-        query = select(SupportTicket)
-    else:
-        query = select(SupportTicket).where(SupportTicket.account_id == account.id)
-    
-    # Total tickets
-    total_result = await db.execute(
-        select(func.count(SupportTicket.id)).select_from(query.subquery())
-    )
-    total_tickets = total_result.scalar() or 0
-    
-    # By status
-    status_result = await db.execute(
-        select(
-            SupportTicket.status,
-            func.count(SupportTicket.id).label("count")
-        ).where(
-            SupportTicket.account_id == account.id if not has_permission(current_user.role, Permission.MANAGE_SUPPORT) else True
-        ).group_by(SupportTicket.status)
-    )
-    by_status = {
-        row.status.value: row.count
-        for row in status_result.all()
-    }
-    
-    # By priority
-    priority_result = await db.execute(
-        select(
-            SupportTicket.priority,
-            func.count(SupportTicket.id).label("count")
-        ).where(
-            SupportTicket.account_id == account.id if not has_permission(current_user.role, Permission.MANAGE_SUPPORT) else True
-        ).group_by(SupportTicket.priority)
-    )
-    by_priority = {
-        row.priority.value: row.count
-        for row in priority_result.all()
-    }
-    
-    return {
-        "total_tickets": total_tickets,
-        "by_status": by_status,
-        "by_priority": by_priority
-    }
-
-
 class TicketAssignRequest(BaseModel):
     user_id: UUID
     user_name: Optional[str] = None
@@ -620,27 +746,25 @@ async def upload_ticket_documents(
     db: AsyncSession = Depends(get_db)
 ):
     """Upload documents related to a support ticket"""
-    account_result = await db.execute(
-        select(Account).where(Account.user_id == current_user.id)
-    )
-    account = account_result.scalar_one_or_none()
-    
-    if not account:
-        raise NotFoundException("Account", str(current_user.id))
-    
+    is_staff = has_permission(current_user.role, Permission.MANAGE_SUPPORT)
+
     result = await db.execute(
         select(SupportTicket).where(SupportTicket.id == ticket_id)
     )
     ticket = result.scalar_one_or_none()
-    
+
     if not ticket:
         raise NotFoundException("Ticket", str(ticket_id))
-    
+
     # Check access
-    if not has_permission(current_user.role, Permission.MANAGE_SUPPORT):
-        if ticket.account_id != account.id:
+    if not is_staff:
+        account_result = await db.execute(
+            select(Account).where(Account.user_id == current_user.id)
+        )
+        account = account_result.scalar_one_or_none()
+        if not account or ticket.account_id != account.id:
             raise HTTPException(status_code=403, detail="Access denied")
-    
+
     uploaded_documents = []
     
     for file in files:
@@ -672,7 +796,7 @@ async def upload_ticket_documents(
         
         # Create document record linked to ticket
         document = Document(
-            account_id=account.id,
+            account_id=ticket.account_id,
             document_type=DocumentType.OTHER,
             file_name=file.filename,
             file_path=file_path,
@@ -707,28 +831,25 @@ async def get_ticket_documents(
     db: AsyncSession = Depends(get_db)
 ):
     """Get all documents associated with a ticket"""
-    account_result = await db.execute(
-        select(Account).where(Account.user_id == current_user.id)
-    )
-    account = account_result.scalar_one_or_none()
-    
-    if not account:
-        raise NotFoundException("Account", str(current_user.id))
-    
+    is_admin = has_permission(current_user.role, Permission.MANAGE_SUPPORT)
+
     result = await db.execute(
         select(SupportTicket).where(SupportTicket.id == ticket_id)
     )
     ticket = result.scalar_one_or_none()
-    
+
     if not ticket:
         raise NotFoundException("Ticket", str(ticket_id))
-    
+
     # Check access
-    is_admin = has_permission(current_user.role, Permission.MANAGE_SUPPORT)
     if not is_admin:
-        if ticket.account_id != account.id:
+        account_result = await db.execute(
+            select(Account).where(Account.user_id == current_user.id)
+        )
+        account = account_result.scalar_one_or_none()
+        if not account or ticket.account_id != account.id:
             raise HTTPException(status_code=403, detail="Access denied")
-    
+
     # Find documents linked to this ticket via metadata
     documents_result = await db.execute(
         select(Document).where(
@@ -760,28 +881,25 @@ async def get_ticket_history(
     db: AsyncSession = Depends(get_db)
 ):
     """Get the complete history/activity log for a ticket"""
-    account_result = await db.execute(
-        select(Account).where(Account.user_id == current_user.id)
-    )
-    account = account_result.scalar_one_or_none()
-    
-    if not account:
-        raise NotFoundException("Account", str(current_user.id))
-    
+    is_admin = has_permission(current_user.role, Permission.MANAGE_SUPPORT)
+
     result = await db.execute(
         select(SupportTicket).where(SupportTicket.id == ticket_id)
     )
     ticket = result.scalar_one_or_none()
-    
+
     if not ticket:
         raise NotFoundException("Ticket", str(ticket_id))
-    
+
     # Check access
-    is_admin = has_permission(current_user.role, Permission.MANAGE_SUPPORT)
     if not is_admin:
-        if ticket.account_id != account.id:
+        account_result = await db.execute(
+            select(Account).where(Account.user_id == current_user.id)
+        )
+        account = account_result.scalar_one_or_none()
+        if not account or ticket.account_id != account.id:
             raise HTTPException(status_code=403, detail="Access denied")
-    
+
     # Build history from ticket fields and replies
     history = []
     
@@ -875,19 +993,17 @@ async def support_analytics(
     For staff scopes ``satisfaction_rate`` reflects CSAT *received*; for the investor
     scope it reflects CSAT *they submitted*.
     """
-    account = (await db.execute(
-        select(Account).where(Account.user_id == current_user.id)
-    )).scalar_one_or_none()
+    # Scope is shared with GET /support/tickets so the two can't disagree.
+    scope = ticket_scope_for_role(current_user.role)
 
-    # Determine scope + the base predicate that filters the ticket set.
-    if current_user.role == Role.ADMIN:
-        scope = "all"
+    if scope == "all":
         base = []
-    elif current_user.role == Role.ADVISOR:
-        scope = "assigned"
+    elif scope == "assigned":
         base = [SupportTicket.assigned_to == current_user.id]
     else:
-        scope = "own"
+        account = (await db.execute(
+            select(Account).where(Account.user_id == current_user.id)
+        )).scalar_one_or_none()
         if not account:
             raise NotFoundException("Account", str(current_user.id))
         base = [SupportTicket.account_id == account.id]

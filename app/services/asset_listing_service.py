@@ -29,12 +29,13 @@ Suspend/restore helpers share the best-effort never-raise contract.
 """
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 from sqlalchemy import select, and_, update as sa_update
 
 from app.models.asset import Asset, AssetAppraisal, AppraisalDocument, AppraisalStatus, AppraisalType
 from app.models.marketplace import MarketplaceListing, ListingStatus, Offer, OfferStatus, WatchlistItem
+from app.services.listing_details_policy import merge_details, missing_required_details
 from app.utils.helpers import calculate_listing_fee
 from app.utils.logger import logger
 
@@ -292,17 +293,35 @@ def listing_price_for_asset(current_value: Optional[Decimal], purchase_price: Op
     return None
 
 
-async def ensure_listing_for_active_asset(db, asset: Asset, approved_by=None) -> Optional[MarketplaceListing]:
+async def ensure_listing_for_active_asset(
+    db, asset: Asset, approved_by=None, details: Optional[Mapping[str, Any]] = None,
+) -> Optional[MarketplaceListing]:
     """Ensure an ACTIVE asset has a public marketplace listing.
 
-    Every asset with status 'active' ("Active Investment") is public in the
-    marketplace. Idempotent: an existing open listing is left as-is. Assets
-    without a usable price are skipped (logged). Best-effort — never raises
-    into the caller, since asset create/update has already been committed.
+    Not called from anywhere today — manual/self-service listing was removed
+    when the marketplace became appraisal-driven only (2026-08-18; see
+    ``maybe_publish_valued_asset``). Kept in case a "list my active investment
+    directly" feature returns. ``details`` (the same four fields required at
+    listing creation) is required here too, so that if this ever IS wired up
+    it cannot reproduce the "every field N/A" bug — with no caller supplying
+    ``details`` today, this makes the function a provable no-op rather than
+    merely an unused one.
+
+    Idempotent: an existing open listing is left as-is. Assets without a
+    usable price are skipped (logged). Best-effort — never raises into the
+    caller, since asset create/update has already been committed.
     """
     try:
         status_value = asset.status.value if hasattr(asset.status, "value") else asset.status
         if status_value != "active":
+            return None
+
+        missing = missing_required_details(details or {})
+        if missing:
+            logger.info(
+                f"Auto-list: active asset {asset.id} missing listing details "
+                f"({', '.join(missing)}); not listing"
+            )
             return None
 
         price = listing_price_for_asset(asset.current_value, asset.purchase_price)
@@ -342,6 +361,7 @@ async def ensure_listing_for_active_asset(db, asset: Asset, approved_by=None) ->
             approved_by=approved_by,
             approved_at=now,
         )
+        listing.meta_data = merge_details(None, details)
         db.add(listing)
         await db.commit()
         await db.refresh(listing)
@@ -354,9 +374,24 @@ async def ensure_listing_for_active_asset(db, asset: Asset, approved_by=None) ->
         return None
 
 
-async def maybe_publish_valued_asset(db, appraisal: AssetAppraisal, staff_user) -> Optional[MarketplaceListing]:
+async def maybe_publish_valued_asset(
+    db, appraisal: AssetAppraisal, staff_user, details: Optional[Mapping[str, Any]] = None,
+) -> Optional[MarketplaceListing]:
     """Publish (or re-price) the asset's marketplace listing when both the
-    valuation amount and a valuation document are present. Never raises."""
+    valuation amount and a valuation document are present. Never raises.
+
+    Called from two places that can fire in either order — finalizing the
+    valuation (PUT .../valuation, which carries ``details``) and uploading the
+    "valuation" document (POST .../documents, which doesn't). Whichever call
+    completes both conditions is the one that actually publishes. A brand new
+    listing is only ever created WITH details, even if that means waiting for
+    the other trigger to supply them (see the missing-details guard below) —
+    otherwise the doc-uploaded-before-finalize ordering would recreate the
+    exact "every field N/A" bug this whole flow exists to close. Re-pricing an
+    already-detailed existing listing is not gated the same way: a re-run
+    (e.g. after a suspension) with no fresh ``details`` shouldn't wipe out
+    what's already there.
+    """
     try:
         has_doc = await _has_valuation_document(db, appraisal.id)
         if not ready_to_publish(appraisal.estimated_value, has_doc):
@@ -410,6 +445,8 @@ async def maybe_publish_valued_asset(db, appraisal: AssetAppraisal, staff_user) 
             existing.rejection_reason = None
             existing.pre_suspension_status = None
             existing.suspended_at = None
+            if details:
+                existing.meta_data = merge_details(existing.meta_data, details)
             await _sync_watchlist_rows(db, existing, price=price)
             await db.commit()
             logger.info(f"Auto-list: re-priced listing {existing.id} for asset {asset.id} -> {price}")
@@ -421,6 +458,17 @@ async def maybe_publish_valued_asset(db, appraisal: AssetAppraisal, staff_user) 
                     f"re-published at the appraised value of {price} {currency}.",
                 )
             return existing
+
+        # No listing exists yet: only ever create one WITH details, regardless
+        # of which trigger got here second (see docstring).
+        missing = missing_required_details(details or {})
+        if missing:
+            logger.info(
+                f"Auto-list: asset {asset.id} ready to publish but missing listing "
+                f"details ({', '.join(missing)}); waiting for finalize-valuation to "
+                f"supply them (appraisal {appraisal.id})"
+            )
+            return None
 
         listing = MarketplaceListing(
             account_id=asset.account_id,
@@ -435,6 +483,7 @@ async def maybe_publish_valued_asset(db, appraisal: AssetAppraisal, staff_user) 
             approved_by=staff_user.id,
             approved_at=now,
         )
+        listing.meta_data = merge_details(None, details)
         db.add(listing)
         await db.commit()
         await db.refresh(listing)

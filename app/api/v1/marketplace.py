@@ -22,6 +22,14 @@ from app.core.permissions import Role, Permission, has_permission
 from app.utils.logger import logger
 from app.utils.helpers import calculate_listing_fee, calculate_commission, generate_reference_id
 from app.integrations.stripe_client import StripeClient
+from app.services.listing_details_policy import (
+    DETAILS_KEY,
+    ListingEditError,
+    ensure_staff_edit_scope,
+    ensure_update_allowed,
+    merge_details,
+    missing_required_details,
+)
 from app.services.escrow_payout import (
     escrow_net_amount, prepare_seller_payout, refund_cents, resolve_payout_bank,
 )
@@ -93,14 +101,10 @@ class ListingDetailFields(BaseModel):
     document_ids: Optional[List[UUID]] = None
 
 
-# meta_data keys used by the detail page
-_DETAILS_KEY = "details"
+# meta_data key for the public-document opt-in list. DETAILS_KEY lives in
+# listing_details_policy (shared with asset_listing_service.py's auto-publish
+# paths, which also write into meta_data["details"]).
 _PUBLIC_DOCS_KEY = "public_document_ids"
-
-_DETAIL_FIELD_NAMES = (
-    "expected_return", "duration", "risk_level",
-    "slots_total", "slots_filled", "overview", "faqs",
-)
 
 
 class ListingCreate(ListingDetailFields):
@@ -189,7 +193,7 @@ def _listing_detail_response(listing: MarketplaceListing, is_owner: bool) -> Lis
     """Detail-page serialization. Callers must eager-load listing.asset
     (category+photos) and listing.account.user."""
     meta = listing.meta_data or {}
-    details = meta.get(_DETAILS_KEY) or {}
+    details = meta.get(DETAILS_KEY) or {}
     seller_user = listing.account.user if listing.account else None
     asset_photos = listing.asset.photos if listing.asset else []
     images = [p.url or p.thumbnail_url for p in asset_photos if (p.url or p.thumbnail_url)]
@@ -212,23 +216,16 @@ def _listing_detail_response(listing: MarketplaceListing, is_owner: bool) -> Lis
 
 
 async def _apply_listing_details(listing: MarketplaceListing, data: ListingDetailFields, db: AsyncSession) -> None:
-    """Merge seller-provided detail fields into listing.meta_data.
+    """Merge seller/staff-provided detail fields into listing.meta_data.
 
     Only fields explicitly present in the request change (send null/[] to
     clear one). document_ids are validated to belong to the listing's own
     asset — this is the seller's explicit opt-in that makes those documents
     publicly visible on the Documents tab."""
     provided = data.model_dump(exclude_unset=True, mode="json")
-    meta = dict(listing.meta_data or {})
-    details = dict(meta.get(_DETAILS_KEY) or {})
-
-    for field in _DETAIL_FIELD_NAMES:
-        if field in provided:
-            if provided[field] is None:
-                details.pop(field, None)
-            else:
-                details[field] = provided[field]
-    meta[_DETAILS_KEY] = details
+    # JSONB columns don't track in-place mutation; merge_details returns (and
+    # we reassign) a new dict.
+    listing.meta_data = merge_details(listing.meta_data, provided)
 
     if "document_ids" in provided:
         doc_ids = data.document_ids or []
@@ -246,10 +243,9 @@ async def _apply_listing_details(listing: MarketplaceListing, data: ListingDetai
                     f"Documents not found on this listing's asset: {', '.join(invalid)}",
                     code="INVALID_LISTING_DOCUMENTS",
                 )
+        meta = dict(listing.meta_data or {})
         meta[_PUBLIC_DOCS_KEY] = [str(d) for d in doc_ids]
-
-    # JSONB columns don't track in-place mutation; reassign a new dict.
-    listing.meta_data = meta
+        listing.meta_data = meta
 
 
 def _full_name(user: Optional[User]) -> str:
@@ -375,6 +371,18 @@ async def create_listing(
     # No new listing while the asset is under valuation — otherwise it would
     # sit unapprovable in the queue until the appraisal ends.
     await _assert_no_open_human_appraisal(db, asset.id)
+
+    # The detail page has nothing to show without these; they used to be
+    # optional and most listings were created with them blank, which is what
+    # rendered "N/A" for Expected Returns / Duration / Risk Level / Slots.
+    missing = missing_required_details(
+        listing_data.model_dump(exclude_unset=True, mode="json")
+    )
+    if missing:
+        raise BadRequestException(
+            f"These listing details are required: {', '.join(missing)}.",
+            code="MISSING_LISTING_DETAILS",
+        )
 
     # Calculate listing fee (2%)
     listing_fee = calculate_listing_fee(listing_data.asking_price)
@@ -1390,29 +1398,42 @@ async def update_listing(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Update a listing"""
+    """Update a listing.
+
+    The owner may edit their own listing (full terms while draft/pending,
+    descriptive fields only once live). Staff permitted to moderate this
+    listing (admin, or an advisor for one of their assigned clients — see
+    _assert_can_moderate_listing) may also update descriptive fields on a
+    listing they don't own; terms stay owner-only regardless of status.
+    """
+    result = await db.execute(
+        select(MarketplaceListing).where(MarketplaceListing.id == listing_id)
+    )
+    listing = result.scalar_one_or_none()
+
+    if not listing:
+        raise NotFoundException("Listing", str(listing_id))
+
     account_result = await db.execute(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
-    
-    if not account:
-        raise NotFoundException("Account", str(current_user.id))
-    
-    result = await db.execute(
-        select(MarketplaceListing).where(
-            MarketplaceListing.id == listing_id,
-            MarketplaceListing.account_id == account.id
-        )
-    )
-    listing = result.scalar_one_or_none()
-    
-    if not listing:
-        raise NotFoundException("Listing", str(listing_id))
-    
-    if listing.status not in [ListingStatus.DRAFT, ListingStatus.PENDING_APPROVAL]:
-        raise BadRequestException("Can only update draft or pending listings")
-    
+    is_owner = account is not None and listing.account_id == account.id
+
+    provided_fields = listing_data.model_dump(exclude_unset=True, mode="json").keys()
+
+    # Draft/pending: everything is editable. Live (approved/active/suspended):
+    # descriptive fields only — deal terms are priced against by open offers
+    # and escrow. Refusing ALL edits once approved is what left every live
+    # listing permanently showing "N/A" for the seller-provided fields.
+    try:
+        if not is_owner:
+            await _assert_can_moderate_listing(db, current_user, listing)
+            ensure_staff_edit_scope(provided_fields)
+        ensure_update_allowed(listing.status, provided_fields)
+    except ListingEditError as exc:
+        raise BadRequestException(str(exc), code=exc.code)
+
     if listing_data.title:
         listing.title = listing_data.title
     if listing_data.description is not None:
@@ -1425,8 +1446,9 @@ async def update_listing(
 
     await db.commit()
     await db.refresh(listing)
-    
-    logger.info(f"Listing updated: {listing_id}")
+
+    who = "owner" if is_owner else f"staff {current_user.id}"
+    logger.info(f"Listing updated: {listing_id} by {who}")
     return listing
 
 
