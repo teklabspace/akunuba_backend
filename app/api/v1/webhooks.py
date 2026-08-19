@@ -204,11 +204,19 @@ def _period_from_stripe_subscription(sub: dict) -> tuple:
 def _plan_from_stripe_subscription(sub: dict):
     """(plan_tier, billing_cycle, amount) from the subscription's active price.
 
-    Our Stripe prices carry plan_tier / billing_cycle in metadata (set at catalog
+    Our Stripe prices carry plan_tier / billing_cycle in metadata (set by hand at catalog
     creation), so Stripe is the source of truth for which plan the customer actually
     pays for. This is what lets an upgrade land locally only after its invoice is paid.
+
+    That metadata is hand-maintained, though, and a price created without it used to make
+    this return (None, None, ...) — every caller then skipped the write and the plan never
+    landed at all, leaving a paid customer on the "activating your plan" screen with no
+    error anywhere. So fall back to matching the price id against the configured
+    STRIPE_PRICE_* ids, which encode exactly the same mapping and cannot go missing.
     """
     from decimal import Decimal
+
+    from app.core.stripe_pricing import resolve_plan_from_price_id
 
     items = ((sub.get("items") or {}).get("data") or [])
     if not items:
@@ -217,7 +225,13 @@ def _plan_from_stripe_subscription(sub: dict):
     meta = price.get("metadata") or {}
     unit_amount = price.get("unit_amount")
     amount = (Decimal(unit_amount) / Decimal(100)) if unit_amount is not None else None
-    return meta.get("plan_tier"), meta.get("billing_cycle"), amount
+
+    tier, cycle = meta.get("plan_tier"), meta.get("billing_cycle")
+    if not tier or not cycle:
+        fallback_tier, fallback_cycle = resolve_plan_from_price_id(price.get("id"))
+        tier = tier or fallback_tier
+        cycle = cycle or fallback_cycle
+    return tier, cycle, amount
 
 
 async def _apply_stripe_subscription_event(db: AsyncSession, event: dict) -> str:
