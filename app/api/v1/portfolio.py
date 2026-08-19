@@ -6,20 +6,36 @@ from typing import Optional, List, Dict, Any
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
+import secrets
+from app.config import settings
 from app.database import get_db
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, _as_aware_utc
 from app.models.user import User
 from app.models.account import Account
 from app.models.asset import Asset, AssetType, AssetValuation, AssetOwnership
 from app.models.portfolio import Portfolio
 from app.models.banking import LinkedAccount, Transaction, AccountType as BankingAccountType
 from app.models.order import Order, OrderStatus, OrderType
+from app.models.cash import CashEntryType, CashTransaction
+from app.models.portfolio_share import PortfolioShare
 from app.models.notification import Notification, NotificationType
 from app.models.transfer import Transfer
-from app.core.exceptions import NotFoundException, BadRequestException
+from app.core.exceptions import NotFoundException, BadRequestException, GoneException
+from app.services.cash_ledger import (
+    apply_delta,
+    has_sufficient_funds,
+    order_cash_delta,
+    order_notional,
+    record_cash_movement,
+)
 from app.services.net_worth import compute_net_worth, core_assets, breakdown_dict
 from app.services.valuation_history import load_valuations, value_asof, first_value
 from app.services.crypto_metrics import metric_series
+from app.services.crypto_window import (
+    SUPPORTED_TIME_RANGES,
+    resolve_window,
+    snapshot_points,
+)
 
 
 def _polygon_quote(symbol: str):
@@ -45,6 +61,11 @@ from app.integrations.plaid_client import PlaidClient
 from pydantic import BaseModel, Field
 
 router = APIRouter()
+
+# Ungated companion router. Share links are resolved by people who have no
+# account at all, so those routes must not sit behind auth + require_kyc_verified
+# like the rest of this module. Registered separately in app/main.py.
+public_router = APIRouter()
 
 
 class AssetAllocationItem(BaseModel):
@@ -751,7 +772,8 @@ class PortfolioSummaryResponse(BaseModel):
     total_portfolio_value: Decimal  # net: assets + cash - debts
     total_assets: Decimal           # gross owned wealth (matches /allocation total)
     total_debts: Decimal
-    cash_available: Decimal
+    cash_available: Decimal         # Plaid-synced bank balances
+    trading_cash_balance: Decimal   # settled trading cash (accounts.cash_balance)
     total_invested: Decimal         # cost basis (first valuations)
     total_returns: Decimal
     return_percentage: Decimal
@@ -832,17 +854,22 @@ async def get_portfolio_summary(
         if linked_account.balance:
             cash_available += linked_account.balance
     
+    # Settled trading cash is separate money from the Plaid bank balances above
+    # — a deposit moves value between the two, it does not create any.
+    trading_cash_balance = apply_delta(account.cash_balance, 0)
+
     # Debts = the Liabilities category group (amount owed stored as positive value)
     total_debts = breakdown.total_liabilities
 
-    # Total portfolio value = assets + cash - debts
-    total_portfolio_value = total_assets + cash_available - total_debts
+    # Total portfolio value = assets + bank cash + trading cash - debts
+    total_portfolio_value = total_assets + cash_available + trading_cash_balance - total_debts
 
     return PortfolioSummaryResponse(
         total_portfolio_value=total_portfolio_value,
         total_assets=total_assets,
         total_debts=total_debts,
         cash_available=cash_available,
+        trading_cash_balance=trading_cash_balance,
         total_invested=total_invested,
         total_returns=total_returns,
         return_percentage=return_percentage,
@@ -1281,12 +1308,29 @@ async def get_crypto_portfolio_summary(
 
 @router.get("/crypto/performance", response_model=Dict[str, List[Dict[str, Any]]])
 async def get_crypto_performance(
-    time_range: str = Query(..., description="Time range: 1h, 6h, 12h, 24h, 7d, 30d, 1y"),
+    time_range: Optional[str] = Query(
+        None, description=f"Time range: {', '.join(SUPPORTED_TIME_RANGES)}. Omit when supplying start_date/end_date."
+    ),
     metric: str = Query(..., description="Metric: value-over-time, return-rate, risk-exposure"),
+    start_date: Optional[datetime] = Query(
+        None, description="Custom range start (ISO 8601). Must be paired with end_date; overrides time_range."
+    ),
+    end_date: Optional[datetime] = Query(
+        None, description="Custom range end (ISO 8601). Must be paired with start_date."
+    ),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get crypto performance data"""
+    """Get crypto performance data over a fixed period or a custom date range."""
+    # An unrecognised time_range used to fall through to 30 days with a 200,
+    # which made the period dropdown look inert. It is now an explicit 400.
+    try:
+        window = resolve_window(
+            time_range=time_range, start_date=start_date, end_date=end_date
+        )
+    except ValueError as exc:
+        raise BadRequestException(str(exc), code="INVALID_TIME_RANGE")
+
     account_result = await db.execute(
         select(Account).where(Account.user_id == current_user.id)
     )
@@ -1341,29 +1385,18 @@ async def get_crypto_performance(
             total += chosen.value if chosen else asset.current_value
         return total + alpaca_value
 
+    # One sampling rule for both the dropdown options and a custom range —
+    # see app/services/crypto_window.py.
     data_points = []
     snapshot_dates = []
-    intraday_hours = {"1h": 1, "6h": 6, "12h": 12, "24h": 24}
-    if time_range in intraday_hours:
-        hours = intraday_hours[time_range]
-        n_points = max(6, min(24, hours * 2))
-        step_seconds = hours * 3600 / n_points
-        for i in range(n_points, -1, -1):
-            snapshot_date = datetime.utcnow() - timedelta(seconds=step_seconds * i)
-            snapshot_dates.append(snapshot_date)
-            data_points.append({
-                "time": snapshot_date.strftime("%H:%M"),
-                "value": float(value_at(snapshot_date)),
-            })
-    else:
-        days = int({"7d": 7, "30d": 30, "1y": 365}.get(time_range, 30))
-        for i in range(days, 0, -1):
-            snapshot_date = datetime.utcnow() - timedelta(days=i)
-            snapshot_dates.append(snapshot_date)
-            data_points.append({
-                "time": snapshot_date.strftime("%Y-%m-%d"),
-                "value": float(value_at(snapshot_date)),
-            })
+    for moment, label in snapshot_points(window):
+        # value_at compares against naive DB dates, so drop tzinfo here.
+        snapshot_date = moment.replace(tzinfo=None)
+        snapshot_dates.append(snapshot_date)
+        data_points.append({
+            "time": label,
+            "value": float(value_at(snapshot_date)),
+        })
 
     # Each metric tab gets its own series (QA B7: all three used to return the
     # same dollar curve, so the frontend put a % axis on dollar values).
@@ -1608,6 +1641,302 @@ async def get_crypto_holdings(
         holdings.sort(key=lambda x: x["portfolio_weight"], reverse=reverse_order)
     
     return {"data": holdings}
+
+
+class CryptoShareRequest(BaseModel):
+    expires_in_days: Optional[int] = Field(
+        30, ge=1, le=365, description="Link lifetime in days. Null for a link that never expires."
+    )
+    email: Optional[str] = Field(None, description="Recipient, recorded for reference only")
+    time_range: Optional[str] = Field(
+        None, description=f"Snapshot the link opens at: {', '.join(SUPPORTED_TIME_RANGES)}"
+    )
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
+
+
+async def _crypto_snapshot(db: AsyncSession, account: Account, window) -> Dict[str, Any]:
+    """The crypto portfolio figures a share link resolves to.
+
+    Deliberately a read-only aggregate — totals, per-symbol allocation and the
+    value series — with no asset ids, documents or account identifiers, since
+    the audience is whoever holds the link.
+    """
+    assets_result = await db.execute(
+        select(Asset).where(
+            and_(
+                Asset.account_id == account.id,
+                Asset.asset_type == AssetType.CRYPTO,
+            )
+        )
+    )
+    crypto_assets = assets_result.scalars().all()
+
+    valuations = await load_valuations(db, [asset.id for asset in crypto_assets])
+
+    alpaca_crypto = _get_alpaca_positions("crypto")
+    alpaca_value = Decimal(str(sum(p["market_value"] for p in alpaca_crypto)))
+    alpaca_cost = Decimal(str(sum(p["cost_basis"] for p in alpaca_crypto)))
+
+    total_value = sum(
+        (asset.current_value for asset in crypto_assets), Decimal("0.00")
+    ) + alpaca_value
+    total_invested = sum(
+        (first_value(valuations.get(asset.id, []), asset) for asset in crypto_assets),
+        Decimal("0.00"),
+    ) + alpaca_cost
+
+    total_return = total_value - total_invested
+    return_percentage = (
+        (total_return / total_invested * 100) if total_invested > 0 else Decimal("0.00")
+    )
+
+    # Per-symbol allocation, local assets and brokerage positions combined.
+    by_symbol: Dict[str, Decimal] = {}
+    for asset in crypto_assets:
+        symbol = (asset.symbol or "Unknown").upper()
+        by_symbol[symbol] = by_symbol.get(symbol, Decimal("0.00")) + asset.current_value
+    for position in alpaca_crypto:
+        symbol = str(position.get("symbol", "Unknown")).upper()
+        by_symbol[symbol] = by_symbol.get(symbol, Decimal("0.00")) + Decimal(
+            str(position["market_value"])
+        )
+
+    holdings = sorted(
+        (
+            {
+                "symbol": symbol,
+                "value": float(value),
+                "percentage": float(value / total_value * 100) if total_value > 0 else 0.0,
+            }
+            for symbol, value in by_symbol.items()
+        ),
+        key=lambda row: row["value"],
+        reverse=True,
+    )
+
+    series = []
+    for moment, label in snapshot_points(window):
+        snapshot_date = moment.replace(tzinfo=None)
+        value = sum(
+            (
+                value_asof(valuations.get(asset.id, []), asset, snapshot_date)
+                for asset in crypto_assets
+            ),
+            Decimal("0.00"),
+        )
+        series.append({"time": label, "value": float(value + alpaca_value)})
+
+    return {
+        "total_value": float(total_value),
+        "total_return": float(total_return),
+        "return_percentage": float(return_percentage),
+        "holdings": holdings,
+        "performance": series,
+        "currency": "USD",
+    }
+
+
+@router.post("/crypto/share", response_model=Dict[str, Dict[str, Any]], status_code=201)
+async def create_crypto_share_link(
+    share_data: CryptoShareRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Generate a shareable link to the crypto portfolio view.
+
+    The link records the date window it was generated for, so the recipient
+    sees the same range the owner was looking at.
+    """
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+
+    try:
+        window = resolve_window(
+            time_range=share_data.time_range or ("30d" if not share_data.start_date else None),
+            start_date=share_data.start_date,
+            end_date=share_data.end_date,
+        )
+    except ValueError as exc:
+        raise BadRequestException(str(exc), code="INVALID_TIME_RANGE")
+
+    # Absolute URL — a relative path can't be opened straight from the
+    # clipboard. Points at the frontend page, which resolves the data via
+    # GET /api/v1/portfolio/crypto/shared?code=...
+    access_code = secrets.token_urlsafe(24)
+    base_url = settings.FRONTEND_BASE_URL.rstrip("/")
+    share_link = f"{base_url}/portfolio/crypto/shared?code={access_code}"
+
+    expires_at = None
+    if share_data.expires_in_days:
+        expires_at = datetime.now(timezone.utc) + timedelta(days=share_data.expires_in_days)
+
+    share = PortfolioShare(
+        account_id=account.id,
+        view="crypto",
+        share_link=share_link,
+        access_code=access_code,
+        email=share_data.email,
+        expires_at=expires_at,
+        window={
+            "start": window.start.isoformat(),
+            "end": window.end.isoformat(),
+            "time_range": share_data.time_range,
+        },
+    )
+    db.add(share)
+    await db.commit()
+    await db.refresh(share)
+
+    logger.info(f"Crypto share link created for account {account.id}: {share.id}")
+    return {
+        "data": {
+            "id": str(share.id),
+            "share_link": share_link,
+            "access_code": access_code,
+            "expires_at": expires_at.isoformat() if expires_at else None,
+            "window": share.window,
+        }
+    }
+
+
+@router.get("/crypto/share", response_model=Dict[str, List[Dict[str, Any]]])
+async def list_crypto_share_links(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """List the crypto share links this account has generated."""
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+
+    result = await db.execute(
+        select(PortfolioShare)
+        .where(
+            and_(
+                PortfolioShare.account_id == account.id,
+                PortfolioShare.view == "crypto",
+            )
+        )
+        .order_by(desc(PortfolioShare.created_at))
+    )
+    shares = result.scalars().all()
+
+    now = datetime.now(timezone.utc)
+    return {
+        "data": [
+            {
+                "id": str(share.id),
+                "share_link": share.share_link,
+                "email": share.email,
+                "expires_at": share.expires_at.isoformat() if share.expires_at else None,
+                "is_active": share.is_active,
+                "is_expired": bool(
+                    share.expires_at and _as_aware_utc(share.expires_at) < now
+                ),
+                "created_at": share.created_at.isoformat() if share.created_at else None,
+            }
+            for share in shares
+        ]
+    }
+
+
+@router.delete("/crypto/share/{share_id}", response_model=Dict[str, Dict[str, Any]])
+async def revoke_crypto_share_link(
+    share_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Deactivate a share link. Revoked links resolve as 404, like unknown codes."""
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+
+    result = await db.execute(
+        select(PortfolioShare).where(
+            and_(
+                PortfolioShare.id == share_id,
+                PortfolioShare.account_id == account.id,
+            )
+        )
+    )
+    share = result.scalar_one_or_none()
+    if share is None:
+        raise NotFoundException("Share link", str(share_id))
+
+    share.is_active = False
+    await db.commit()
+
+    return {"data": {"id": str(share_id), "is_active": False}}
+
+
+@public_router.get("/crypto/shared", response_model=Dict[str, Any])
+async def get_shared_crypto_portfolio(
+    code: str = Query(..., description="Share access code from the share link"),
+    db: AsyncSession = Depends(get_db)
+):
+    """Resolve a crypto portfolio share link.
+
+    Anonymous by design — the per-share access code IS the credential, so this
+    lives on public_router (no auth, no KYC gate) and declares no user
+    dependency, which also means a stale Authorization header is never
+    inspected. Contract matches GET /assets/{id}/shared: valid code → 200,
+    unknown or revoked → 404, expired → 410 SHARE_LINK_EXPIRED.
+    """
+    result = await db.execute(
+        select(PortfolioShare).where(
+            and_(
+                PortfolioShare.access_code == code,
+                PortfolioShare.view == "crypto",
+                PortfolioShare.is_active == True,
+            )
+        )
+    )
+    share = result.scalar_one_or_none()
+    if share is None:
+        raise NotFoundException("Share link", code)
+
+    if share.expires_at and _as_aware_utc(share.expires_at) < datetime.now(timezone.utc):
+        raise GoneException("This share link has expired.", code="SHARE_LINK_EXPIRED")
+
+    account_result = await db.execute(
+        select(Account).where(Account.id == share.account_id)
+    )
+    account = account_result.scalar_one_or_none()
+    if account is None:
+        raise NotFoundException("Share link", code)
+
+    stored = share.window or {}
+    try:
+        window = resolve_window(
+            start_date=datetime.fromisoformat(stored["start"]),
+            end_date=datetime.fromisoformat(stored["end"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        window = resolve_window(time_range="30d")
+
+    snapshot = await _crypto_snapshot(db, account, window)
+    return {
+        "data": {
+            **snapshot,
+            "shared_with": share.email,
+            "window": stored,
+            "expires_at": share.expires_at.isoformat() if share.expires_at else None,
+        }
+    }
 
 
 # ============================================================================
@@ -2578,35 +2907,214 @@ async def get_brokerage_accounts(
     if not account:
         raise NotFoundException("Account", str(current_user.id))
     
-    accounts_list = []
-    
-    # Get Alpaca account
+    # Balance and buying power come from the caller's OWN cash ledger. They
+    # used to be read off AlpacaClient.get_account(), but that client runs on
+    # app-level credentials — one shared paper account, so every user saw the
+    # same figure and it never reflected their own trades.
+    cash_balance = apply_delta(account.cash_balance, 0)
+
+    masked_number = "****"
     try:
         alpaca_account = AlpacaClient.get_account()
         if alpaca_account:
-            if isinstance(alpaca_account, dict):
-                account_data = alpaca_account
-            else:
-                account_data = {
-                    "account_number": getattr(alpaca_account, "account_number", ""),
-                    "buying_power": float(getattr(alpaca_account, "buying_power", 0)),
-                    "cash": float(getattr(alpaca_account, "cash", 0)),
-                    "portfolio_value": float(getattr(alpaca_account, "portfolio_value", 0))
-                }
-            
-            accounts_list.append({
-                "id": f"broker_{account_data.get('account_number', 'default')}",
-                "name": "Primary Trading Account",
-                "masked_number": f"****{str(account_data.get('account_number', ''))[-4:]}" if account_data.get('account_number') else "****",
-                "type": "brokerage",
-                "balance": account_data.get("portfolio_value", 0),
-                "buying_power": account_data.get("buying_power", 0),
-                "currency": "USD"
-            })
+            raw_number = (
+                alpaca_account.get("account_number", "")
+                if isinstance(alpaca_account, dict)
+                else getattr(alpaca_account, "account_number", "")
+            )
+            if raw_number:
+                masked_number = f"****{str(raw_number)[-4:]}"
     except Exception as e:
+        # Display detail only — never let the broker being down hide the balance.
         logger.error(f"Failed to get Alpaca account: {e}")
-    
-    return {"data": accounts_list}
+
+    return {
+        "data": [
+            {
+                "id": str(account.id),
+                "name": "Primary Trading Account",
+                "masked_number": masked_number,
+                "type": "brokerage",
+                "balance": float(cash_balance),
+                "buying_power": float(cash_balance),
+                "currency": "USD",
+            }
+        ]
+    }
+
+
+class CashMovementRequest(BaseModel):
+    linked_account_id: str = Field(..., description="A linked bank account belonging to the caller")
+    amount: Decimal = Field(..., description="Positive amount in USD")
+    description: Optional[str] = None
+
+
+async def _resolve_own_linked_account(db: AsyncSession, account: Account, raw_id: str) -> LinkedAccount:
+    """Caller-scoped lookup — an id belonging to someone else is a 404, not a 403."""
+    try:
+        wanted = UUID(str(raw_id))
+    except (TypeError, ValueError):
+        raise NotFoundException("Linked account", str(raw_id))
+
+    result = await db.execute(
+        select(LinkedAccount).where(
+            and_(
+                LinkedAccount.id == wanted,
+                LinkedAccount.account_id == account.id,
+                LinkedAccount.is_active == True,
+            )
+        )
+    )
+    linked = result.scalar_one_or_none()
+    if linked is None:
+        raise NotFoundException("Linked account", str(raw_id))
+    return linked
+
+
+@router.get("/trade-engine/cash", response_model=Dict[str, Dict[str, Any]])
+async def get_trading_cash(
+    limit: int = Query(20, ge=1, le=100, description="Recent ledger entries to return"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Settled trading cash plus the recent ledger entries behind it."""
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+
+    entries_result = await db.execute(
+        select(CashTransaction)
+        .where(CashTransaction.account_id == account.id)
+        .order_by(desc(CashTransaction.created_at))
+        .limit(limit)
+    )
+    entries = entries_result.scalars().all()
+
+    return {
+        "data": {
+            "cash_balance": float(apply_delta(account.cash_balance, 0)),
+            "currency": "USD",
+            "transactions": [
+                {
+                    "id": str(entry.id),
+                    "entry_type": entry.entry_type.value,
+                    "amount": float(entry.amount),
+                    "balance_after": float(entry.balance_after),
+                    "description": entry.description,
+                    "order_id": str(entry.order_id) if entry.order_id else None,
+                    "created_at": entry.created_at.isoformat() if entry.created_at else None,
+                }
+                for entry in entries
+            ],
+        }
+    }
+
+
+@router.post("/trade-engine/cash/deposit", response_model=Dict[str, Dict[str, Any]])
+async def deposit_trading_cash(
+    request: CashMovementRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Move money from a linked bank account into trading cash."""
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+
+    if request.amount is None or request.amount <= 0:
+        raise BadRequestException("amount must be positive")
+
+    linked = await _resolve_own_linked_account(db, account, request.linked_account_id)
+
+    # Same convention as /cash-flow/transfers: only enforce when Plaid has
+    # actually given us a balance to check against.
+    if linked.balance is not None and Decimal(linked.balance) < request.amount:
+        raise BadRequestException(
+            "Insufficient funds in the source account for this deposit.",
+            code="INSUFFICIENT_FUNDS",
+        )
+
+    if linked.balance is not None:
+        linked.balance = Decimal(linked.balance) - request.amount
+
+    await record_cash_movement(
+        db,
+        account,
+        entry_type=CashEntryType.DEPOSIT,
+        delta=request.amount,
+        description=request.description or f"Deposit from {linked.account_name or 'linked account'}",
+        linked_account_id=linked.id,
+    )
+    await db.commit()
+    await db.refresh(account)
+
+    return {
+        "data": {
+            "cash_balance": float(apply_delta(account.cash_balance, 0)),
+            "source_account_balance": float(linked.balance) if linked.balance is not None else None,
+            "amount": float(request.amount),
+            "currency": "USD",
+        }
+    }
+
+
+@router.post("/trade-engine/cash/withdraw", response_model=Dict[str, Dict[str, Any]])
+async def withdraw_trading_cash(
+    request: CashMovementRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Move settled trading cash back out to a linked bank account."""
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+
+    if request.amount is None or request.amount <= 0:
+        raise BadRequestException("amount must be positive")
+
+    linked = await _resolve_own_linked_account(db, account, request.linked_account_id)
+
+    if not has_sufficient_funds(account.cash_balance, -request.amount):
+        raise BadRequestException(
+            f"Insufficient trading cash for this withdrawal. Balance "
+            f"{apply_delta(account.cash_balance, 0)}.",
+            code="INSUFFICIENT_FUNDS",
+        )
+
+    if linked.balance is not None:
+        linked.balance = Decimal(linked.balance) + request.amount
+
+    await record_cash_movement(
+        db,
+        account,
+        entry_type=CashEntryType.WITHDRAWAL,
+        delta=-request.amount,
+        description=request.description or f"Withdrawal to {linked.account_name or 'linked account'}",
+        linked_account_id=linked.id,
+    )
+    await db.commit()
+    await db.refresh(account)
+
+    return {
+        "data": {
+            "cash_balance": float(apply_delta(account.cash_balance, 0)),
+            "destination_account_balance": float(linked.balance) if linked.balance is not None else None,
+            "amount": float(request.amount),
+            "currency": "USD",
+        }
+    }
 
 
 class OrderRequest(BaseModel):
@@ -2646,6 +3154,43 @@ async def place_order(
     if mode == "stop-limit" and (not order_data.limit_price or not order_data.stop_price):
         raise BadRequestException("stop_price and limit_price required for stop-limit orders")
 
+    if order_data.quantity is None or order_data.quantity <= 0:
+        raise BadRequestException("quantity must be positive")
+
+    if (order_data.order_type or "").strip().lower() not in ("buy", "sell"):
+        raise BadRequestException("order_type must be 'buy' or 'sell'")
+
+    # Price the order BEFORE touching the broker so an unaffordable order is
+    # rejected here rather than filled at Alpaca and then refused locally.
+    # (QA B6: orders were stored with price 0 and every downstream feed showed
+    # "$0.00" trades — same price source as the asset-details endpoint, crypto
+    # X: retry included.)
+    execution_price = None
+    if mode in ("limit", "stop-limit"):
+        execution_price = order_data.limit_price
+    else:
+        try:
+            symbol_upper = order_data.symbol.upper().strip()
+            quote = PolygonClient.get_current_price(symbol_upper)
+            if not quote and not symbol_upper.startswith("X:"):
+                quote = PolygonClient.get_current_price(f"X:{symbol_upper}")
+            if quote:
+                execution_price = Decimal(str(quote))
+        except Exception as price_err:  # a quote miss must never fail the order
+            logger.warning(f"No execution price for {order_data.symbol}: {price_err}")
+
+    # Funds check against the caller's own trading cash. Runs for queued orders
+    # too — you cannot place an order you could not pay for — but only settled
+    # (priced) orders actually move cash below.
+    cash_delta = order_cash_delta(order_data.order_type, order_data.quantity, execution_price)
+    if not has_sufficient_funds(account.cash_balance, cash_delta):
+        raise BadRequestException(
+            f"Insufficient trading cash for this order. Balance "
+            f"{apply_delta(account.cash_balance, 0)}, order requires "
+            f"{order_notional(order_data.quantity, execution_price)}.",
+            code="INSUFFICIENT_FUNDS",
+        )
+
     # Create order via Alpaca
     try:
         if mode == "market":
@@ -2677,23 +3222,6 @@ async def place_order(
             detail = f": {broker_error}" if broker_error else ""
             raise BadRequestException(f"Broker rejected the order{detail}")
 
-        # Capture the execution price at placement (QA B6: orders were stored
-        # with price 0 and every downstream feed showed "$0.00" trades). Same
-        # price source as the asset-details endpoint, crypto X: retry included.
-        execution_price = None
-        if mode in ("limit", "stop-limit"):
-            execution_price = order_data.limit_price
-        else:
-            try:
-                symbol_upper = order_data.symbol.upper().strip()
-                quote = PolygonClient.get_current_price(symbol_upper)
-                if not quote and not symbol_upper.startswith("X:"):
-                    quote = PolygonClient.get_current_price(f"X:{symbol_upper}")
-                if quote:
-                    execution_price = Decimal(str(quote))
-            except Exception as price_err:  # a quote miss must never fail the order
-                logger.warning(f"No execution price for {order_data.symbol}: {price_err}")
-
         is_market = mode == "market"
         filled = is_market and execution_price is not None
 
@@ -2717,12 +3245,32 @@ async def place_order(
             alpaca_order_id=str(alpaca_order.get("id", "")) if isinstance(alpaca_order, dict) else str(getattr(alpaca_order, "id", ""))
         )
         db.add(order)
+        # Flush (not commit) so the ledger row can reference order.id and both
+        # land in the same transaction as the balance change.
+        await db.flush()
+
+        # Only settled orders move cash. A SUBMITTED order has no fill to
+        # settle, and nothing in this codebase syncs Alpaca fills back into
+        # `orders` yet — see app/services/cash_ledger.py.
+        if filled and cash_delta != Decimal("0.00"):
+            await record_cash_movement(
+                db,
+                account,
+                entry_type=(
+                    CashEntryType.TRADE_BUY if cash_delta < 0 else CashEntryType.TRADE_SELL
+                ),
+                delta=cash_delta,
+                description=f"{order_data.order_type.lower()} {order_data.quantity} {order_data.symbol.upper()}",
+                order_id=order.id,
+            )
+
         await db.commit()
         await db.refresh(order)
+        await db.refresh(account)
 
         order_id = str(alpaca_order.get("id", "")) if isinstance(alpaca_order, dict) else str(getattr(alpaca_order, "id", ""))
         estimated_total = float(order_data.quantity * (execution_price or 0))
-        
+
         return {
             "data": {
                 "order_id": order_id,
@@ -2730,9 +3278,16 @@ async def place_order(
                 "confirmation_number": f"ORD{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
                 "price": float(execution_price) if execution_price is not None else None,
                 "estimated_total": estimated_total,
+                # The caller's own cash after this order, so the trade screen
+                # can update without a second round-trip.
+                "cash_balance": float(apply_delta(account.cash_balance, 0)),
                 "created_at": datetime.utcnow().isoformat()
             }
         }
+    except BadRequestException:
+        # Broker rejects already carry their own message/code — re-wrapping
+        # them buried the reason behind a generic "Failed to place order".
+        raise
     except Exception as e:
         logger.error(f"Failed to place order: {e}")
         raise BadRequestException(f"Failed to place order: {str(e)}")

@@ -304,6 +304,9 @@ app.include_router(notifications.router, prefix=f"{settings.API_V1_PREFIX}/notif
 # account), and shared-with-me (authed via its own dependency, but not KYC-gated).
 app.include_router(assets.public_router, prefix=f"{settings.API_V1_PREFIX}/assets", tags=["Assets"])
 app.include_router(assets.router, prefix=f"{settings.API_V1_PREFIX}/assets", tags=["Assets"], dependencies=_KYC_GATED)
+# portfolio.public_router is ungated: share links are opened by recipients who
+# have no account (the per-share access code is the credential).
+app.include_router(portfolio.public_router, prefix=f"{settings.API_V1_PREFIX}/portfolio", tags=["Portfolio"])
 app.include_router(portfolio.router, prefix=f"{settings.API_V1_PREFIX}/portfolio", tags=["Portfolio"], dependencies=_KYC_GATED)
 app.include_router(trading.router, prefix=f"{settings.API_V1_PREFIX}/trading", tags=["Trading"], dependencies=_KYC_GATED)
 # Marketplace browse is public (guests view listings; auth/KYC only to transact)

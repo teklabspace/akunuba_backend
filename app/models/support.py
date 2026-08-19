@@ -51,7 +51,7 @@ class SupportTicket(Base):
     satisfaction_rating = Column(Integer)
     satisfaction_comment = Column(Text)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     account = relationship("Account")
     assigned_user = relationship("User")

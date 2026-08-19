@@ -42,6 +42,15 @@ KYC_GATED_MODULES = {
     "compliance", "referrals", "advisor",
 }
 
+# Routes inside a gated module that are public BY DESIGN, mounted on that
+# module's `public_router`. Each one's credential is a per-share access code,
+# and its audience is people with no account at all. Adding a path here is a
+# security decision — it must have its own route-placement regression test.
+DELIBERATELY_PUBLIC_PATHS = {
+    # tests/test_crypto_share_route_open.py
+    "/api/v1/portfolio/crypto/shared",
+}
+
 ADMIN_ONLY_PERMISSIONS = {
     Permission.MANAGE_USERS,
     Permission.WRITE_USERS,
@@ -117,6 +126,8 @@ def test_every_gated_module_route_requires_kyc():
     unguarded = []
     for r in _api_routes():
         module = r.endpoint.__module__.rsplit(".", 1)[-1]
+        if r.path in DELIBERATELY_PUBLIC_PATHS:
+            continue
         if module in KYC_GATED_MODULES and "require_kyc_verified" not in _deps(r):
             unguarded.append((module, r.path))
     assert not unguarded, (
