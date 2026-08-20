@@ -8,7 +8,7 @@ from app.core.security import decode_access_token
 from app.models.user import User
 from app.models.account import Account
 from app.models.kyc import KYCVerification, KYCStatus
-from app.models.payment import Subscription, SubscriptionPlan, SubscriptionStatus
+from app.models.payment import Subscription, SubscriptionStatus
 from app.core.permissions import Role
 from app.core.exceptions import UnauthorizedException, ForbiddenException, NotFoundException
 from app.core.features import Feature, get_permissions, get_plan_limits, has_feature
@@ -111,7 +111,19 @@ async def get_active_subscription(
 async def get_user_subscription_plan(
     account: Account = Depends(get_account),
     db: AsyncSession = Depends(get_db)
-) -> SubscriptionPlan:
+) -> str:
+    """The product TIER ("free" | "starter" | "pro" | "premium" | "concierge")
+    that gates feature access -- never the billing cycle.
+
+    Bug fixed 2026-08-20: this used to return ``subscription.plan``, which is
+    the billing-CYCLE enum (free/monthly/annual), not the tier. Every
+    ANNUAL-only feature was unreachable by any monthly subscriber regardless
+    of tier. ``get_plan_tier`` resolves the actual tier (preferring the
+    explicit ``plan_tier`` column, falling back to reverse-mapping the legacy
+    ``plan`` enum for rows written before that column existed).
+    """
+    from app.api.v1.subscriptions import get_plan_tier
+
     result = await db.execute(
         select(Subscription).where(
             Subscription.account_id == account.id,
@@ -122,9 +134,9 @@ async def get_user_subscription_plan(
 
     period_end = _as_aware_utc(subscription.current_period_end) if subscription else None
     if subscription and period_end and period_end >= datetime.now(timezone.utc):
-        return subscription.plan
+        return get_plan_tier(subscription)
 
-    return SubscriptionPlan.FREE
+    return "free"
 
 
 async def require_kyc_verified(
@@ -180,7 +192,7 @@ def require_feature(feature: Feature):
     return decorator
 
 
-def check_usage_limit(limit_type: str, current_count: int, plan: SubscriptionPlan) -> bool:
+def check_usage_limit(limit_type: str, current_count: int, plan: str) -> bool:
     from app.core.features import get_limit
     limit = get_limit(plan, limit_type)
     if limit is None:

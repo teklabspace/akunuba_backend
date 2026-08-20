@@ -154,16 +154,17 @@ def test_listing_fee_is_two_percent():
 
 
 def test_offer_limits_scale_with_plan():
-    from app.core.features import check_usage_limit, get_limit
-    from app.models.payment import SubscriptionPlan
+    # Keyed on product TIER (starter/pro/premium), not billing cycle -- see
+    # app/core/features.py and tests/test_payments_subscriptions.py.
+    from app.core.features import FREE, PREMIUM, STARTER, check_usage_limit, get_limit
 
-    assert get_limit(SubscriptionPlan.FREE, "offers") == 3
-    assert get_limit(SubscriptionPlan.MONTHLY, "offers") == 20
-    assert get_limit(SubscriptionPlan.ANNUAL, "offers") is None  # unlimited
+    assert get_limit(FREE, "offers") == 3
+    assert get_limit(STARTER, "offers") == 20
+    assert get_limit(PREMIUM, "offers") is None  # unlimited
 
-    assert check_usage_limit(SubscriptionPlan.FREE, "offers", 2)
-    assert not check_usage_limit(SubscriptionPlan.FREE, "offers", 3)
-    assert check_usage_limit(SubscriptionPlan.ANNUAL, "offers", 10_000)
+    assert check_usage_limit(FREE, "offers", 2)
+    assert not check_usage_limit(FREE, "offers", 3)
+    assert check_usage_limit(PREMIUM, "offers", 10_000)
 
 
 def _run_standalone():
