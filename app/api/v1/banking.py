@@ -72,7 +72,10 @@ async def create_link_token(
     # bank-selection flow and is rejected at the final step.
     plan = await get_user_subscription_plan(account=account, db=db)
     if not has_feature(plan, Feature.BANKING):
-        raise ForbiddenException("Banking integration requires Annual subscription")
+        raise ForbiddenException(
+            "Banking integration requires a paid subscription (Starter plan or higher).",
+            code="SUBSCRIPTION_REQUIRED",
+        )
 
     try:
         link_token = PlaidClient.create_link_token(
@@ -104,7 +107,10 @@ async def link_account(
     
     # Check subscription feature
     if not has_feature(plan, Feature.BANKING):
-        raise ForbiddenException("Banking integration requires Annual subscription")
+        raise ForbiddenException(
+            "Banking integration requires a paid subscription (Starter plan or higher).",
+            code="SUBSCRIPTION_REQUIRED",
+        )
     
     try:
         # Exchange public token for access token
