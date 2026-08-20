@@ -75,6 +75,24 @@ def grant_is_usable(grant, now: datetime) -> bool:
     return True
 
 
+def grant_allows_media(grant, now: datetime) -> bool:
+    """True when a grant still lets its advisor attach photos/documents.
+
+    Deliberately wider than grant_is_usable, which answers only "may this be
+    spent on a create?". Media is attached on BOTH sides of the create call:
+    the add-asset wizard uploads photos BEFORE POST /assets (grant still
+    ACTIVE), and the advisor can still fix the asset afterwards while the
+    investor has not confirmed it (grant CONSUMED -- decision D1). LOCKED and
+    REVOKED end it, matching find_edit_grant.
+
+    Expiry bounds the CREATE window only, so it is not re-applied to a grant
+    that was already spent.
+    """
+    if grant.status == GrantStatus.CONSUMED.value:
+        return True
+    return grant_is_usable(grant, now)
+
+
 def ensure_can_revoke_grant(grant, user) -> None:
     """Only the investor the grant is for, or an admin, may revoke it.
 
@@ -245,6 +263,57 @@ async def resolve_asset_actor_context(db: AsyncSession, user: User, asset_id):
         raise NotFoundException("Account", str(grant.investor_id))
 
     return owner, owner_account, grant
+
+
+async def resolve_media_upload_account(db: AsyncSession, user: User, on_behalf_of):
+    """The INVESTOR's account an advisor may upload files into -> (account, grant).
+
+    The add-asset wizard uploads photos/documents BEFORE the asset exists, so
+    there is no asset_id to authorise against and resolve_asset_actor_context
+    does not apply. Authorisation is instead "this advisor holds a live grant
+    for this investor", and the account returned is the investor's -- the file
+    is stored under their account folder and later linked to their asset, never
+    the advisor's.
+
+    Nothing is consumed here: the grant is spent by create_asset, not by
+    uploading a file that may never be attached to anything.
+    """
+    from app.models.account import Account
+
+    if user.role != Role.ADVISOR:
+        raise ForbiddenException(
+            "Only an advisor can upload files on behalf of an investor.",
+            # Literal on purpose -- the drift guard only sees string literals.
+            code="ADVISOR_ROLE_REQUIRED",
+        )
+
+    grant = (await db.execute(
+        select(AssetDelegationGrant)
+        .where(
+            AssetDelegationGrant.investor_id == on_behalf_of,
+            AssetDelegationGrant.advisor_id == user.id,
+            AssetDelegationGrant.status.in_(
+                [GrantStatus.ACTIVE.value, GrantStatus.CONSUMED.value]
+            ),
+        )
+        # An advisor can hold a spent grant on last month's asset and a fresh
+        # one for the next; newest wins so the create window is preferred.
+        .order_by(AssetDelegationGrant.created_at.desc())
+    )).scalars().first()
+
+    if grant is None or not grant_allows_media(grant, datetime.now(timezone.utc)):
+        raise ForbiddenException(
+            "You do not have an active authorisation to add an asset for this investor.",
+            code="NO_ACTIVE_GRANT",
+        )
+
+    account = (await db.execute(
+        select(Account).where(Account.user_id == on_behalf_of)
+    )).scalar_one_or_none()
+    if not account:
+        raise NotFoundException("Account", str(on_behalf_of))
+
+    return account, grant
 
 
 async def find_edit_grant(db: AsyncSession, user: User, asset_id):

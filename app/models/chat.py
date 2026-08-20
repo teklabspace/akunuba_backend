@@ -71,7 +71,13 @@ class MessageAttachment(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     message_id = Column(UUID(as_uuid=True), ForeignKey("messages.id"), nullable=False)
-    file_id = Column(UUID(as_uuid=True), ForeignKey("files.id"), nullable=True)
+    # Plain UUID, deliberately not a ForeignKey: there is no `files` table and never has
+    # been (the only real constraint on this table is message_id -> messages.id). The
+    # fictional FK made `alembic revision --autogenerate` abort with
+    # NoReferencedTableError, so nobody could generate migrations - which is how the
+    # schema drifted by hand (tasks, reminders, offers.counter_amount all went missing
+    # from the migration chain). Removing it changes no database object.
+    file_id = Column(UUID(as_uuid=True), nullable=True)
     file_name = Column(String(255), nullable=False)
     file_url = Column(String(500), nullable=False)
     file_size = Column(Integer, nullable=False)

@@ -42,6 +42,24 @@ from app.models.investment_goal import InvestmentGoal
 from app.models.investment_strategy import InvestmentStrategy
 from app.models.transfer import Transfer
 
+# Import EVERY module in app.models so all tables land in Base.metadata.
+#
+# The explicit imports above covered 26 of 32 model modules, and app/models/__init__.py
+# does not re-export the rest (advisor_client among them). Autogenerate compares metadata
+# against the live database, so any model missing here looks like a table that has been
+# *removed*: a generated migration proposed dropping advisor_clients, appraisal_comments
+# and asset_delegation_grants outright. Running that would have destroyed real tables.
+#
+# Walking the package means a newly added model file is picked up automatically instead of
+# silently turning into a proposed DROP.
+import importlib
+import pkgutil
+
+import app.models as _models_pkg
+
+for _m in pkgutil.iter_modules(_models_pkg.__path__):
+    importlib.import_module(f"{_models_pkg.__name__}.{_m.name}")
+
 config = context.config
 
 if config.config_file_name is not None:

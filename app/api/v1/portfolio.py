@@ -108,6 +108,17 @@ class PortfolioResponse(BaseModel):
     risk_metrics: Optional[Dict[str, Any]] = None
 
 
+def _json_safe(value):
+    """Recursively convert Decimals to float so a payload can be stored in a JSONB column."""
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 @router.get("", response_model=PortfolioResponse)
 async def get_portfolio(
     include_performance: bool = Query(True, description="Include performance metrics"),
@@ -208,7 +219,18 @@ async def get_portfolio(
         for item in allocation_items
     }
     
-    performance_dict = performance_data.model_dump() if performance_data else None
+    # `performance_data` is a JSONB column, so everything stored in it must be
+    # JSON-encodable. Pydantic's plain model_dump() hands back live Decimal objects
+    # (PerformanceMetrics and DailyReturnItem are Decimal-typed throughout), and the
+    # driver cannot encode a Decimal into JSONB — the commit below blew up with a 500
+    # for every account that actually had performance history. Accounts with none took
+    # the `else None` branch, which is why an empty portfolio looked fine.
+    #
+    # Cast to float rather than using model_dump(mode="json"), which would stringify the
+    # Decimals: reports.py reads this column straight back into its response, and the
+    # branch it falls back to emits numbers. The allocation dict just above already does
+    # the same float() cast for the same reason.
+    performance_dict = _json_safe(performance_data.model_dump()) if performance_data else None
     
     if portfolio:
         portfolio.total_value = total_value

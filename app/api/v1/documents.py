@@ -34,6 +34,10 @@ class DocumentResponse(BaseModel):
         from_attributes = True
 
 
+# documents.file_name is String(255); keep a margin for the storage path prefix.
+MAX_FILENAME_LENGTH = 200
+
+
 @router.post("/upload", response_model=DocumentResponse, status_code=status.HTTP_201_CREATED)
 async def upload_document(
     file: UploadFile = File(...),
@@ -56,10 +60,23 @@ async def upload_document(
     if file_extension not in settings.ALLOWED_FILE_TYPES:
         raise BadRequestException(f"File type not allowed. Allowed types: {settings.ALLOWED_FILE_TYPES}")
     
+    # Filename length. `documents.file_name` is String(255) and the storage path embeds the
+    # name, so an over-long filename overflowed the column and surfaced as an unhandled 500
+    # (a 300-character name reproduced it). Reject it as a validation error instead.
+    if len(file.filename or "") > MAX_FILENAME_LENGTH:
+        raise BadRequestException(
+            f"File name is too long (maximum {MAX_FILENAME_LENGTH} characters)."
+        )
+
     # Read file
     file_data = await file.read()
     file_size = len(file_data)
-    
+
+    # An empty upload used to be accepted with 201 and file_size 0, producing a document row
+    # that can never be downloaded to anything meaningful. Nothing downstream wants it.
+    if file_size == 0:
+        raise BadRequestException("The uploaded file is empty.")
+
     # Check file size
     if file_size > settings.MAX_UPLOAD_SIZE:
         raise BadRequestException(f"File size exceeds maximum allowed size of {settings.MAX_UPLOAD_SIZE} bytes")
@@ -193,10 +210,16 @@ async def download_document(
             raise HTTPException(status_code=403, detail="Access denied")
     
     try:
-        # Get file from Supabase Storage
+        # Go through SupabaseClient.download_file, not the raw SDK client.
+        #
+        # get_client() returns None whenever the Supabase SDK cannot be imported (it degrades
+        # to an HTTP storage fallback and says so in the log). This code then did
+        # `None.storage` and every single download failed with a 400 - while upload, delete
+        # and preview all kept working, because they already go through the resilient
+        # SupabaseClient helpers. The result was uploads that reported success and files that
+        # could never be retrieved. download_file() has the same HTTP fallback as upload_file().
         from app.integrations.supabase_client import SupabaseClient
-        supabase = SupabaseClient.get_client()
-        file_data = supabase.storage.from_("documents").download(document.supabase_storage_path)
+        file_data = SupabaseClient.download_file("documents", document.supabase_storage_path)
         
         return StreamingResponse(
             io.BytesIO(file_data),
