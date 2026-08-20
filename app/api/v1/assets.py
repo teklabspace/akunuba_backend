@@ -316,6 +316,36 @@ def ensure_investor_can_write_assets(user: User) -> None:
         )
 
 
+async def _resolve_media_account(db: AsyncSession, user: User, asset_id) -> Account:
+    """Whose account may `user` attach photos/documents to `asset_id` under?
+
+    Mirrors update_asset: the owner acts on their own asset, and an advisor who
+    created it under a still-unlocked grant keeps write access to it (decision
+    D1). Returns the OWNER's account so the caller's existing
+    `Asset.account_id == account.id` check keeps working unchanged -- and so a
+    delegate is never able to reach an asset outside the grant.
+
+    Deletes deliberately do NOT use this: removing a client's file stays the
+    owner's call, the same line delete_asset draws.
+    """
+    from app.api.v1.delegation import find_edit_grant
+
+    edit_grant = await find_edit_grant(db, user, asset_id)
+
+    if edit_grant is None:
+        ensure_investor_can_write_assets(user)
+        owner_user_id = user.id
+    else:
+        owner_user_id = edit_grant.investor_id
+
+    account = (await db.execute(
+        select(Account).where(Account.user_id == owner_user_id)
+    )).scalar_one_or_none()
+    if not account:
+        raise NotFoundException("Account", str(owner_user_id))
+    return account
+
+
 class ValuationResponse(BaseModel):
     id: UUID
     value: Decimal
@@ -1067,6 +1097,10 @@ async def get_asset(
     """Get asset details with all frontend-required fields.
 
     Investors can only fetch their own assets; admins can fetch any asset.
+    An advisor holding a live edit grant on this specific asset (decision D1,
+    same window as update_asset/upload_asset_photo/upload_asset_document) can
+    fetch it too -- otherwise they could PUT/upload to an asset they can never
+    load into the edit wizard first.
     """
     is_admin = current_user.role == Role.ADMIN
 
@@ -1081,13 +1115,20 @@ async def get_asset(
     )
 
     if not is_admin:
+        owner_user_id = current_user.id
+        if current_user.role == Role.ADVISOR:
+            from app.api.v1.delegation import find_edit_grant
+            edit_grant = await find_edit_grant(db, current_user, asset_id)
+            if edit_grant is not None:
+                owner_user_id = edit_grant.investor_id
+
         account_result = await db.execute(
-            select(Account).where(Account.user_id == current_user.id)
+            select(Account).where(Account.user_id == owner_user_id)
         )
         account = account_result.scalar_one_or_none()
 
         if not account:
-            raise NotFoundException("Account", str(current_user.id))
+            raise NotFoundException("Account", str(owner_user_id))
 
         query = query.where(Asset.account_id == account.id)
     
@@ -1900,9 +1941,10 @@ async def upload_asset_photo(
     db: AsyncSession = Depends(get_db)
 ):
     """Upload a photo for an asset"""
-    ensure_investor_can_write_assets(current_user)
-    account = await get_account(current_user=current_user, db=db)
-    
+    # An advisor who created this asset under a grant may still attach media to
+    # it until the investor confirms it -- the same window update_asset honours.
+    account = await _resolve_media_account(db, current_user, asset_id)
+
     # Verify asset belongs to account
     asset_result = await db.execute(
         select(Asset).where(and_(Asset.id == asset_id, Asset.account_id == account.id))
@@ -2016,9 +2058,9 @@ async def upload_asset_document(
     db: AsyncSession = Depends(get_db)
 ):
     """Upload a document for an asset"""
-    ensure_investor_can_write_assets(current_user)
-    account = await get_account(current_user=current_user, db=db)
-    
+    # See upload_asset_photo -- a live edit grant carries media rights too.
+    account = await _resolve_media_account(db, current_user, asset_id)
+
     # Verify asset belongs to account
     asset_result = await db.execute(
         select(Asset).where(and_(Asset.id == asset_id, Asset.account_id == account.id))
@@ -3591,12 +3633,23 @@ async def upload_file_assets(
     file: UploadFile = File(...),
     file_type: str = Form(..., description="File type: photo or document"),
     asset_id: Optional[UUID] = Form(None, description="Asset ID if uploading for specific asset"),
+    on_behalf_of: Optional[UUID] = Form(None, description="Investor ID when an advisor uploads under a delegation grant"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """General file upload endpoint (assets-specific)"""
-    ensure_investor_can_write_assets(current_user)
-    account = await get_account(current_user=current_user, db=db)
+    # Same two ways in as create_asset. Milestone 2 branched create/update for
+    # delegated advisors but left this uploader on the investor-only gate, so
+    # an advisor could create a client's asset yet not attach a single photo to
+    # it (bug, 2026-08-20). The delegated branch resolves the INVESTOR's
+    # account, so the storage folder and the asset link below both belong to
+    # the owner rather than to whoever is holding the keyboard.
+    if on_behalf_of is not None:
+        from app.api.v1.delegation import resolve_media_upload_account
+        account, _grant = await resolve_media_upload_account(db, current_user, on_behalf_of)
+    else:
+        ensure_investor_can_write_assets(current_user)
+        account = await get_account(current_user=current_user, db=db)
     
     # Validate file type
     if file_type not in ["photo", "document"]:

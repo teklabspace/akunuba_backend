@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
+import asyncio
 import time
 from app.config import settings
 from app.api.v1 import (
@@ -484,6 +485,10 @@ async def root():
     }
 
 
+# A health check must answer fast even when its dependencies are wedged.
+HEALTH_PROBE_TIMEOUT_SECONDS = 3.0
+
+
 @app.get("/health")
 @limiter.exempt
 async def health_check():
@@ -493,21 +498,44 @@ async def health_check():
         "status": "healthy",
         "version": settings.APP_VERSION,
     }
-    # Optional: DB check
-    try:
+    # DB check, bounded.
+    #
+    # These probes had no timeout, so when the database stopped accepting connections
+    # /health did not report "degraded" - it hung. Observed hanging past 90s. That is worse
+    # than an unhealthy answer: load balancers, uptime monitors and container health checks
+    # all stall on it and cannot tell a wedged instance from a slow one. A health endpoint
+    # must always answer quickly, even (especially) when its dependencies are down.
+    async def _db_probe():
         from app.database import engine
         from sqlalchemy import text
         async with engine.connect() as conn:
             await conn.execute(text("SELECT 1"))
+
+    try:
+        await asyncio.wait_for(_db_probe(), timeout=HEALTH_PROBE_TIMEOUT_SECONDS)
         payload["database"] = "ok"
-    except Exception as e:
+    except asyncio.TimeoutError:
+        payload["database"] = "timeout"
+        payload["status"] = "degraded"
+    except Exception:
         payload["database"] = "error"
         payload["status"] = "degraded"
-    # Optional: Redis check
-    try:
+
+    # Redis check, also bounded. `redis.from_url(...).ping()` is a BLOCKING call on the event
+    # loop; with an unreachable host it stalls every other request on this worker, so it runs
+    # in a thread with the same deadline.
+    def _redis_probe():
         import redis
-        r = redis.from_url(settings.REDIS_URL)
-        r.ping()
+        redis.from_url(
+            settings.REDIS_URL,
+            socket_connect_timeout=HEALTH_PROBE_TIMEOUT_SECONDS,
+            socket_timeout=HEALTH_PROBE_TIMEOUT_SECONDS,
+        ).ping()
+
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(_redis_probe), timeout=HEALTH_PROBE_TIMEOUT_SECONDS
+        )
         payload["redis"] = "ok"
     except Exception:
         payload["redis"] = "unavailable"
@@ -605,3 +633,55 @@ async def shutdown_event():
     except Exception as e:
         logger.error(f"Shutdown event failed: {e}", exc_info=True)
 
+
+
+# ---------------------------------------------------------------------------
+# MUST STAY LAST: this matches every path, so any route defined below it would be
+# shadowed. Moving it earlier once made GET /health and GET / return 405.
+# ---------------------------------------------------------------------------
+@app.api_route(
+    "/{full_path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
+    include_in_schema=False,
+)
+@limiter.exempt
+async def not_found_handler(full_path: str, request: Request):
+    """Return 404 for an unmatched path, instead of the 405 the CORS catch-all caused.
+
+    The OPTIONS catch-all below matches EVERY path. Starlette answers 405 when a path
+    matches a route but the method does not, so once that route existed every unknown URL
+    replied `405 Method Not Allowed` rather than 404 - including obvious nonsense like
+    /api/v1/zzzz-nonsense. That is the wrong contract for API consumers (a client cannot
+    tell "no such resource" from "wrong verb"), and during the QA audit it made 13 endpoints
+    look like they existed when they did not.
+
+    Registered after every include_router call, so real routes always win; this only ever
+    sees paths nothing else matched.
+    """
+    # Distinguish "no such path" from "path exists, wrong verb". Starlette would have done
+    # this for us if the OPTIONS catch-all did not shadow every route, so re-derive it: if any
+    # registered route matches this path under a different method, the honest answer is 405.
+    path = request.url.path
+    allowed = set()
+    for route in request.app.router.routes:
+        matcher = getattr(route, "path_regex", None)
+        methods = getattr(route, "methods", None)
+        if matcher is None or not methods:
+            continue
+        if "{full_path" in getattr(route, "path", ""):
+            continue  # skip the catch-alls themselves
+        if matcher.match(path):
+            allowed |= set(methods)
+
+    if allowed:
+        response = JSONResponse(
+            status_code=405,
+            content=error_envelope(405, message="Method Not Allowed", code="METHOD_NOT_ALLOWED"),
+        )
+        response.headers["Allow"] = ", ".join(sorted(allowed))
+    else:
+        response = JSONResponse(
+            status_code=404,
+            content=error_envelope(404, message="Not Found", code="NOT_FOUND"),
+        )
+    return _apply_cors_headers(request, response)

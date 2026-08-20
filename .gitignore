@@ -121,3 +121,18 @@ docs/
 
 # Playwright MCP artifacts (page snapshots, console logs from browser sessions)
 .playwright-mcp/
+
+# QA-only database URL (isolated akunuba_qa) - contains credentials
+.env.qa
+
+# Held out of this push on request (2026-08-21). The 2 formerly-tracked files
+# below were also `git rm --cached` (staged, not committed) so they stop
+# reappearing as untracked once that's committed.
+tests/test_asset_role_enforcement.py
+tests/test_commission_tier.py
+tests/test_delegation_guards.py
+tests/test_health_probe_timeouts.py
+tests/test_kyc_webhook_signature.py
+tests/test_offer_accept_race.py
+tests/test_platform_hardening.py
+tests/test_portfolio_jsonb_serialisation.py

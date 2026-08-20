@@ -629,6 +629,25 @@ async def _assert_no_open_human_appraisal(db: AsyncSession, asset_id) -> None:
         )
 
 
+async def _seller_has_premium_subscription(db: AsyncSession, account_id) -> bool:
+    """True when the account holds an ACTIVE `premium` subscription.
+
+    Gates the reduced 10% marketplace commission. Only `premium` qualifies - `starter` and
+    `pro` pay the standard rate. Anything other than an ACTIVE subscription (incomplete,
+    past_due, cancelled, expired) is not an entitlement, so it pays standard too: an unpaid
+    subscription must not buy a cheaper commission.
+    """
+    from app.models.payment import Subscription, SubscriptionStatus
+    from app.api.v1.subscriptions import get_plan_tier
+
+    subscription = (await db.execute(
+        select(Subscription).where(Subscription.account_id == account_id)
+    )).scalar_one_or_none()
+    if subscription is None or subscription.status != SubscriptionStatus.ACTIVE:
+        return False
+    return get_plan_tier(subscription) == "premium"
+
+
 def _require_categorized_asset(asset: Optional[Asset]) -> None:
     """A listing may only go public when its asset has a category — the browse
     UI is category-driven, so an uncategorized listing would be unreachable
@@ -964,8 +983,16 @@ async def accept_offer(
     if not account:
         raise NotFoundException("Account", str(current_user.id))
     
+    # Lock the offer row for the rest of this transaction.
+    #
+    # Accepting was a check-then-act: read the offer, test `status == PENDING`, then create
+    # an escrow. With no lock, concurrent accepts all read PENDING before any of them wrote
+    # ACCEPTED, so every one proceeded. Reproduced in QA: 5 parallel accepts of ONE offer
+    # returned 200 five times and created 5 escrow rows totalling 2,000,000 for a 400,000
+    # offer - five separate Stripe PaymentIntents against the same buyer. FOR UPDATE
+    # serialises them so the losers observe ACCEPTED and are rejected by the guard below.
     offer_result = await db.execute(
-        select(Offer).where(Offer.id == offer_id)
+        select(Offer).where(Offer.id == offer_id).with_for_update()
     )
     offer = offer_result.scalar_one_or_none()
     
@@ -991,8 +1018,17 @@ async def accept_offer(
     if offer.status != OfferStatus.PENDING:
         raise BadRequestException("Offer is not pending")
     
-    # Calculate commission (20% standard, 10% premium)
-    is_premium = current_user.role == Role.ADMIN  # Premium logic
+    # Calculate commission (20% standard, 10% premium).
+    #
+    # The reduced rate is an entitlement of the SELLER's subscription. This used to read
+    # `current_user.role == Role.ADMIN`, which asked whether the caller was an admin rather
+    # than whether the seller had paid for premium. Two things followed: every premium
+    # subscriber was charged the standard 20% they had paid to avoid, and the 10% branch was
+    # unreachable in practice - an admin has no Account row, and the ownership check above
+    # (`listing.account_id != account.id`) means only the listing owner ever gets here.
+    #
+    # `current_user` IS the seller at this point, guaranteed by that same ownership check.
+    is_premium = await _seller_has_premium_subscription(db, account.id)
     commission = calculate_commission(offer.offer_amount, is_premium)
     
     # Create escrow transaction

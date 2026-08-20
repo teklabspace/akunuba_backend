@@ -6,7 +6,11 @@ from pydantic import field_validator
 class Settings(BaseSettings):
     APP_NAME: str = "Akunuba Backend"
     APP_ENV: str = "development"
-    APP_DEBUG: bool = True
+    # Fail safe. When true, unhandled exceptions return str(exc) to the client and
+    # SQLAlchemy echoes every statement. Production sets APP_DEBUG=false explicitly, but a
+    # deploy that merely forgets the variable must not silently start leaking exception
+    # text and SQL. Local development opts in through its own .env.
+    APP_DEBUG: bool = False
     APP_VERSION: str = "1.0.0"
     API_V1_PREFIX: str = "/api/v1"
     

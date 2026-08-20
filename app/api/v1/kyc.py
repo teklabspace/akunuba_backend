@@ -293,8 +293,8 @@ async def get_kyc_status(
                     if attributes.get("verification-level"):
                         kyc.verification_level = attributes.get("verification-level")
                     # Set user as verified
-                    if account:
-                        account.user.is_verified = True
+                    if webhook_user:
+                        webhook_user.is_verified = True
                 elif status_str == "completed":
                     # Check verification status to determine if approved or pending review
                     verification_status = attributes.get("verification-status")
@@ -305,34 +305,34 @@ async def get_kyc_status(
                         if attributes.get("verification-level"):
                             kyc.verification_level = attributes.get("verification-level")
                         # Set user as verified
-                        if account:
-                            account.user.is_verified = True
+                        if webhook_user:
+                            webhook_user.is_verified = True
                     elif verification_status == "pending":
                         kyc.status = KYCStatus.PENDING_REVIEW
                         # Set user as NOT verified
-                        if account:
-                            account.user.is_verified = False
+                        if webhook_user:
+                            webhook_user.is_verified = False
                     elif verification_status == "failed":
                         kyc.status = KYCStatus.REJECTED
                         kyc.rejection_reason = attributes.get("failure-reason", "Verification failed")
                         # Set user as NOT verified
-                        if account:
-                            account.user.is_verified = False
+                        if webhook_user:
+                            webhook_user.is_verified = False
                     else:
                         # Default to approved if completed but no verification-status
                         logger.info(f"[KYC STATUS SYNC] Status is 'completed' but no verification-status found. Defaulting to APPROVED")
                         kyc.status = KYCStatus.APPROVED
                         kyc.verified_at = datetime.utcnow()
                         # Set user as verified
-                        if account:
-                            account.user.is_verified = True
+                        if webhook_user:
+                            webhook_user.is_verified = True
                 elif status_str == "failed":
                     logger.info(f"[KYC STATUS SYNC] Status is 'failed'. Setting to REJECTED")
                     kyc.status = KYCStatus.REJECTED
                     kyc.rejection_reason = attributes.get("failure-reason", "Verification failed")
                     # Set user as NOT verified
-                    if account:
-                        account.user.is_verified = False
+                    if webhook_user:
+                        webhook_user.is_verified = False
                 elif status_str == "pending":
                     # Persona "pending" = user started but hasn't finished the
                     # flow (their review state is needs_review / completed).
@@ -340,31 +340,31 @@ async def get_kyc_status(
                     logger.info(f"[KYC STATUS SYNC] Status is 'pending'. Keeping as IN_PROGRESS (user mid-flow)")
                     kyc.status = KYCStatus.IN_PROGRESS
                     # Set user as NOT verified
-                    if account:
-                        account.user.is_verified = False
+                    if webhook_user:
+                        webhook_user.is_verified = False
                 elif status_str in ("needs_review", "needs-review", "marked_for_review", "marked-for-review"):
                     logger.info(f"[KYC STATUS SYNC] Status is '{status_str}'. Setting to PENDING_REVIEW")
                     kyc.status = KYCStatus.PENDING_REVIEW
-                    if account:
-                        account.user.is_verified = False
+                    if webhook_user:
+                        webhook_user.is_verified = False
                 elif status_str in ["processing", "waiting"]:
                     logger.info(f"[KYC STATUS SYNC] Status is '{status_str}'. Keeping as IN_PROGRESS")
                     kyc.status = KYCStatus.IN_PROGRESS
                     # Set user as NOT verified (KYC is still in progress)
-                    if account:
-                        account.user.is_verified = False
+                    if webhook_user:
+                        webhook_user.is_verified = False
                 elif status_str == "expired":
                     # Persona expired the inquiry session; resume_inquiry below
                     # revives it, so keep it actionable as IN_PROGRESS.
                     logger.info("[KYC STATUS SYNC] Status is 'expired'. Keeping as IN_PROGRESS (resumable)")
                     kyc.status = KYCStatus.IN_PROGRESS
-                    if account:
-                        account.user.is_verified = False
+                    if webhook_user:
+                        webhook_user.is_verified = False
                 else:
                     logger.warning(f"[KYC STATUS SYNC] Unknown status value: '{status_str}'. Keeping current status: {kyc.status}")
                     # For unknown statuses, set user as NOT verified to be safe
                     if account and kyc.status != KYCStatus.APPROVED:
-                        account.user.is_verified = False
+                        webhook_user.is_verified = False
                 
                 # Update verification level if available
                 verification_level = attributes.get("verification-level") or attributes.get("verification_level")
@@ -657,10 +657,26 @@ async def persona_webhook(
     CRITICAL: Preserves verification_level and verification_type when updating status.
     """
     logger.info("=== PERSONA WEBHOOK RECEIVED ===")
-    
+
+    # Verify the Persona signature BEFORE trusting anything in the body.
+    #
+    # This endpoint used to parse and apply the payload with no signature check at all
+    # (the raw body was read "for potential signature verification" and then never
+    # verified). An unauthenticated POST could therefore drive a KYC record straight to
+    # APPROVED - demonstrated in QA: status went REJECTED -> APPROVED with no credentials
+    # of any kind. KYC approval gates asset creation, marketplace listing and payments,
+    # so that was a full verification bypass. The `reference-id` fallback below widens it
+    # further: knowing only an account UUID is enough to bind and approve an inquiry.
+    #
+    # `verify_persona_signature` is the same fail-closed HMAC check already used by
+    # /webhooks/persona (it refuses when PERSONA_WEBHOOK_SECRET is unset).
+    body = await request.body()
+    from app.api.v1.webhooks import verify_persona_signature
+    if not verify_persona_signature(body, request.headers.get("Persona-Signature", "")):
+        logger.warning("Rejected Persona webhook on /kyc/webhook: invalid or missing signature")
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
     try:
-        # Get raw body for potential signature verification (read before JSON parsing)
-        body = await request.body()
         
         # Parse webhook payload
         import json
@@ -722,6 +738,17 @@ async def persona_webhook(
         )
         account = account_result.scalar_one_or_none()
         
+        # `account.user` is a lazy relationship. Touching it here raised
+        # "greenlet_spawn has not been called" inside the async handler, which the broad
+        # except below swallowed into an HTTP 200 {"status": "error"} - so users.is_verified
+        # silently never updated, even for genuine Persona callbacks, leaving accounts with
+        # kyc.status=APPROVED but users.is_verified=False. Load the row explicitly instead.
+        webhook_user = None
+        if account is not None:
+            webhook_user = (await db.execute(
+                select(User).where(User.id == account.user_id)
+            )).scalar_one_or_none()
+
         # CRITICAL: Preserve verification_level and verification_type (if exists)
         old_verification_level = kyc.verification_level
         old_verification_type = getattr(kyc, 'verification_type', None)  # May not exist on KYC model
@@ -744,21 +771,21 @@ async def persona_webhook(
                     kyc.verification_level = attributes.get("verification-level")
                 
                 # Update user verification status - ONLY set to True when APPROVED
-                if account:
-                    account.user.is_verified = True
+                if webhook_user:
+                    webhook_user.is_verified = True
             elif verification_status == "pending":
                 logger.info("Updating status to pending_review")
                 kyc.status = KYCStatus.PENDING_REVIEW
                 # Set user as NOT verified
-                if account:
-                    account.user.is_verified = False
+                if webhook_user:
+                    webhook_user.is_verified = False
             elif verification_status == "failed":
                 logger.info("Updating status to rejected")
                 kyc.status = KYCStatus.REJECTED
                 kyc.rejection_reason = attributes.get("failure-reason", "Verification failed")
                 # Set user as NOT verified
-                if account:
-                    account.user.is_verified = False
+                if webhook_user:
+                    webhook_user.is_verified = False
             else:
                 # Default to approved if completed but no verification-status
                 logger.info("Updating status to approved (default for completed)")
@@ -769,8 +796,8 @@ async def persona_webhook(
                 if attributes.get("verification-level"):
                     kyc.verification_level = attributes.get("verification-level")
                 # Set user as verified
-                if account:
-                    account.user.is_verified = True
+                if webhook_user:
+                    webhook_user.is_verified = True
         
         elif event_type == "inquiry.failed":
             logger.info("Updating status to rejected")
@@ -778,15 +805,15 @@ async def persona_webhook(
             attributes = payload.get("data", {}).get("attributes", {})
             kyc.rejection_reason = attributes.get("failure-reason", "Verification failed")
             # Set user as NOT verified
-            if account:
-                account.user.is_verified = False
+            if webhook_user:
+                webhook_user.is_verified = False
         
         elif event_type == "inquiry.requires-attention":
             logger.info("Updating status to pending_review")
             kyc.status = KYCStatus.PENDING_REVIEW
             # Set user as NOT verified
-            if account:
-                account.user.is_verified = False
+            if webhook_user:
+                webhook_user.is_verified = False
         
         # CRITICAL: Restore preserved values
         kyc.verification_level = old_verification_level
@@ -849,7 +876,7 @@ async def resubmit_kyc(
         kyc.persona_response = result["persona_response"]
 
         # Set user as NOT verified when resubmitting (KYC is in progress again)
-        account.user.is_verified = False
+        webhook_user.is_verified = False
 
         await db.commit()
         await db.refresh(kyc)
@@ -932,7 +959,7 @@ async def sync_kyc_status(
                 kyc.verification_level = verification_level
             
             # Update user verification status - ONLY set to True when APPROVED
-            account.user.is_verified = True
+            webhook_user.is_verified = True
         elif status_str == "completed":
             if verification_status == "approved":
                 logger.info(f"[KYC SYNC-STATUS] verification-status is 'approved'. Setting to APPROVED")
@@ -945,18 +972,18 @@ async def sync_kyc_status(
                     kyc.verification_level = verification_level
                 
                 # Update user verification status - ONLY set to True when APPROVED
-                account.user.is_verified = True
+                webhook_user.is_verified = True
             elif verification_status == "pending":
                 logger.info(f"[KYC SYNC-STATUS] verification-status is 'pending'. Setting to PENDING_REVIEW")
                 kyc.status = KYCStatus.PENDING_REVIEW
                 # Set user as NOT verified
-                account.user.is_verified = False
+                webhook_user.is_verified = False
             elif verification_status == "failed":
                 logger.info(f"[KYC SYNC-STATUS] verification-status is 'failed'. Setting to REJECTED")
                 kyc.status = KYCStatus.REJECTED
                 kyc.rejection_reason = attributes.get("failure-reason", "Verification failed")
                 # Set user as NOT verified
-                account.user.is_verified = False
+                webhook_user.is_verified = False
             else:
                 # Default to approved if completed but no verification-status
                 logger.info(f"[KYC SYNC-STATUS] Status is 'completed' but verification-status is '{verification_status}' (not found/unknown). Defaulting to APPROVED")
@@ -967,40 +994,40 @@ async def sync_kyc_status(
                     logger.info(f"[KYC SYNC-STATUS] Updating verification_level to: {verification_level}")
                     kyc.verification_level = verification_level
                 # Set user as verified (defaulting to approved)
-                account.user.is_verified = True
+                webhook_user.is_verified = True
         elif status_str == "failed":
             logger.info(f"[KYC SYNC-STATUS] Status is 'failed'. Setting to REJECTED")
             kyc.status = KYCStatus.REJECTED
             kyc.rejection_reason = attributes.get("failure-reason", "Verification failed")
             # Set user as NOT verified
-            account.user.is_verified = False
+            webhook_user.is_verified = False
         elif status_str == "pending":
             # Persona "pending" = user started but hasn't finished the flow;
             # actual review states are needs_review / completed+pending.
             logger.info(f"[KYC SYNC-STATUS] Status is 'pending'. Keeping as IN_PROGRESS (user mid-flow)")
             kyc.status = KYCStatus.IN_PROGRESS
             # Set user as NOT verified
-            account.user.is_verified = False
+            webhook_user.is_verified = False
         elif status_str in ("needs_review", "needs-review", "marked_for_review", "marked-for-review"):
             logger.info(f"[KYC SYNC-STATUS] Status is '{status_str}'. Setting to PENDING_REVIEW")
             kyc.status = KYCStatus.PENDING_REVIEW
-            account.user.is_verified = False
+            webhook_user.is_verified = False
         elif status_str in ["processing", "waiting"]:
             logger.info(f"[KYC SYNC-STATUS] Status is '{status_str}'. Keeping as IN_PROGRESS")
             kyc.status = KYCStatus.IN_PROGRESS
             # Set user as NOT verified (KYC is still in progress)
-            account.user.is_verified = False
+            webhook_user.is_verified = False
         elif status_str == "expired":
             # Session lapsed on Persona's side; GET /kyc/status resumes it, so
             # keep the verification actionable instead of stranding the user.
             logger.info("[KYC SYNC-STATUS] Status is 'expired'. Keeping as IN_PROGRESS (resumable)")
             kyc.status = KYCStatus.IN_PROGRESS
-            account.user.is_verified = False
+            webhook_user.is_verified = False
         else:
             logger.warning(f"[KYC SYNC-STATUS] Unknown status value: '{status_str}'. Keeping current status: {kyc.status}")
             # For unknown statuses, set user as NOT verified to be safe (unless already approved)
             if kyc.status != KYCStatus.APPROVED:
-                account.user.is_verified = False
+                webhook_user.is_verified = False
         
         # Update verification level if available
         verification_level = attributes.get("verification-level") or attributes.get("verification_level")
@@ -1114,8 +1141,8 @@ async def approve_kyc_manual(
         select(Account).where(Account.id == kyc.account_id)
     )
     account = account_result.scalar_one_or_none()
-    if account:
-        account.user.is_verified = True
+    if webhook_user:
+        webhook_user.is_verified = True
     
     await db.commit()
     await db.refresh(kyc)
