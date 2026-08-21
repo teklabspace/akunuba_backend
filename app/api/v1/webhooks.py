@@ -19,7 +19,12 @@ from app.models.banking import LinkedAccount
 from app.models.payment import Subscription, SubscriptionStatus
 from app.integrations.plaid_client import PlaidClient
 from app.integrations.stripe_client import StripeClient, subscription_id_from_invoice
-from app.services.banking_sync_service import sync_linked_account_transactions, refresh_linked_account_balance
+from app.services.banking_sync_service import (
+    sync_linked_account_transactions,
+    refresh_linked_account_balance,
+    sync_linked_account_holdings,
+    sync_linked_account_liabilities,
+)
 from app.core.metrics import record_webhook_failure
 from app.core.rate_limit import limiter
 from app.utils.logger import logger
@@ -425,6 +430,10 @@ async def plaid_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             try:
                 if webhook_type == "TRANSACTIONS":
                     await sync_linked_account_transactions(db, la.id)
+                elif webhook_type == "HOLDINGS":
+                    await sync_linked_account_holdings(db, la.id)
+                elif webhook_type == "LIABILITIES":
+                    await sync_linked_account_liabilities(db, la.id)
                 elif webhook_type in ("ITEM", "AUTH") or "balance" in (webhook_code or "").lower():
                     await refresh_linked_account_balance(db, la.id)
             except Exception as e:

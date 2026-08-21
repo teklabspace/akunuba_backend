@@ -861,13 +861,17 @@ async def get_portfolio_summary(
     today_change = today_value - yesterday_value
     today_change_percentage = (today_change / yesterday_value * 100) if yesterday_value > 0 else Decimal("0.00")
     
-    # Get cash available (from linked accounts)
+    # Get cash available (from linked DEPOSITORY accounts only — a linked
+    # brokerage/credit/loan account's balance is not cash, and a liability
+    # balance is money owed, not money available; counting either here would
+    # inflate total_portfolio_value below by exactly the wrong amount).
     cash_available = Decimal("0.00")
     linked_accounts_result = await db.execute(
         select(LinkedAccount).where(
             and_(
                 LinkedAccount.account_id == account.id,
-                LinkedAccount.is_active == True
+                LinkedAccount.is_active == True,
+                LinkedAccount.plaid_type == "depository",
             )
         )
     )

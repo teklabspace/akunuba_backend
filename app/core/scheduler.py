@@ -441,10 +441,17 @@ async def monitor_sla_breaches():
 
 
 async def banking_sync_all():
-    """Sync transactions and balance for all active linked bank accounts. Runs every 6 hours."""
+    """Sync transactions, balance, holdings and liabilities for all active
+    linked accounts. Runs every 6 hours. Holdings/liabilities sync is a no-op
+    for accounts whose plaid_type doesn't apply (see banking_sync_service)."""
     from app.database import AsyncSessionLocal
     from app.models.banking import LinkedAccount
-    from app.services.banking_sync_service import sync_linked_account_transactions, refresh_linked_account_balance
+    from app.services.banking_sync_service import (
+        sync_linked_account_transactions,
+        refresh_linked_account_balance,
+        sync_linked_account_holdings,
+        sync_linked_account_liabilities,
+    )
     from sqlalchemy import select
     try:
         async with AsyncSessionLocal() as db:
@@ -456,6 +463,8 @@ async def banking_sync_all():
                 try:
                     await sync_linked_account_transactions(db, la.id)
                     await refresh_linked_account_balance(db, la.id)
+                    await sync_linked_account_holdings(db, la.id)
+                    await sync_linked_account_liabilities(db, la.id)
                 except Exception as e:
                     logger.warning(f"Banking sync failed for linked account {la.id}: {e}")
             logger.info(f"Banking sync completed for {len(linked_accounts)} linked accounts")

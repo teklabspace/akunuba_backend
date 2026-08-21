@@ -11,6 +11,10 @@ class AccountType(str, Enum):
     BANKING = "banking"
     BROKERAGE = "brokerage"
     CRYPTO = "crypto"
+    # Credit/loan accounts (Plaid type "credit"/"loan"): deliberately NOT
+    # BANKING — app/services/escrow_payout.py filters BANKING-only for payout
+    # eligibility, and a credit card or mortgage must never qualify.
+    OTHER = "other"
 
 
 class LinkedAccount(Base):
@@ -19,10 +23,22 @@ class LinkedAccount(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     account_id = Column(UUID(as_uuid=True), ForeignKey("accounts.id"), nullable=False)
     plaid_item_id = Column(String(255))
+    # Plaid's per-account id (distinct from plaid_item_id, which is shared by
+    # every account under one Item/login). Required to correctly identify a
+    # specific account when an Item returns more than one — see
+    # app/services/plaid_categorization.py and banking_sync_service matching.
+    plaid_account_id = Column(String(255))
     plaid_access_token = Column(String(500))
     # The PG enum is named linkedaccounttype — "accounttype" belongs to the
     # accounts table (INDIVIDUAL/CORPORATE/TRUST) and is a different type.
     account_type = Column(SQLEnum(AccountType, name="linkedaccounttype"), nullable=False)
+    # Plaid's raw account type/subtype (e.g. "depository"/"checking",
+    # "credit"/"credit card", "investment"/"401k"). Stored as plain strings,
+    # not a constrained enum, since Plaid's subtype list is long and grows —
+    # see app/services/plaid_categorization.py for the type->category mapping
+    # every "is this cash?" filter (portfolio/investment/accounts/reports) uses.
+    plaid_type = Column(String(50))
+    plaid_subtype = Column(String(100))
     institution_name = Column(String(255))
     account_name = Column(String(255))
     account_number = Column(String(100))
@@ -37,6 +53,8 @@ class LinkedAccount(Base):
 
     account = relationship("Account")
     transactions = relationship("Transaction", back_populates="linked_account")
+    holdings = relationship("InvestmentHolding", back_populates="linked_account", cascade="all, delete-orphan")
+    liability = relationship("Liability", back_populates="linked_account", uselist=False, cascade="all, delete-orphan")
 
 
 class Transaction(Base):

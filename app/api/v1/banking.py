@@ -9,7 +9,16 @@ from app.api.deps import get_current_user
 from app.models.user import User
 from app.models.account import Account
 from app.models.banking import LinkedAccount, Transaction, AccountType
+from app.models.investment_holding import Security, InvestmentHolding
+from app.models.liability import Liability
 from app.integrations.plaid_client import PlaidClient
+from app.services.plaid_categorization import category_from_plaid_type, legacy_account_type, extract_balance, plaid_value
+from app.services.banking_sync_service import (
+    resolve_institution_name,
+    refresh_linked_account_balance,
+    sync_linked_account_holdings,
+    sync_linked_account_liabilities,
+)
 from app.core.exceptions import NotFoundException, BadRequestException, ForbiddenException
 from app.api.deps import get_account, get_user_subscription_plan
 from app.core.features import Feature, has_feature
@@ -47,13 +56,13 @@ async def create_link_token(
 ):
     """
     Create Plaid link token for account linking.
-    
+
     This endpoint creates a link token that the frontend uses to initialize
     Plaid Link for connecting bank accounts.
-    
+
     Returns:
         LinkTokenResponse with link_token string
-        
+
     Raises:
         404: If user account not found
         400: If Plaid credentials not configured or API call fails
@@ -63,7 +72,7 @@ async def create_link_token(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
-    
+
     if not account:
         raise NotFoundException("Account", str(current_user.id))
 
@@ -100,53 +109,87 @@ async def link_account(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Link bank account using Plaid public token"""
+    """Link account(s) using a Plaid public token.
+
+    Every account Plaid returns under this Item is stored as its own
+    LinkedAccount with its own real Plaid type/subtype/id — a single
+    institution login can return a checking, a savings, and a brokerage
+    account together, and each keeps its own identity rather than being
+    collapsed into one generic "banking" record.
+    """
     public_token = payload.public_token
     account = await get_account(current_user=current_user, db=db)
     plan = await get_user_subscription_plan(account=account, db=db)
-    
+
     # Check subscription feature
     if not has_feature(plan, Feature.BANKING):
         raise ForbiddenException(
             "Banking integration requires a paid subscription (Starter plan or higher).",
             code="SUBSCRIPTION_REQUIRED",
         )
-    
+
     try:
         # Exchange public token for access token
         exchange_response = PlaidClient.exchange_public_token(public_token)
         access_token = exchange_response["access_token"]
         item_id = exchange_response["item_id"]
-        
+
         # Get account information
         accounts_response = PlaidClient.get_accounts(access_token)
         accounts_data = accounts_response.get("accounts", [])
-        
+
         if not accounts_data:
             raise BadRequestException("No accounts found")
-        
-        # Create linked account records
+
+        # Institution's real display name (e.g. "Chase"), not an account
+        # nickname — best-effort, never blocks linking.
+        institution_name = resolve_institution_name(access_token) or "Unknown Institution"
+
         linked_accounts = []
         for acc_data in accounts_data:
+            # Coerced to text: the SDK returns AccountType/AccountSubtype
+            # objects, which asyncpg refuses for these String columns and which
+            # never match the string comparisons below.
+            plaid_type = plaid_value(acc_data.get("type"))
+            plaid_subtype = plaid_value(acc_data.get("subtype"))
+            category = category_from_plaid_type(plaid_type)
             linked_account = LinkedAccount(
                 account_id=account.id,
                 plaid_item_id=item_id,
+                plaid_account_id=acc_data.get("account_id"),
                 plaid_access_token=access_token,
-                account_type=AccountType.BANKING,  # Default, could be determined from account type
-                institution_name=acc_data.get("name", "Unknown"),
+                account_type=legacy_account_type(category),
+                plaid_type=plaid_type,
+                plaid_subtype=plaid_subtype,
+                institution_name=institution_name,
                 account_name=acc_data.get("name", "Account"),
                 account_number=acc_data.get("mask", ""),
-                balance=Decimal(str(acc_data.get("balances", {}).get("available", 0))),
+                balance=extract_balance(acc_data.get("balances")),
                 currency="USD",
                 last_synced_at=datetime.utcnow(),
             )
             db.add(linked_account)
             linked_accounts.append(linked_account)
-        
+
         await db.commit()
-        
+
+        # Best-effort first sync so a newly linked brokerage/credit/loan
+        # account shows real holdings/liability data immediately instead of
+        # waiting for the next 6-hour scheduled sync. Must not fail the link
+        # itself — the account is linked either way.
+        for linked_account in linked_accounts:
+            try:
+                if linked_account.plaid_type == "investment":
+                    await sync_linked_account_holdings(db, linked_account.id)
+                elif linked_account.plaid_type in ("credit", "loan"):
+                    await sync_linked_account_liabilities(db, linked_account.id)
+            except Exception as e:
+                logger.warning(f"Initial sync failed for linked account {linked_account.id}: {e}")
+
         logger.info(f"Accounts linked for user {current_user.id}")
         return {"message": f"{len(linked_accounts)} account(s) linked successfully"}
+    except BadRequestException:
+        raise
     except Exception as e:
         logger.error(f"Failed to link account: {e}")
         raise BadRequestException("Failed to link account")
@@ -157,6 +200,8 @@ class BankingAccountResponse(BaseModel):
     institution_name: str
     account_name: str
     account_type: str
+    category: str
+    subtype: Optional[str] = None
     balance: Optional[Decimal] = None
     currency: str
     last_synced: Optional[datetime] = None
@@ -174,15 +219,17 @@ async def get_linked_accounts(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get all linked bank accounts"""
+    """Get all linked accounts, each tagged with its real Plaid category
+    (depository/credit/loan/investment) so the frontend can place it under
+    the correct portfolio section."""
     account_result = await db.execute(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
-    
+
     if not account:
         raise NotFoundException("Account", str(current_user.id))
-    
+
     result = await db.execute(
         select(LinkedAccount).where(
             LinkedAccount.account_id == account.id,
@@ -190,27 +237,25 @@ async def get_linked_accounts(
         )
     )
     linked_accounts = result.scalars().all()
-    
-    # Map to spec format
-    account_type_map = {
-        AccountType.BANKING: "checking",
-        AccountType.BROKERAGE: "brokerage",
-        AccountType.CRYPTO: "crypto"
-    }
-    
-    data = []
-    for linked_account in linked_accounts:
-        account_type = account_type_map.get(linked_account.account_type, "checking")
-        data.append(BankingAccountResponse(
+
+    data = [
+        BankingAccountResponse(
             id=linked_account.id,
             institution_name=linked_account.institution_name or "Unknown Institution",
             account_name=linked_account.account_name,
-            account_type=account_type,
+            # Plaid's own subtype (e.g. "checking", "credit card", "401k") is
+            # already a display-ready label — more precise than the old
+            # 3-value account_type map this replaces.
+            account_type=linked_account.plaid_subtype or category_from_plaid_type(linked_account.plaid_type),
+            category=category_from_plaid_type(linked_account.plaid_type),
+            subtype=linked_account.plaid_subtype,
             balance=linked_account.balance,
             currency=linked_account.currency,
             last_synced=linked_account.last_synced_at
-        ))
-    
+        )
+        for linked_account in linked_accounts
+    ]
+
     return BankingAccountsResponse(data=data)
 
 
@@ -225,10 +270,10 @@ async def sync_transactions(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
-    
+
     if not account:
         raise NotFoundException("Account", str(current_user.id))
-    
+
     linked_account_result = await db.execute(
         select(LinkedAccount).where(
             LinkedAccount.id == linked_account_id,
@@ -236,23 +281,23 @@ async def sync_transactions(
         )
     )
     linked_account = linked_account_result.scalar_one_or_none()
-    
+
     if not linked_account:
         raise NotFoundException("Linked Account", str(linked_account_id))
-    
+
     try:
         # Get transactions from last 30 days
         end_date = datetime.utcnow()
         start_date = end_date - timedelta(days=30)
-        
+
         transactions_response = PlaidClient.get_transactions(
             access_token=linked_account.plaid_access_token,
             start_date=start_date.strftime("%Y-%m-%d"),
             end_date=end_date.strftime("%Y-%m-%d")
         )
-        
+
         transactions_data = transactions_response.get("transactions", [])
-        
+
         # Store transactions
         new_count = 0
         for tx_data in transactions_data:
@@ -264,7 +309,7 @@ async def sync_transactions(
             )
             if existing_result.scalar_one_or_none():
                 continue
-            
+
             transaction = Transaction(
                 linked_account_id=linked_account.id,
                 plaid_transaction_id=tx_data.get("transaction_id"),
@@ -276,11 +321,11 @@ async def sync_transactions(
             )
             db.add(transaction)
             new_count += 1
-        
+
         linked_account.last_synced_at = datetime.utcnow()
         await db.commit()
-        
-        logger.info(f"Synced {new_count} transactions for account {linked_account_id}")
+
+        logger.info(f"Synced {new_count} new transactions for account {linked_account_id}")
         return {"message": f"Synced {new_count} new transactions"}
     except Exception as e:
         logger.error(f"Failed to sync transactions: {e}")
@@ -298,10 +343,10 @@ async def disconnect_account(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
-    
+
     if not account:
         raise NotFoundException("Account", str(current_user.id))
-    
+
     linked_account_result = await db.execute(
         select(LinkedAccount).where(
             LinkedAccount.id == linked_account_id,
@@ -309,13 +354,13 @@ async def disconnect_account(
         )
     )
     linked_account = linked_account_result.scalar_one_or_none()
-    
+
     if not linked_account:
         raise NotFoundException("Linked Account", str(linked_account_id))
-    
+
     linked_account.is_active = False
     await db.commit()
-    
+
     logger.info(f"Account disconnected: {linked_account_id}")
     return {"message": "Account disconnected successfully"}
 
@@ -331,10 +376,10 @@ async def get_linked_account_details(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
-    
+
     if not account:
         raise NotFoundException("Account", str(current_user.id))
-    
+
     linked_account_result = await db.execute(
         select(LinkedAccount).where(
             LinkedAccount.id == linked_account_id,
@@ -342,10 +387,30 @@ async def get_linked_account_details(
         )
     )
     linked_account = linked_account_result.scalar_one_or_none()
-    
+
     if not linked_account:
         raise NotFoundException("Linked Account", str(linked_account_id))
-    
+
+    return linked_account
+
+
+async def _get_own_linked_account(db: AsyncSession, current_user: User, linked_account_id: UUID) -> LinkedAccount:
+    account_result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+    )
+    account = account_result.scalar_one_or_none()
+    if not account:
+        raise NotFoundException("Account", str(current_user.id))
+
+    linked_account_result = await db.execute(
+        select(LinkedAccount).where(
+            LinkedAccount.id == linked_account_id,
+            LinkedAccount.account_id == account.id
+        )
+    )
+    linked_account = linked_account_result.scalar_one_or_none()
+    if not linked_account:
+        raise NotFoundException("Linked Account", str(linked_account_id))
     return linked_account
 
 
@@ -356,53 +421,87 @@ async def refresh_account_balance(
     db: AsyncSession = Depends(get_db)
 ):
     """Refresh account balance from Plaid"""
-    account_result = await db.execute(
-        select(Account).where(Account.user_id == current_user.id)
-    )
-    account = account_result.scalar_one_or_none()
-    
-    if not account:
-        raise NotFoundException("Account", str(current_user.id))
-    
-    linked_account_result = await db.execute(
-        select(LinkedAccount).where(
-            LinkedAccount.id == linked_account_id,
-            LinkedAccount.account_id == account.id
-        )
-    )
-    linked_account = linked_account_result.scalar_one_or_none()
-    
-    if not linked_account:
-        raise NotFoundException("Linked Account", str(linked_account_id))
-    
-    try:
-        # Get updated account information from Plaid
-        accounts_response = PlaidClient.get_accounts(linked_account.plaid_access_token)
-        accounts_data = accounts_response.get("accounts", [])
-        
-        # Find matching account
-        updated_account = None
-        for acc_data in accounts_data:
-            if acc_data.get("mask") == linked_account.account_number or acc_data.get("account_id") == linked_account.plaid_item_id:
-                updated_account = acc_data
-                break
-        
-        if updated_account:
-            linked_account.balance = Decimal(str(updated_account.get("balances", {}).get("available", 0)))
-            linked_account.last_synced_at = datetime.utcnow()
-            await db.commit()
-            
-            logger.info(f"Account balance refreshed: {linked_account_id}")
-            return {
-                "message": "Account balance refreshed successfully",
-                "balance": float(linked_account.balance),
-                "currency": linked_account.currency
-            }
-        else:
-            raise BadRequestException("Account not found in Plaid")
-    except Exception as e:
-        logger.error(f"Failed to refresh account balance: {e}")
+    linked_account = await _get_own_linked_account(db, current_user, linked_account_id)
+
+    ok = await refresh_linked_account_balance(db, linked_account.id)
+    if not ok:
         raise BadRequestException("Failed to refresh account balance")
+
+    await db.refresh(linked_account)
+    logger.info(f"Account balance refreshed: {linked_account_id}")
+    return {
+        "message": "Account balance refreshed successfully",
+        "balance": float(linked_account.balance) if linked_account.balance is not None else None,
+        "currency": linked_account.currency
+    }
+
+
+@router.get("/accounts/{linked_account_id}/holdings")
+async def get_account_holdings(
+    linked_account_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Investment holdings for a specific linked account — securities held,
+    quantity, cost basis, current value. Empty for non-investment accounts."""
+    linked_account = await _get_own_linked_account(db, current_user, linked_account_id)
+
+    result = await db.execute(
+        select(InvestmentHolding, Security)
+        .join(Security, InvestmentHolding.security_id == Security.id)
+        .where(InvestmentHolding.linked_account_id == linked_account.id)
+    )
+    rows = result.all()
+
+    return {
+        "holdings": [
+            {
+                "id": str(holding.id),
+                "ticker_symbol": security.ticker_symbol,
+                "name": security.name,
+                "security_type": security.security_type,
+                "quantity": float(holding.quantity),
+                "cost_basis": float(holding.cost_basis) if holding.cost_basis is not None else None,
+                "institution_value": float(holding.institution_value),
+                "institution_price": float(holding.institution_price) if holding.institution_price is not None else None,
+                "currency": holding.currency,
+            }
+            for holding, security in rows
+        ],
+        "total_value": float(sum((holding.institution_value for holding, _ in rows), Decimal("0.00"))),
+    }
+
+
+@router.get("/accounts/{linked_account_id}/liabilities")
+async def get_account_liability(
+    linked_account_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Liability detail (APR/statement/term data) for a credit/loan linked
+    account. 404 if the account has no liability detail synced yet — the
+    account's `balance` (from GET /banking/accounts) is the amount owed
+    either way; this adds the detail on top of it."""
+    linked_account = await _get_own_linked_account(db, current_user, linked_account_id)
+
+    liability_result = await db.execute(
+        select(Liability).where(Liability.linked_account_id == linked_account.id)
+    )
+    liability = liability_result.scalar_one_or_none()
+    if not liability:
+        raise NotFoundException("Liability detail", str(linked_account_id))
+
+    return {
+        "liability_type": liability.liability_type,
+        "balance_owed": float(linked_account.balance) if linked_account.balance is not None else None,
+        "last_payment_amount": float(liability.last_payment_amount) if liability.last_payment_amount is not None else None,
+        "last_payment_date": liability.last_payment_date.isoformat() if liability.last_payment_date else None,
+        "next_payment_due_date": liability.next_payment_due_date.isoformat() if liability.next_payment_due_date else None,
+        "minimum_payment_amount": float(liability.minimum_payment_amount) if liability.minimum_payment_amount is not None else None,
+        "last_statement_balance": float(liability.last_statement_balance) if liability.last_statement_balance is not None else None,
+        "is_overdue": liability.is_overdue,
+        "details": liability.details,
+    }
 
 
 @router.get("/accounts/{linked_account_id}/transactions")
@@ -419,10 +518,10 @@ async def get_account_transactions(
         select(Account).where(Account.user_id == current_user.id)
     )
     account = account_result.scalar_one_or_none()
-    
+
     if not account:
         raise NotFoundException("Account", str(current_user.id))
-    
+
     linked_account_result = await db.execute(
         select(LinkedAccount).where(
             LinkedAccount.id == linked_account_id,
@@ -430,22 +529,22 @@ async def get_account_transactions(
         )
     )
     linked_account = linked_account_result.scalar_one_or_none()
-    
+
     if not linked_account:
         raise NotFoundException("Linked Account", str(linked_account_id))
-    
+
     # Get transactions from database
     from app.models.banking import Transaction
     query = select(Transaction).where(Transaction.linked_account_id == linked_account.id)
-    
+
     if start_date:
         query = query.where(Transaction.transaction_date >= datetime.fromisoformat(start_date))
     if end_date:
         query = query.where(Transaction.transaction_date <= datetime.fromisoformat(end_date))
-    
+
     result = await db.execute(query.order_by(Transaction.transaction_date.desc()).limit(limit))
     transactions = result.scalars().all()
-    
+
     return {
         "transactions": [
             {
@@ -461,4 +560,3 @@ async def get_account_transactions(
         ],
         "count": len(transactions)
     }
-

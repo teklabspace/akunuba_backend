@@ -125,13 +125,16 @@ class PlaidClient:
                 logger.error(error_msg)
                 raise ValueError(error_msg)
             
-            # Create link token request
+            # Create link token request. investments/liabilities are billed by
+            # Plaid per linked Item as soon as the product is attached, whether
+            # or not the corresponding data endpoint is ever called — there is
+            # no cheaper "optional" tier for these two products.
             request = {
                 "user": {
                     "client_user_id": user_id,
                 },
                 "client_name": "Akunuba",
-                "products": ["transactions", "auth"],
+                "products": ["transactions", "auth", "investments", "liabilities"],
                 "country_codes": ["US"],
                 "language": "en",
             }
@@ -200,5 +203,77 @@ class PlaidClient:
             return response
         except Exception as e:
             logger.error(f"Failed to get Plaid transactions: {e}")
+            raise
+
+    @classmethod
+    def get_item(cls, access_token: str) -> Dict[str, Any]:
+        """The Item behind an access token — institution_id lives here, not on
+        the accounts themselves."""
+        try:
+            client = cls.get_client()
+            request = {"access_token": access_token}
+            response = client.item_get(request)
+            return response
+        except Exception as e:
+            logger.error(f"Failed to get Plaid item: {e}")
+            raise
+
+    @classmethod
+    def get_institution(cls, institution_id: str) -> Dict[str, Any]:
+        """Institution metadata (real display name, products, etc.) by id."""
+        try:
+            client = cls.get_client()
+            request = {
+                "institution_id": institution_id,
+                "country_codes": ["US"],
+            }
+            response = client.institutions_get_by_id(request)
+            return response
+        except Exception as e:
+            logger.error(f"Failed to get Plaid institution {institution_id}: {e}")
+            raise
+
+    @classmethod
+    def get_investment_holdings(cls, access_token: str) -> Dict[str, Any]:
+        """Current holdings + securities for every investment-type account under
+        this access token. Requires the Investments product on the Item.
+
+        _check_return_type=False: confirmed against Plaid's own sandbox that
+        the generated SDK's response models declare some fields (e.g. a
+        security's close_price_as_of) required-non-null more strictly than
+        Plaid's actual API — a real sandbox response tripped this exact
+        validator on liabilities_get (see get_liabilities below) and raised
+        instead of returning data. The response is still used as a plain
+        dict via .get() throughout this codebase, so skipping the SDK's
+        internal type-check does not change how callers consume it.
+        """
+        try:
+            client = cls.get_client()
+            request = {"access_token": access_token}
+            response = client.investments_holdings_get(request, _check_return_type=False)
+            return response
+        except Exception as e:
+            logger.error(f"Failed to get Plaid investment holdings: {e}")
+            raise
+
+    @classmethod
+    def get_liabilities(cls, access_token: str) -> Dict[str, Any]:
+        """Detailed credit/mortgage/student liability data for every relevant
+        account under this access token. Requires the Liabilities product.
+
+        _check_return_type=False: required, not defensive paranoia — a real
+        Plaid sandbox response for a mortgage liability came back with
+        account_number: null, which the generated SDK's strict response
+        model rejects (`ApiTypeError`) before this method ever sees the
+        data. Confirmed the flag resolves it and the response remains
+        dict-accessible exactly like every other PlaidClient response here.
+        """
+        try:
+            client = cls.get_client()
+            request = {"access_token": access_token}
+            response = client.liabilities_get(request, _check_return_type=False)
+            return response
+        except Exception as e:
+            logger.error(f"Failed to get Plaid liabilities: {e}")
             raise
 
