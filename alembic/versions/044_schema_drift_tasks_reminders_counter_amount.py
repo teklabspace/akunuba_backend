@@ -51,10 +51,20 @@ def upgrade() -> None:
 
     # Enum names must match what SQLAlchemy's SQLEnum derives from the Python enum
     # class names (TaskStatus -> taskstatus), or the ORM will not bind to them.
+    #
+    # reminderstatus is deliberately named settings_reminder_status instead: a
+    # type named "reminderstatus" already exists in some environments (created
+    # ad hoc, uppercase-labeled — PENDING not pending) and app/models/task.py's
+    # Reminder.status now names its column explicitly to avoid ever binding to
+    # whatever that stray type turns out to contain. taskstatus/taskpriority
+    # are left as-is here: Task/Reminder share those names with
+    # app/models/compliance.py's ComplianceTask, a separate pre-existing
+    # collision (different value sets) that does not block this migration —
+    # 'pending'/'medium' are valid in both — and is not part of this fix.
     for enum_name, values in (
         ("taskstatus", TASK_STATUS),
         ("taskpriority", TASK_PRIORITY),
-        ("reminderstatus", REMINDER_STATUS),
+        ("settings_reminder_status", REMINDER_STATUS),
     ):
         labels = ", ".join(f"'{v}'" for v in values)
         bind.execute(
@@ -103,7 +113,7 @@ def upgrade() -> None:
             sa.Column("title", sa.String(200), nullable=False),
             sa.Column("description", sa.Text(), nullable=True),
             sa.Column("reminder_date", sa.DateTime(timezone=True), nullable=False),
-            sa.Column("status", postgresql.ENUM(*REMINDER_STATUS, name="reminderstatus",
+            sa.Column("status", postgresql.ENUM(*REMINDER_STATUS, name="settings_reminder_status",
                                                 create_type=False), nullable=False,
                       server_default="pending"),
             sa.Column("snoozed_until", sa.DateTime(timezone=True), nullable=True),

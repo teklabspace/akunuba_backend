@@ -190,13 +190,16 @@ async def get_asset_summary_cards(
         except Exception as e:
             logger.warning(f"Failed to get Alpaca cash: {e}")
         
-        # Also check linked accounts
+        # Also check linked DEPOSITORY accounts — a linked brokerage/credit/
+        # loan account's balance is not cash (same fix as portfolio.py's
+        # cash_available; see plaid-categorization work).
         try:
             linked_accounts_result = await db.execute(
                 select(LinkedAccount).where(
                     and_(
                         LinkedAccount.account_id == account.id,
-                        LinkedAccount.is_active == True
+                        LinkedAccount.is_active == True,
+                        LinkedAccount.plaid_type == "depository",
                     )
                 )
             )

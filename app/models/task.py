@@ -57,7 +57,19 @@ class Reminder(Base):
     title = Column(String(200), nullable=False)
     description = Column(Text, nullable=True)
     reminder_date = Column(DateTime(timezone=True), nullable=False)
-    status = Column(SQLEnum(ReminderStatus), default=ReminderStatus.PENDING, nullable=False)
+    # Explicit name+values_callable: the implicit default ("reminderstatus")
+    # already exists in some environments with uppercase labels from an
+    # earlier ad-hoc creation, which breaks lowercase-value inserts. A named,
+    # explicit type avoids ever depending on how it happened to get created.
+    status = Column(
+        SQLEnum(
+            ReminderStatus,
+            name="settings_reminder_status",
+            values_callable=lambda enum_class: [member.value for member in enum_class],
+        ),
+        default=ReminderStatus.PENDING,
+        nullable=False,
+    )
     snoozed_until = Column(DateTime(timezone=True), nullable=True)
     notification_channels = Column(String(100), nullable=True)  # JSON array: ["email", "push", "sms"]
     notified_at = Column(DateTime(timezone=True), nullable=True)

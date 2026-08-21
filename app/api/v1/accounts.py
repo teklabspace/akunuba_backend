@@ -12,7 +12,7 @@ from app.models.kyc import KYCVerification, KYCStatus
 from app.models.joint_invitation import JointAccountInvitation, InvitationStatus
 from app.models.payment import Payment, PaymentStatus
 from app.models.asset import Asset
-from app.models.banking import LinkedAccount, AccountType as BankingAccountType
+from app.models.banking import LinkedAccount
 from app.integrations.alpaca_client import AlpacaClient
 from app.schemas.account import AccountCreate, AccountResponse
 from app.core.exceptions import ConflictException, NotFoundException, BadRequestException, UnauthorizedException
@@ -103,14 +103,13 @@ async def get_user_accounts(
         linked_accounts = linked_accounts_result.scalars().all()
         
         for linked_account in linked_accounts:
-            account_type_map = {
-                BankingAccountType.BANKING: "checking",
-                BankingAccountType.BROKERAGE: "brokerage",
-                BankingAccountType.CRYPTO: "investment"
-            }
-            
-            account_type = account_type_map.get(linked_account.account_type, "checking")
-            
+            # Plaid's own subtype ("checking", "savings", ...) is already a
+            # correct, display-ready label. The 3-value account_type map this
+            # replaces could never distinguish savings from checking — every
+            # depository account showed up as "checking" regardless, so
+            # type=savings silently matched nothing.
+            account_type = linked_account.plaid_subtype or "checking"
+
             # Filter by type if specified
             if type != "all" and account_type != type:
                 continue

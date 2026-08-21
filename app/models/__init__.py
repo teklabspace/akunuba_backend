@@ -13,7 +13,9 @@ from app.models.cash import CashTransaction, CashEntryType
 from app.models.portfolio_share import PortfolioShare
 from app.models.marketplace import MarketplaceListing, Offer, EscrowTransaction
 from app.models.payment import Payment, Refund, Invoice, Subscription
-from app.models.banking import LinkedAccount, Transaction
+from app.models.banking import LinkedAccount, Transaction, AccountType as LinkedAccountType
+from app.models.investment_holding import Security, InvestmentHolding
+from app.models.liability import Liability
 from app.models.document import Document
 from app.models.document_share import DocumentShare, SharePermission
 from app.models.support import SupportTicket
@@ -88,6 +90,10 @@ __all__ = [
     "Subscription",
     "LinkedAccount",
     "Transaction",
+    "LinkedAccountType",
+    "Security",
+    "InvestmentHolding",
+    "Liability",
     "Document",
     "DocumentShare",
     "SharePermission",
